@@ -1,12 +1,16 @@
 name: Release
 
 # Fires only when a version tag is pushed (e.g. `git tag v0.1.1 && git push
-# --tags`). Its one job is a guard: the tag must match the version in
-# Cargo.toml, so a release can never ship with a mismatched number.
+# --tags`). It guards that the tag matches Cargo.toml, then builds the Windows
+# binaries and publishes them as a GitHub Release.
 on:
   push:
     tags:
       - "v*"
+
+# Least privilege by default; the release job elevates to contents: write.
+permissions:
+  contents: read
 
 jobs:
   version-guard:
@@ -29,3 +33,35 @@ jobs:
             echo "::error::git tag v$tag does not match Cargo.toml version $manifest; bump Cargo.toml or retag"
             exit 1
           fi
+
+  release:
+    needs: version-guard
+    runs-on: windows-latest
+    permissions:
+      contents: write # required to create the release and upload assets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2 # after the toolchain: keyed off the rustc version
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      # Bundle both binaries with the license and readme into one archive named
+      # after the tag, so the download is self-contained.
+      - name: Package archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Force -DestinationPath "dist/goz-${{ github.ref_name }}-windows-x86_64.zip" -Path `
+            target/release/goz.exe, `
+            target/release/gozd.exe, `
+            LICENSE, `
+            README.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.zip
