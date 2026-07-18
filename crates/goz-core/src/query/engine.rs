@@ -32,8 +32,15 @@ pub struct QueryHit {
 pub struct QueryOutcome {
     /// Total matches before offset/limit (es `totitems` semantics).
     pub total: u64,
-    /// The requested page of hits, sorted.
+    /// The requested page of hits, ordered per [`Self::sorted`].
     pub hits: Vec<QueryHit>,
+    /// Whether [`Self::hits`] is already in sort order.
+    ///
+    /// `false` means the executor declined to order under the index lock and
+    /// the CALLER must sort before any k-way merge that assumes sorted runs.
+    /// Always `true` from [`run_query`], always `false` from
+    /// [`run_query_unsorted`]; only [`run_query_deferrable`] varies.
+    pub sorted: bool,
 }
 
 /// A [`ParsedQuery`]'s substring needles prebuilt into finders once (rather
@@ -138,7 +145,33 @@ pub fn run_query(
     offset: u32,
     limit: Option<u32>,
 ) -> QueryOutcome {
-    run_query_impl(index, parsed, scope, Some(sort), offset, limit)
+    run_query_impl(index, parsed, scope, Some(sort), offset, limit, false)
+}
+
+/// Like [`run_query`], but allowed to hand back an UNSORTED page when ordering
+/// under the index lock would buy nothing.
+///
+/// Ordering inside the lock earns its keep only when the page is a strict slice
+/// of the match set: picking which `limit` matches survive needs the index, and
+/// only that many paths are then reconstructed. When the page already covers
+/// every match there is nothing to pick, so this returns the matches in scan
+/// order with [`QueryOutcome::sorted`] set to `false` and leaves the ordering to
+/// the caller, which can do it after releasing the lock.
+///
+/// That distinction is not knowable before the scan (it depends on the match
+/// count), which is why it lives here rather than in the caller's dispatch.
+///
+/// The caller MUST check [`QueryOutcome::sorted`] and sort when it is `false`,
+/// before any k-way merge that assumes sorted runs.
+pub fn run_query_deferrable(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    scope: Option<EntryIdx>,
+    sort: SortSpec,
+    offset: u32,
+    limit: Option<u32>,
+) -> QueryOutcome {
+    run_query_impl(index, parsed, scope, Some(sort), offset, limit, true)
 }
 
 /// Every match, with paths built, in scan order. The CALLER sorts.
@@ -161,7 +194,7 @@ pub fn run_query_unsorted(
     parsed: &ParsedQuery,
     scope: Option<EntryIdx>,
 ) -> QueryOutcome {
-    run_query_impl(index, parsed, scope, None, 0, None)
+    run_query_impl(index, parsed, scope, None, 0, None, false)
 }
 
 /// A folder-scoped query walks the scope's subtree instead of scanning the
@@ -175,6 +208,10 @@ pub fn run_query_unsorted(
 const SUBTREE_WALK_MAX: usize = 200_000;
 
 /// `sort: None` skips ordering entirely and returns every match.
+///
+/// `allow_defer` lets the executor drop the ordering when the page turns out to
+/// cover every match (see [`run_query_deferrable`]); the reported
+/// [`QueryOutcome::sorted`] says which happened.
 fn run_query_impl(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
@@ -182,6 +219,7 @@ fn run_query_impl(
     sort: Option<SortSpec>,
     offset: u32,
     limit: Option<u32>,
+    allow_defer: bool,
 ) -> QueryOutcome {
     let compiled = CompiledQuery::new(parsed);
     let has_path_terms = !parsed.path_terms.is_empty();
@@ -325,6 +363,27 @@ fn run_query_impl(
 
     let total = candidates.len() as u64;
 
+    let start = (offset as usize).min(candidates.len());
+    let end = match limit {
+        Some(n) => (start + n as usize).min(candidates.len()),
+        None => candidates.len(),
+    };
+
+    // A page that covers every match has nothing to select, so ordering it here
+    // buys nothing the caller cannot do itself once it has released the index
+    // lock. Dropping the sort in that case is the whole point of
+    // `run_query_deferrable`: see `run_query_unsorted` for who is waiting on
+    // that lock. `end` is already clamped to the match count, so this is exactly
+    // "the page is the whole set".
+    //
+    // Everything below keys off the rebound `sort`, so a deferred query also
+    // skips the path-key precompute it would never consult.
+    let sort = match sort {
+        Some(s) if !(allow_defer && end == candidates.len()) => Some(s),
+        _ => None,
+    };
+    let sorted = sort.is_some();
+
     // Sort-by-path: precompute each candidate's comparison key ONCE,
     // fold(parent dir path) + NUL + fold(name), so ordering is a plain byte
     // compare instead of re-folding both paths inside every comparison (the
@@ -355,12 +414,6 @@ fn run_query_impl(
             }
         }
     }
-
-    let start = (offset as usize).min(candidates.len());
-    let end = match limit {
-        Some(n) => (start + n as usize).min(candidates.len()),
-        None => candidates.len(),
-    };
 
     // Order only enough to fill the page: quickselect the top `end` by the
     // sort key (O(M)), then sort just that prefix (O(end log end)). This avoids
@@ -422,7 +475,11 @@ fn run_query_impl(
         });
     }
 
-    QueryOutcome { total, hits }
+    QueryOutcome {
+        total,
+        hits,
+        sorted,
+    }
 }
 
 /// Verifies all predicates for one candidate, returning it (with a
@@ -1018,6 +1075,51 @@ mod tests {
         );
         assert_eq!(out.total, 5);
         assert_eq!(out.hits.len(), 2);
+    }
+
+    /// Ordering under the index lock earns its keep only when the limit really
+    /// slices the match set: picking the survivors needs the index, and only
+    /// that many paths get reconstructed. A page that already covers every
+    /// match has nothing to pick, so the executor must hand the ordering back
+    /// rather than do it while the caller holds the lock.
+    ///
+    /// Regression: the daemon chose by `limit.is_none()`, so a client asking for
+    /// everything as a NUMBER (`-n 4294967295`, or any limit at or above the
+    /// match count) took the in-lock path and sorted the entire set with the
+    /// volume's tail thread blocked behind it. The protection was one number
+    /// away from being skipped.
+    #[test]
+    fn a_page_covering_every_match_defers_the_sort() {
+        let idx = sample_index();
+        let parsed = parse_query("").unwrap();
+        let sort = SortSpec::default_for(SortKey::Name);
+        let total = run_query(&idx, &parsed, None, sort, 0, None).total as u32;
+        assert!(total > 1, "fixture must have several matches to slice");
+
+        for limit in [None, Some(u32::MAX), Some(total), Some(total + 1)] {
+            let out = run_query_deferrable(&idx, &parsed, None, sort, 0, limit);
+            assert!(
+                !out.sorted,
+                "limit {limit:?} covers all {total} matches; ordering must be deferred off-lock"
+            );
+            assert_eq!(
+                out.hits.len(),
+                total as usize,
+                "limit {limit:?}: a covering page still returns every match"
+            );
+        }
+
+        // A limit that genuinely slices still orders here, where the index is
+        // available to pick which matches survive.
+        let sliced = run_query_deferrable(&idx, &parsed, None, sort, 0, Some(total - 1));
+        assert!(sliced.sorted, "a real slice must still order in-lock");
+        assert_eq!(sliced.hits.len(), total as usize - 1);
+
+        // `run_query` keeps its unconditional promise for direct callers.
+        assert!(
+            run_query(&idx, &parsed, None, sort, 0, Some(u32::MAX)).sorted,
+            "run_query must always return sorted hits"
+        );
     }
 
     #[test]

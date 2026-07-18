@@ -18,7 +18,7 @@ use goz_core::proto::{
     MAX_CLIENT_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame, push_item,
     push_results_header,
 };
-use goz_core::query::{parse_query, resolve_scope, run_query, run_query_unsorted};
+use goz_core::query::{parse_query, resolve_scope, run_query_deferrable};
 use goz_core::types::{EntryIdx, SortKey, SortSpec};
 use goz_winfs::{PipeSecurity, build_pipe_security};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -269,23 +269,26 @@ fn stream_query_binary(
                 None => continue, // scope folder absent on this volume: no hits
             },
         };
-        // A limited query must order INSIDE the lock: it needs the index to pick
-        // which `per_vol_limit` matches survive, and it only reconstructs that
-        // many paths.
+        // A limited query orders INSIDE the lock only when the limit actually
+        // slices the match set: picking which `per_vol_limit` matches survive
+        // needs the index, and only that many paths are then reconstructed.
         //
-        // A full export has no such need. It returns every match, so ordering is
-        // pure post-processing over owned rows, and every sort key comes from the
-        // hit itself (`sort_collected` touches no index). Sorting a million rows
-        // under the read lock blocked this volume's tail thread from applying a
-        // single journal record for the whole sort; doing it after the guard
-        // drops blocks nobody.
-        let deferred_sort = per_vol_limit.is_none();
-        let outcome = if deferred_sort {
-            run_query_unsorted(&index, &parsed, scope_entry)
-        } else {
-            run_query(&index, &parsed, scope_entry, q.sort, 0, per_vol_limit)
-        };
+        // When the page covers every match there is nothing to pick, so ordering
+        // is pure post-processing over owned rows and every sort key comes from
+        // the hit itself (`sort_collected` touches no index). Sorting a million
+        // rows under the read lock blocked this volume's tail thread from
+        // applying a single journal record for the whole sort; doing it after
+        // the guard drops blocks nobody.
+        //
+        // Which case applies depends on the match count, which is not known
+        // until the scan has run, so the executor decides and reports back via
+        // `outcome.sorted`. Testing `limit.is_none()` here instead meant a
+        // client asking for everything as a NUMBER (`-n 4294967295`, or any
+        // limit at or above the match count) took the in-lock path and
+        // re-introduced the very stall the deferral exists to prevent.
+        let outcome = run_query_deferrable(&index, &parsed, scope_entry, q.sort, 0, per_vol_limit);
         total += outcome.total;
+        let sorted = outcome.sorted;
         drop(index); // hits own their bytes; release the read lock early
 
         let mut run: Vec<_> = outcome
@@ -293,7 +296,7 @@ fn stream_query_binary(
             .into_iter()
             .map(|hit| (vol.clone(), hit))
             .collect();
-        if deferred_sort {
+        if !sorted {
             // Off the lock. `order_merged` k-way merges runs it assumes are
             // already sorted, so this is not optional.
             sort_collected(&mut run, q.sort);
@@ -1131,6 +1134,54 @@ mod tests {
             ["a.log", "a.log", "z.log", "z.log"],
             "merged pages must be globally ordered by name, not by path or by volume"
         );
+    }
+
+    /// Every emitted path, in wire order, across all pages.
+    fn paths(bytes: &[u8]) -> Vec<String> {
+        results(bytes)
+            .into_iter()
+            .flat_map(|p| p.items.into_iter().map(|i| i.path))
+            .collect()
+    }
+
+    /// A limit at or above the match count means "everything", so it must return
+    /// exactly what no limit returns, in the same order, under every sort key
+    /// and direction.
+    ///
+    /// The deferral that makes the covering-limit case cheap changes WHERE the
+    /// ordering happens (off the index lock instead of under it). This pins that
+    /// it does not change WHAT comes back. Before the fix the two spellings took
+    /// different code paths entirely, the engine's comparator versus the
+    /// server's, which is exactly how their tie-ordering could drift apart
+    /// unnoticed.
+    #[test]
+    fn a_covering_limit_returns_the_same_page_as_no_limit() {
+        use goz_core::types::SortDir;
+        let vols = set(&[volume(r"C:\", merge_index(), VolumePhase::Live)]);
+        for key in [
+            SortKey::Name,
+            SortKey::Path,
+            SortKey::Size,
+            SortKey::DateModified,
+        ] {
+            for dir in [SortDir::Asc, SortDir::Desc] {
+                let page = |limit| {
+                    let mut q = query("log");
+                    q.sort = SortSpec { key, dir };
+                    q.limit = limit;
+                    paths(&encode_query_binary(&vols, q))
+                };
+                let unlimited = page(None);
+                assert!(!unlimited.is_empty(), "fixture must produce hits");
+                for limit in [u32::MAX, unlimited.len() as u32, unlimited.len() as u32 + 1] {
+                    assert_eq!(
+                        page(Some(limit)),
+                        unlimited,
+                        "{key:?}/{dir:?}: -n {limit} covers the set and must equal no limit"
+                    );
+                }
+            }
+        }
     }
 
     fn hello_request(proto_min: u16, proto_max: u16) -> Request {
