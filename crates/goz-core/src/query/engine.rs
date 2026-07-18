@@ -681,12 +681,21 @@ fn order_top(index: &VolumeIndex, cands: &mut [Candidate], sort: SortSpec, end: 
     // candidates); that is done in parallel across cores. Quickselect + small
     // sorts stay serial: they touch far less data and the rayon fan-out is not
     // worth it there.
+    use rayon::slice::ParallelSliceMut;
     const PARALLEL_SORT_MIN: usize = 100_000;
     if end < cands.len() {
         cands.select_nth_unstable_by(end - 1, |a, b| cmp_candidate(index, sort, a, b));
-        cands[..end].sort_unstable_by(|a, b| cmp_candidate(index, sort, a, b));
+        // The selected prefix is not always small: a page asking for all but a
+        // handful of matches selects nearly everything, and ordering that
+        // serially held the index read lock ~6x longer than the parallel branch
+        // below does for the same row count, stalling the volume's tail thread
+        // for the difference. Same threshold, same work, just not on one core.
+        if end >= PARALLEL_SORT_MIN {
+            cands[..end].par_sort_unstable_by(|a, b| cmp_candidate(index, sort, a, b));
+        } else {
+            cands[..end].sort_unstable_by(|a, b| cmp_candidate(index, sort, a, b));
+        }
     } else if cands.len() >= PARALLEL_SORT_MIN {
-        use rayon::slice::ParallelSliceMut;
         cands.par_sort_unstable_by(|a, b| cmp_candidate(index, sort, a, b));
     } else {
         cands.sort_unstable_by(|a, b| cmp_candidate(index, sort, a, b));
