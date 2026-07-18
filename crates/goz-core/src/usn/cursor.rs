@@ -56,11 +56,11 @@ pub enum Resync {
 }
 
 /// Why a full rescan was decided. [`validate_cursor`] produces only
-/// `JournalIdChanged` / `CursorPurged` / `RestampDiscontinuity`; `ParserAnomaly` and
-/// `EntryDeletedError` are mapped by the daemon from runtime conditions.
-/// `JournalNotActive`, `JournalDeleteInProgress`, and `VolumeReattached` are
-/// reserved for causes the daemon does not yet map. All live here so every
-/// rescan cause shares one telemetry vocabulary.
+/// `JournalIdChanged` / `CursorPurged` / `RestampDiscontinuity`; `ParserAnomaly`,
+/// `EntryDeletedError`, and `TailRevived` are mapped by the daemon from runtime
+/// conditions. `JournalNotActive`, `JournalDeleteInProgress`, and
+/// `VolumeReattached` are reserved for causes the daemon does not yet map. All
+/// live here so every rescan cause shares one telemetry vocabulary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RescanReason {
     /// Saved `UsnJournalID` differs from the live journal's: the journal
@@ -85,6 +85,10 @@ pub enum RescanReason {
     /// A corrupt buffer or cycle was detected while parsing/applying; we
     /// cannot prove what was missed (daemon-mapped).
     ParserAnomaly,
+    /// The volume's tail thread exited and its supervisor revived it; the
+    /// volume went untailed in between, so nothing proves the index is still
+    /// in sync (daemon-mapped).
+    TailRevived,
     /// The volume went away and came back; its journal may have advanced on
     /// another machine.
     VolumeReattached,

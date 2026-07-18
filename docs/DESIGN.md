@@ -13,7 +13,7 @@ goz is four crates:
 
 goz indexes fixed NTFS volumes; removable drives and non-NTFS filesystems (ReFS, exFAT, FAT32) are out of scope and are not tracked.
 
-The index is a cache of the filesystem, and a cache that cannot prove it is coherent must rebuild itself. Every sync-loss path (journal wrap, a missed delete, a parse anomaly, an ID mismatch, reads that stop answering, even a sick disk that leaves a journal read pending forever, which a watchdog cancels) ends in one of three states:
+The index is a cache of the filesystem, and a cache that cannot prove it is coherent must rebuild itself. Every sync-loss path (journal wrap, a missed delete, a parse anomaly, an ID mismatch, reads that stop answering, even a sick disk that leaves a journal read pending forever, which a supervisor cancels, or a tail thread that exits outright, which the same supervisor revives on a bounded budget) ends in one of three states:
 
 - **in sync**, provably;
 - **rescanning**, with a full rescan scheduled; or

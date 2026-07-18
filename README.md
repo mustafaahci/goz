@@ -13,7 +13,7 @@ goz indexes every filename on your fixed NTFS volumes and answers substring quer
 
 - **Fast.** 1.8x to 6.1x quicker than Everything across every query in our [benchmarks](docs/BENCHMARKS.md), on the same machine with the same result sets.
 - **Light.** ~215 MB resident under heavy querying and ~12 MB idle, against a ~3.97M-entry index.
-- **Live.** Tails the NTFS USN journal, so the index stays in sync as files change, including hard-link renames that Everything 1.4 misses.
+- **Live.** Tails the NTFS USN journal, so the index stays in sync as files change, including hard-link renames that Everything 1.4 misses. A tail thread that wedges on a sick disk or dies outright is cancelled or revived automatically.
 - **Scriptable.** Native `--json` output and a subset of `es.exe`-compatible flags with matching exit codes, so it drops into existing Everything workflows.
 - **Honest about state.** Every volume reports whether it is provably in sync, rescanning, or offline. It never serves stale results silently.
 

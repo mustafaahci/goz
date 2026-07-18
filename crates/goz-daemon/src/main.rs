@@ -16,11 +16,15 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(windows)]
 mod bootstrap;
 #[cfg(windows)]
+mod pulse;
+#[cfg(windows)]
 mod run;
 #[cfg(windows)]
 mod server;
 #[cfg(windows)]
 mod service;
+#[cfg(windows)]
+mod supervisor;
 #[cfg(windows)]
 mod tail;
 #[cfg(windows)]

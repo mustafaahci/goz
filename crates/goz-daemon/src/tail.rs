@@ -17,7 +17,7 @@
 //! `--status` shows it rather than hiding it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,7 @@ use goz_winfs::{
 };
 
 use crate::bootstrap;
+use crate::pulse::TailPulse;
 use crate::volume_state::VolumeState;
 
 /// Reason bits we ask the kernel to report: everything that changes a name,
@@ -64,60 +65,76 @@ const IDLE_POLL: Duration = Duration::from_millis(50);
 const DEGRADE_AFTER: Duration = Duration::from_secs(5);
 /// Read-retry backoff bounds. The ceiling is what keeps a permanently sick
 /// volume from writing a log line every 500 ms for the life of the service.
+/// The ceiling is `pub(crate)` because the supervisor's stall threshold must
+/// comfortably exceed it, and a test over there pins that coupling.
 const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(500);
-const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+pub(crate) const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Consecutive rescans before giving up and marking the volume Failed: a storm
 /// guard so a persistently broken journal cannot spin on rebuilds forever. Reset
 /// after any healthy batch.
 const MAX_RESCANS: u32 = 3;
 
-/// How long a tail thread may go without a heartbeat before the watchdog
-/// cancels its (presumed stuck) synchronous I/O. Must comfortably exceed both
-/// the retry backoff ceiling (30 s) and anything the loop does between
-/// stamps; rescans park the heartbeat but are excluded by phase instead.
-/// Observed live: a spinning-down HDD pended one `FSCTL_READ_USN_JOURNAL`
-/// IRP forever, freezing the D: tail with no error and no log line.
-pub(crate) const WATCHDOG_STALL: Duration = Duration::from_secs(300);
-
 /// A running tail thread and the flag that stops it.
 pub(crate) struct TailHandle {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
-    /// Volume this tail serves, for watchdog log lines.
+    /// Volume this tail serves, for supervisor log lines.
     pub(crate) mount: String,
-    /// Unix seconds of the tail loop's last liveness stamp.
-    pub(crate) heartbeat: Arc<AtomicU64>,
-    /// The tail thread's own phase, so the watchdog can skip legitimate long
-    /// operations (a rescan re-enumerates the whole MFT without stamping).
+    /// The tail's self-reported liveness: beating, busy in a rebuild, or
+    /// retired. The supervisor's stall and retirement decisions read only
+    /// this, never `state.phase`, which is user-facing honesty state; the
+    /// phase is consulted for exactly one thing, gating the revival budget
+    /// refund (see the supervisor's `accrue_health`).
+    pub(crate) pulse: Arc<TailPulse>,
+    /// Shared volume state, kept so the supervisor can revive a retired tail
+    /// (reopen by GUID, respawn) and correct the phase when it gives up.
     pub(crate) state: Arc<VolumeState>,
     /// Real handle to the tail thread, target of `cancel_synchronous_io`.
     pub(crate) io_handle: Arc<goz_winfs::ThreadIoHandle>,
 }
 
 impl TailHandle {
-    /// Signals the tail to stop and joins it.
+    /// Signals the tail to stop and joins it. Only safe against a thread
+    /// that will actually observe the flag; teardown of a possibly-wedged
+    /// tail goes through the supervisor's cancel-and-poll loop instead.
     pub(crate) fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
     }
+
+    /// Signals the tail to stop without joining, so teardown can flag every
+    /// tail before waiting on any single one of them.
+    pub(crate) fn signal_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the tail thread has exited, i.e. a join would not block.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
 }
 
-/// Spawns the tail thread for one volume. `handle` and the starting `cursor`
-/// are moved into the thread (the handle is not shared).
+/// Spawns the tail thread for one volume. `handle` is moved into the thread
+/// (it is not shared). `cursor: None` means the caller has no trustworthy
+/// starting point (a supervisor reviving a tail whose predecessor exited, so
+/// the volume went untailed for a while) and the thread's first act is a full
+/// rescan, which rebuilds the index and acquires a fresh cursor.
 pub(crate) fn spawn(
     state: Arc<VolumeState>,
     handle: VolumeHandle,
-    cursor: JournalInfo,
+    cursor: Option<JournalInfo>,
 ) -> std::io::Result<TailHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
-    let heartbeat = Arc::new(AtomicU64::new(now_unix()));
-    let heartbeat_thread = heartbeat.clone();
+    let pulse = Arc::new(TailPulse::new());
+    let pulse_thread = pulse.clone();
     let mount = state.mount_prefix().to_string();
     let state_thread = state.clone();
-    // The watchdog needs a REAL handle to this thread, and duplicating one
+    // The supervisor needs a REAL handle to this thread, and duplicating one
     // must happen ON the thread (the pseudo-handle is per-thread), so the
     // thread sends it back before entering the loop.
     let (io_tx, io_rx) = std::sync::mpsc::sync_channel(1);
@@ -128,14 +145,26 @@ pub(crate) fn spawn(
         .name(format!("goz-tail-{}", state.mount_prefix()))
         .spawn(move || {
             let io = goz_winfs::current_thread_io_handle();
+            let usable = io.is_ok();
             let _ = io_tx.send(io);
-            tail_loop(
-                &state_thread,
-                &handle,
-                cursor,
-                &stop_thread,
-                &heartbeat_thread,
-            )
+            if !usable {
+                // `spawn` is about to report failure and drop this thread's
+                // stop flag and join handle. Running on anyway would leak a
+                // live index writer that nobody can stop, join, supervise,
+                // or ever rescue from a wedge; and a caller that retries the
+                // spawn (the supervisor's revive) would then stack a second
+                // writer on the same volume. No tail beats a ghost tail.
+                return;
+            }
+            // Publishes `Retired` on ANY exit: the stop flag, a give-up
+            // return, or a panic unwind. This is what lets the supervisor
+            // trust silence: the only way to stop stamping without retiring
+            // is to be genuinely wedged in a syscall. The handle moves INTO
+            // tail_loop so its CloseHandle runs before this guard fires;
+            // `Retired` is a promise that joining is instant, and a close is
+            // itself an IRP a sick device can pend.
+            let _retired = pulse_thread.retire_on_drop();
+            tail_loop(&state_thread, handle, cursor, &stop_thread, &pulse_thread)
         })?;
     let io_handle = io_rx
         .recv()
@@ -145,87 +174,43 @@ pub(crate) fn spawn(
         stop,
         join: Some(join),
         mount,
-        heartbeat,
+        pulse,
         state,
         io_handle: Arc::new(io_handle),
     })
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// One tail thread as the watchdog sees it.
-pub(crate) struct WatchedTail {
-    pub(crate) mount: String,
-    pub(crate) heartbeat: Arc<AtomicU64>,
-    pub(crate) state: Arc<VolumeState>,
-    pub(crate) io: Arc<goz_winfs::ThreadIoHandle>,
-}
-
-/// Runs forever (daemon-thread lifetime): every 30 s, any tail whose
-/// heartbeat is older than [`WATCHDOG_STALL`] and whose volume is not
-/// mid-rescan gets its blocked synchronous I/O cancelled. The aborted call
-/// returns `ERROR_OPERATION_ABORTED` to the tail loop, whose ordinary retry
-/// path (backoff, Offline past the degrade window, recovery on success)
-/// takes over. Repeats every scan while the stall persists, so an IRP that
-/// ignores one cancel gets another.
-pub(crate) fn watchdog_loop(tails: Vec<WatchedTail>) {
-    loop {
-        std::thread::sleep(Duration::from_secs(30));
-        let now = now_unix();
-        for WatchedTail {
-            mount,
-            heartbeat,
-            state,
-            io,
-        } in &tails
-        {
-            let hb = heartbeat.load(Ordering::Relaxed);
-            let stalled = now.saturating_sub(hb) >= WATCHDOG_STALL.as_secs();
-            if !stalled {
-                continue;
-            }
-            if matches!(
-                *state.phase.read(),
-                goz_core::types::VolumePhase::Rescanning
-            ) {
-                continue; // a full MFT re-enumeration legitimately parks the heartbeat
-            }
-            tracing::error!(
-                volume = %mount,
-                stalled_secs = now.saturating_sub(hb),
-                thread_id = io.thread_id,
-                "tail thread heartbeat stalled; cancelling its blocked synchronous I/O"
-            );
-            match goz_winfs::cancel_synchronous_io(io) {
-                Ok(true) => {
-                    tracing::warn!(volume = %mount, "stuck journal I/O cancelled; tail will retry")
-                }
-                Ok(false) => {
-                    tracing::warn!(volume = %mount, "tail stalled but not in a cancellable wait")
-                }
-                Err(e) => {
-                    tracing::error!(volume = %mount, error = %e, "cancelling stuck I/O failed")
-                }
-            }
-        }
-    }
-}
-
 fn tail_loop(
     state: &VolumeState,
-    handle: &VolumeHandle,
-    cursor: JournalInfo,
+    handle: VolumeHandle,
+    cursor: Option<JournalInfo>,
     stop: &AtomicBool,
-    heartbeat: &AtomicU64,
+    pulse: &TailPulse,
 ) {
+    // Owned so it drops in THIS frame, on return and on unwind alike, before
+    // the spawning closure's retire guard publishes `Retired`. A thread that
+    // claimed Retired while still wedged in its handle's CloseHandle would
+    // draw an unbounded join from the supervisor's give-up or revive path.
+    let handle = &handle;
+    let mut rescans: u32 = 0;
+    // A revived tail starts with no cursor: changes kept landing while the
+    // volume had no tail, so nothing proves the index is in sync. Rebuild it
+    // and pick up a fresh cursor before tailing a single record. Deliberately
+    // NOT routed through `bounded_rescan`: this rebuild is revival's price,
+    // not a journal fault, and charging it would leave every revived
+    // incarnation one incident short of the documented budget (the counter
+    // only resets on a non-empty batch, so on a quiet volume the charge
+    // would never clear). Revival storms are bounded by the supervisor's own
+    // budget instead.
+    let cursor = match cursor {
+        Some(c) => c,
+        None => match rescan(state, handle, pulse, RescanReason::TailRevived, stop) {
+            Some(c) => c,
+            None => return,
+        },
+    };
     let mut start_usn = cursor.next_usn;
     let mut journal_id = cursor.journal_id;
-    let mut rescans: u32 = 0;
     let mut buf = vec![0u8; READ_BUFFER_BYTES];
     // Journal-read failure streak. `degraded` records that WE moved the volume
     // to Offline, so only we move it back and we never stomp a phase someone
@@ -235,9 +220,9 @@ fn tail_loop(
     let mut degraded = false;
 
     while !stop.load(Ordering::Relaxed) {
-        // Liveness stamp for the watchdog: as long as this loop is turning,
+        // Liveness stamp for the supervisor: as long as this loop is turning,
         // however unhealthily, no one cancels our I/O.
-        heartbeat.store(now_unix(), Ordering::Relaxed);
+        pulse.beat();
         match read_usn_journal(handle, start_usn, journal_id, REASON_MASK, 0, &mut buf) {
             Ok(bytes) => {
                 if degraded {
@@ -258,6 +243,7 @@ fn tail_loop(
                         match bounded_rescan(
                             state,
                             handle,
+                            pulse,
                             RescanReason::ParserAnomaly,
                             &format!("{e:?}"),
                             &mut rescans,
@@ -307,11 +293,11 @@ fn tail_loop(
                     .collect();
                 dirty.sort_unstable();
                 dirty.dedup();
-                enrich_stats(state, handle, &dirty);
+                enrich_stats(state, handle, &dirty, stop, pulse);
                 // A hard-link change also alters the file's NAMES, which no stat
                 // can refresh and which the record itself cannot be trusted for
                 // (it may name a link that is already dead).
-                reconcile_links(state, handle, &outcome.needs_link_reconcile);
+                reconcile_links(state, handle, &outcome.needs_link_reconcile, stop, pulse);
                 if outcome.wants_compact {
                     compact_index(state);
                 }
@@ -325,6 +311,7 @@ fn tail_loop(
                 match bounded_rescan(
                     state,
                     handle,
+                    pulse,
                     RescanReason::EntryDeletedError,
                     &e.to_string(),
                     &mut rescans,
@@ -349,7 +336,15 @@ fn tail_loop(
                 } else {
                     RescanReason::JournalDeleteInProgress
                 };
-                match bounded_rescan(state, handle, reason, &e.to_string(), &mut rescans, stop) {
+                match bounded_rescan(
+                    state,
+                    handle,
+                    pulse,
+                    reason,
+                    &e.to_string(),
+                    &mut rescans,
+                    stop,
+                ) {
                     Some(c) => {
                         start_usn = c.next_usn;
                         journal_id = c.journal_id;
@@ -386,7 +381,9 @@ fn tail_loop(
                 }
                 // Growing backoff, so a permanently sick volume costs one line
                 // per RETRY_BACKOFF_MAX instead of one every 500 ms forever.
-                std::thread::sleep(backoff);
+                // Interruptible: a stop arriving mid-backoff must not wait out
+                // up to 30 s, or teardown would mistake this tail for wedged.
+                sleep_unless_stopped(stop, backoff);
                 backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
             }
         }
@@ -442,7 +439,13 @@ fn compact_index(state: &VolumeState) {
 /// An FRN whose walk fails is SKIPPED, never reconciled to an empty set:
 /// `reconcile_links` treats empty as a delete, so a transient lock would
 /// otherwise erase a live file from the index.
-fn reconcile_links(state: &VolumeState, handle: &VolumeHandle, frns: &[Frn]) {
+fn reconcile_links(
+    state: &VolumeState,
+    handle: &VolumeHandle,
+    frns: &[Frn],
+    stop: &AtomicBool,
+    pulse: &TailPulse,
+) {
     if frns.is_empty() {
         return;
     }
@@ -450,6 +453,16 @@ fn reconcile_links(state: &VolumeState, handle: &VolumeHandle, frns: &[Frn]) {
     let mut dropped = 0u64;
 
     for &frn in frns {
+        // Teardown must not wait behind a long walk batch: each iteration is
+        // a blocking open, and dozens on a slow disk outlast the teardown
+        // deadline. The daemon is exiting; the results would never be served.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        // Per-file progress IS liveness: without the stamp, a long batch on
+        // a slow disk reads as a stale beat, which delays the supervisor's
+        // budget refund and inches toward a spurious stall verdict.
+        pulse.beat();
         let links = match goz_winfs::link_paths(handle, frn.0) {
             Ok(Some(l)) if !l.is_empty() => l,
             // Gone, locked, or unwalkable: leave the entry alone. The structural
@@ -522,12 +535,25 @@ fn split_parent(path: &[u8]) -> (&[u8], &[u8]) {
 /// the CSV output renders as a directory). Stats every file with the write lock
 /// RELEASED, since `OpenFileById` must never run under it, then applies the whole
 /// batch under one short lock.
-fn enrich_stats(state: &VolumeState, handle: &VolumeHandle, frns: &[u64]) {
+fn enrich_stats(
+    state: &VolumeState,
+    handle: &VolumeHandle,
+    frns: &[u64],
+    stop: &AtomicBool,
+    pulse: &TailPulse,
+) {
     if frns.is_empty() {
         return;
     }
     let mut stats: Vec<(Frn, u64, i64)> = Vec::with_capacity(frns.len());
     for &frn in frns {
+        // Same teardown escape as `reconcile_links`: a large dirty batch of
+        // blocking opens must not make a healthy tail look wedged.
+        if stop.load(Ordering::Relaxed) {
+            break; // apply what was already gathered
+        }
+        // Per-file liveness stamp, same reason as `reconcile_links`.
+        pulse.beat();
         match stat_file(handle, frn) {
             Ok(Some(s)) => stats.push((Frn(frn), s.size, s.mtime_ft)),
             Ok(None) => {} // gone or locked: nothing to refresh
@@ -553,6 +579,7 @@ fn enrich_stats(state: &VolumeState, handle: &VolumeHandle, frns: &[u64]) {
 fn bounded_rescan(
     state: &VolumeState,
     handle: &VolumeHandle,
+    pulse: &TailPulse,
     reason: RescanReason,
     detail: &str,
     rescans: &mut u32,
@@ -567,7 +594,7 @@ fn bounded_rescan(
         );
         return None;
     }
-    rescan(state, handle, reason, stop)
+    rescan(state, handle, pulse, reason, stop)
 }
 
 /// Rebuilds this volume's index in place after a journal loss (wrap, deletion,
@@ -578,11 +605,26 @@ fn bounded_rescan(
 fn rescan(
     state: &VolumeState,
     handle: &VolumeHandle,
+    pulse: &TailPulse,
     reason: RescanReason,
     stop: &AtomicBool,
 ) -> Option<JournalInfo> {
     tracing::warn!(volume = %state.mount_prefix(), ?reason, "journal lost; rebuilding index");
+    // The rebuild re-enumerates the whole MFT without stamping the pulse.
+    // `Busy` tells the supervisor this silence is legitimate; the guard
+    // restores a fresh beat on every way out of this function.
+    let _busy = pulse.busy_scope();
     *state.phase.write() = VolumePhase::Rescanning;
+
+    // Capture the cursor BEFORE enumerating, exactly as first-time bootstrap
+    // does. A change landing after its MFT region was enumerated but before
+    // a late cursor capture would be in neither the snapshot nor the replay,
+    // and nothing would ever notice; captured first, such changes replay
+    // from the journal. The other race is safe: a journal deleted or
+    // recreated DURING the rebuild invalidates this cursor, the first read
+    // from it fails, and the ordinary error arms trigger another rescan. A
+    // stale cursor is loud, a late cursor is silent.
+    let cursor = bootstrap::ensure_journal(handle);
 
     // Pass the stop flag so a shutdown arriving mid-rebuild aborts promptly
     // instead of blocking `TailHandle::shutdown`'s join for the full MFT scan.
@@ -597,9 +639,6 @@ fn rescan(
         }
     };
 
-    // Re-acquire a cursor before publishing the index, so the journal (which may
-    // have been recreated after a deletion) is captured against the fresh state.
-    let cursor = bootstrap::ensure_journal(handle);
     {
         let mut index = state.index.write();
         *index = new_index;
@@ -633,7 +672,30 @@ fn rescan(
     }
 }
 
+/// Sleeps up to `total`, waking early if `stop` flips. Plain `sleep` here
+/// would hold a stopping tail hostage to its own backoff (up to 30 s), which
+/// teardown's cancel-and-poll rescue would misread as a wedged thread.
+fn sleep_unless_stopped(stop: &AtomicBool, total: Duration) {
+    let deadline = Instant::now() + total;
+    while !stop.load(Ordering::Relaxed) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
 fn mark_failed(state: &VolumeState, reason: RescanReason, detail: &str) {
+    // The tail is about to exit for good. Without this line the volume died
+    // silently: nothing else announces the exit, and the supervisor's later
+    // revival attempts were the first evidence anything happened.
+    tracing::error!(
+        volume = %state.mount_prefix(),
+        ?reason,
+        detail,
+        "volume failed; its tail is stopping and live updates have ended"
+    );
     *state.phase.write() = VolumePhase::Failed {
         reason: format!("{reason:?}: {detail}"),
     };

@@ -297,9 +297,7 @@ fn run_service() -> Result<()> {
         if let Err(e) = server::run(engine.volumes, stop_rx) {
             tracing::error!(error = %e, "pipe server error");
         }
-        for t in engine.tails {
-            t.shutdown();
-        }
+        engine.supervisor.shutdown();
     });
 
     // Heartbeat StartPending until the engine reports ready (or fails).

@@ -10,6 +10,7 @@ use goz_core::types::VolumePhase;
 use parking_lot::RwLock;
 use tokio::sync::watch;
 
+use crate::supervisor::Supervisor;
 use crate::tail::{self, TailHandle};
 use crate::volume_state::{VolumeSet, VolumeState};
 use crate::{bootstrap, server};
@@ -18,7 +19,8 @@ use crate::{bootstrap, server};
 /// exists) tailing live. Shared by console and service entry points.
 pub(crate) struct Engine {
     pub volumes: VolumeSet,
-    pub tails: Vec<TailHandle>,
+    /// Owns every tail thread; see [`Supervisor::shutdown`] for teardown.
+    pub supervisor: Supervisor,
     pub total_entries: usize,
     pub elapsed: Duration,
 }
@@ -78,12 +80,14 @@ pub(crate) fn build_engine() -> Result<Engine> {
                     entries = state.index.read().len(),
                     "tailing journal"
                 );
-                match tail::spawn(state.clone(), bv.handle, cursor) {
+                match tail::spawn(state.clone(), bv.handle, Some(cursor)) {
                     Ok(h) => tails.push(h),
                     Err(e) => {
-                        // OS thread creation failed (resource pressure). Degrade
-                        // just this volume to Offline instead of aborting the
-                        // whole engine bootstrap; status will flag it incomplete.
+                        // Thread creation or its handle duplication failed
+                        // (resource pressure); either way no tail is running.
+                        // Degrade just this volume to Offline instead of
+                        // aborting the whole engine bootstrap; status will
+                        // flag it incomplete.
                         tracing::error!(
                             volume = %state.mount_prefix(),
                             error = %e,
@@ -110,28 +114,11 @@ pub(crate) fn build_engine() -> Result<Engine> {
         states.push(state);
     }
 
-    // One watchdog for every tail: the only defense against a device that
-    // pends a synchronous journal IRP forever (observed on a spinning-down
-    // HDD), which no amount of in-loop error handling can see.
-    if !tails.is_empty() {
-        let watched: Vec<_> = tails
-            .iter()
-            .map(|t| tail::WatchedTail {
-                mount: t.mount.clone(),
-                heartbeat: t.heartbeat.clone(),
-                state: t.state.clone(),
-                io: t.io_handle.clone(),
-            })
-            .collect();
-        if let Err(e) = std::thread::Builder::new()
-            .name("goz-tail-watchdog".into())
-            .spawn(move || tail::watchdog_loop(watched))
-        {
-            // Degraded but not fatal: tails still run, they just lose the
-            // stuck-I/O rescue.
-            tracing::error!(error = %e, "failed to spawn tail watchdog");
-        }
-    }
+    // One supervisor for every tail: cancels journal I/O that a sick device
+    // pends forever (observed on a spinning-down HDD), which no in-loop error
+    // handling can see, and revives tails that exit outright, on a bounded
+    // budget. It takes ownership of the tails; teardown goes through it.
+    let supervisor = Supervisor::spawn(tails);
 
     // Purge THIS thread's allocator heap before handing off. The bootstrap
     // transients (sparse FRN maps swapped for dense, enumeration buffers,
@@ -145,7 +132,7 @@ pub(crate) fn build_engine() -> Result<Engine> {
 
     Ok(Engine {
         volumes: Arc::new(states),
-        tails,
+        supervisor,
         total_entries,
         elapsed: started.elapsed(),
     })
@@ -216,8 +203,6 @@ pub(crate) fn run_console() -> Result<()> {
     let (_stop_tx, stop_rx) = watch::channel(false);
     let result = server::run(engine.volumes, stop_rx);
 
-    for t in engine.tails {
-        t.shutdown();
-    }
+    engine.supervisor.shutdown();
     result
 }

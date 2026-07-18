@@ -18,8 +18,8 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::error::WinError;
 
-/// A real (non-pseudo) handle to a thread, held so a watchdog can cancel that
-/// thread's blocked synchronous I/O. Closes the handle on drop.
+/// A real (non-pseudo) handle to a thread, held so a supervisor can cancel
+/// that thread's blocked synchronous I/O. Closes the handle on drop.
 #[derive(Debug)]
 pub struct ThreadIoHandle {
     handle: HANDLE,
@@ -103,10 +103,10 @@ mod tests {
     use std::time::Duration;
 
     /// End to end against a genuinely blocked synchronous read: a thread
-    /// blocks reading an anonymous pipe nobody writes to, the "watchdog"
+    /// blocks reading an anonymous pipe nobody writes to, the "supervisor"
     /// (this test) cancels it, and the read returns ERROR_OPERATION_ABORTED
     /// instead of blocking forever. This is the exact rescue the tail
-    /// watchdog performs on a stuck FSCTL_READ_USN_JOURNAL.
+    /// supervisor performs on a stuck FSCTL_READ_USN_JOURNAL.
     #[test]
     fn cancels_a_blocked_synchronous_read() {
         use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
