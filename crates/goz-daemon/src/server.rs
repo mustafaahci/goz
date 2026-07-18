@@ -599,7 +599,7 @@ fn folded_name(path: &[u8]) -> Vec<u8> {
 }
 
 /// Globally orders the per-volume runs (each already sorted by `sort` inside
-/// [`run_query`]) into one list.
+/// [`run_query_deferrable`]) into one list.
 ///
 /// A name sort needs no re-sort: the folded file name is volume-independent and
 /// each run is already in that order, so the runs are k-way merged in O(n),

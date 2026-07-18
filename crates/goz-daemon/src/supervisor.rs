@@ -1,5 +1,5 @@
 //! Tail supervision: one background thread that reads every tail's
-//! [`Pulse`](crate::pulse::Pulse) and acts on it.
+//! [`Pulse`] and acts on it.
 //!
 //! Three verdicts, one per pulse state:
 //!
