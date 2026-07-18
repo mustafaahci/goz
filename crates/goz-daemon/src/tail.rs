@@ -63,6 +63,12 @@ const IDLE_POLL: Duration = Duration::from_millis(50);
 /// `ERROR_NOT_READY` for a moment); several seconds of them means the index has
 /// stopped tracking the volume, which every consumer must be told.
 const DEGRADE_AFTER: Duration = Duration::from_secs(5);
+/// How long journal reads may keep failing before retrying stops and a
+/// bounded rescan takes over. Long enough that a spin-up's `ERROR_NOT_READY`
+/// window (~15 s worst observed) never triggers a needless rebuild, short
+/// enough that an unmappable error (see the escalation comment in the read
+/// loop) costs seconds of zombie time, not forever.
+const ESCALATE_AFTER: Duration = Duration::from_secs(30);
 /// Read-retry backoff bounds. The ceiling is what keeps a permanently sick
 /// volume from writing a log line every 500 ms for the life of the service.
 /// The ceiling is `pub(crate)` because the supervisor's stall threshold must
@@ -367,6 +373,37 @@ fn tail_loop(
                 // say so and let `--status`, `Hello.ready`, and every result page
                 // carry it.
                 let since = *failing_since.get_or_insert_with(Instant::now);
+                // Nor may we retry FOREVER: deleting the journal mid-read was
+                // observed to answer the stale cursor with
+                // ERROR_INVALID_PARAMETER (87), a code no arm maps, and no
+                // retry of that can ever succeed, so the volume sat Offline
+                // permanently while its tail beat away and the supervisor
+                // (correctly) saw nothing to revive. Past `ESCALATE_AFTER`
+                // the code no longer matters: reads that will not stop
+                // failing mean the journal cannot be trusted, so rebuild.
+                // Bounded: a rescan that fails retires the tail into the
+                // supervisor's revival budget instead of looping here.
+                if since.elapsed() >= ESCALATE_AFTER {
+                    match bounded_rescan(
+                        state,
+                        handle,
+                        pulse,
+                        RescanReason::ReadsKeptFailing,
+                        &e.to_string(),
+                        &mut rescans,
+                        stop,
+                    ) {
+                        Some(c) => {
+                            start_usn = c.next_usn;
+                            journal_id = c.journal_id;
+                            failing_since = None;
+                            backoff = RETRY_BACKOFF_MIN;
+                            degraded = false;
+                        }
+                        None => return,
+                    }
+                    continue;
+                }
                 if !degraded && since.elapsed() >= DEGRADE_AFTER {
                     tracing::error!(
                         volume = %state.mount_prefix(),
@@ -703,7 +740,7 @@ fn mark_failed(state: &VolumeState, reason: RescanReason, detail: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEGRADE_AFTER, REASON_MASK, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN};
+    use super::{DEGRADE_AFTER, ESCALATE_AFTER, REASON_MASK, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN};
     use goz_core::types::Frn;
     use goz_core::usn::ops_for;
     use goz_core::usn::record::ParsedUsnRecord;
@@ -775,6 +812,14 @@ mod tests {
         assert!(RETRY_BACKOFF_MAX > RETRY_BACKOFF_MIN);
         // The first retry must be prompt enough that a blip costs no freshness.
         assert!(RETRY_BACKOFF_MIN <= Duration::from_secs(1));
+        // Escalation must announce Offline first (honesty precedes surgery)
+        // and outlast a spin-up's NOT_READY window (~15 s worst observed), or
+        // every sleepy drive would eat a full MFT rebuild on wake.
+        assert!(ESCALATE_AFTER > DEGRADE_AFTER);
+        assert!(ESCALATE_AFTER >= Duration::from_secs(20));
+        // But not so patient that an unmappable read error (the observed
+        // ERROR_INVALID_PARAMETER zombie) parks a volume for minutes.
+        assert!(ESCALATE_AFTER <= Duration::from_secs(120));
     }
 
     /// The converse direction is deliberately NOT asserted: the mask may name
