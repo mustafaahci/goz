@@ -274,6 +274,11 @@ pub(crate) fn build_index(
         enum_secs = Some(enum_start.elapsed().as_secs_f64());
     }
 
+    // Every record has been seen: densify the FRN map, build the name
+    // order, return the growth slack. Here rather than in the caller so a
+    // rescan's index gets the same treatment as the first build's.
+    index.optimize_storage();
+
     Ok(Some(BuiltIndex {
         index,
         layout_secs,

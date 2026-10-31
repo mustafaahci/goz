@@ -15,6 +15,7 @@
 pub(crate) mod store;
 pub mod volume;
 
+pub(crate) use store::NameId;
 pub use store::{ComponentBytes, EntryFlags, FrnMap, NameRef};
 pub use volume::{
     Anomaly, ApplyOutcome, EntryView, IndexMemory, IndexStats, LinkTarget, NTFS_ROOT_FRN,

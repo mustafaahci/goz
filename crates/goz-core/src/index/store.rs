@@ -100,7 +100,25 @@ pub(crate) struct NameStore {
     by_bytes: hashbrown::HashTable<NameId>,
     /// Dead bytes in `raw` + `folded`, the compaction cue.
     garbage: usize,
+    /// Ids in folded-name order (ties by id): what a name-sorted page walks
+    /// instead of sorting. Built once by [`Self::build_order`] after
+    /// bootstrap; names interned later wait in `unranked` until
+    /// [`Self::merge_unranked`] folds them in. Dead ids linger until a merge
+    /// or compaction drops them (their chains are empty).
+    order: Vec<NameId>,
+    /// Per id: the position in `order` of the first live id with the same
+    /// folded bytes (equal names share it, so it orders like the bytes), or
+    /// [`UNRANKED`] while the id waits.
+    rank_of: Vec<u32>,
+    /// Ids interned since the last merge, in intern order.
+    unranked: Vec<NameId>,
+    /// Ranked ids that died since the last merge: each widens the probes a
+    /// query's binary search makes around it, so they count toward a merge.
+    dead_ranked: usize,
 }
+
+/// A name not (yet) in the order.
+pub(crate) const UNRANKED: u32 = u32::MAX;
 
 fn hash_bytes(b: &[u8]) -> u64 {
     use core::hash::{Hash, Hasher};
@@ -113,6 +131,13 @@ fn hash_bytes(b: &[u8]) -> u64 {
 /// `NameStore::shrink_with_headroom` for why never to exact-fit).
 fn shrink_vec<T>(v: &mut Vec<T>) {
     v.shrink_to(v.len() + v.len() / 64 + 64);
+}
+
+/// `NameStore::folded_bytes_of` over explicit tables, for closures that sort
+/// or merge ids while another field is mutably borrowed.
+fn folded_in<'a>(pairs: &'a [NamePair], folded: &'a [u8], id: NameId) -> &'a [u8] {
+    let r = pairs[id as usize].folded;
+    &folded[r.off as usize..r.off as usize + r.len as usize]
 }
 
 /// `NameStore::raw_bytes` over explicit tables: the intern table's rehash
@@ -140,7 +165,6 @@ impl NameStore {
     }
 
     /// Number of name ids ever allocated (live + dead-awaiting-compaction).
-    #[cfg(test)]
     pub(crate) fn ids(&self) -> usize {
         self.pairs.len()
     }
@@ -176,6 +200,8 @@ impl NameStore {
         self.pairs.push(NamePair { raw, folded });
         self.refcount.push(1);
         self.head.push(NIL);
+        self.rank_of.push(UNRANKED);
+        self.unranked.push(id);
         let Self {
             by_bytes,
             pairs,
@@ -267,6 +293,9 @@ impl NameStore {
         if let Ok(entry) = self.by_bytes.find_entry(hash, |&cand| cand == id) {
             entry.remove();
         }
+        if self.rank_of[i] != UNRANKED {
+            self.dead_ranked += 1;
+        }
         // Zero the folded bytes (the scan haystack) and, if separately
         // stored, the raw bytes. Garbage counts both plus separators.
         let f = pair.folded;
@@ -335,6 +364,19 @@ impl NameStore {
     /// built; the volume's single-writer discipline (one tail thread, which
     /// plans and applies back to back under an upgradable lock) provides that.
     pub(crate) fn install_compacted(&mut self, c: CompactedNames) -> Vec<NameId> {
+        // The order and the waiting list carry old ids: renumber them before
+        // the tables change, dropping the dead. Renumbering keeps relative
+        // order, so the order stays sorted.
+        let renumber = |ids: &[NameId]| -> Vec<NameId> {
+            ids.iter()
+                .filter_map(|&id| {
+                    let n = c.remap[id as usize];
+                    (n != NIL).then_some(n)
+                })
+                .collect()
+        };
+        self.order = renumber(&self.order);
+        self.unranked = renumber(&self.unranked);
         self.raw = c.raw;
         self.folded = c.folded;
         self.pairs = c.pairs;
@@ -350,7 +392,203 @@ impl NameStore {
             });
         }
         self.by_bytes = table;
+        self.rank_of = vec![UNRANKED; self.pairs.len()];
+        self.dead_ranked = 0;
+        self.rerank();
         c.remap
+    }
+
+    // -- name order ---------------------------------------------------------
+
+    /// Ids in folded-name order (ties by id). Dead ids may linger until the
+    /// next merge or compaction; their chains are empty and their refcount 0.
+    #[inline]
+    pub(crate) fn order(&self) -> &[NameId] {
+        &self.order
+    }
+
+    /// Ids interned since the last merge, in intern order.
+    #[inline]
+    pub(crate) fn unranked(&self) -> &[NameId] {
+        &self.unranked
+    }
+
+    #[inline]
+    pub(crate) fn is_ranked(&self, id: NameId) -> bool {
+        self.rank_of[id as usize] != UNRANKED
+    }
+
+    /// The rank of `id`: the position in the order of the first live id with
+    /// the same folded bytes, or [`UNRANKED`]. Read by the test invariant.
+    #[cfg(test)]
+    pub(crate) fn rank(&self, id: NameId) -> u32 {
+        self.rank_of[id as usize]
+    }
+
+    #[inline]
+    pub(crate) fn refcount(&self, id: NameId) -> u32 {
+        self.refcount[id as usize]
+    }
+
+    /// Sorts every live id into the name order and ranks it: the one full
+    /// sort, run once after bootstrap (about 100 ms per million names across
+    /// cores). Names that arrive later wait in `unranked` until
+    /// [`Self::merge_unranked`] folds them in.
+    pub(crate) fn build_order(&mut self) {
+        use rayon::slice::ParallelSliceMut;
+        let mut order: Vec<NameId> = {
+            let Self {
+                pairs,
+                folded,
+                refcount,
+                ..
+            } = &*self;
+            let mut order: Vec<NameId> = (0..pairs.len() as NameId)
+                .filter(|&id| refcount[id as usize] > 0)
+                .collect();
+            order.par_sort_unstable_by(|&a, &b| {
+                folded_in(pairs, folded, a)
+                    .cmp(folded_in(pairs, folded, b))
+                    .then(a.cmp(&b))
+            });
+            order
+        };
+        core::mem::swap(&mut self.order, &mut order);
+        self.unranked.clear();
+        self.dead_ranked = 0;
+        self.rerank();
+    }
+
+    /// Whether enough names sit outside the order that queries pay for it: an
+    /// unranked name costs a query a binary search, a dead ranked name widens
+    /// the probes around it. Past 1024 of either, or 0.1% of the ranked
+    /// names, the tail folds them in with [`Self::merge_unranked`].
+    pub(crate) fn wants_merge(&self) -> bool {
+        let limit = 1024.max(self.order.len() / 1000);
+        self.unranked.len() > limit || self.dead_ranked > limit
+    }
+
+    /// Folds the unranked ids into the order and drops the dead ones: one
+    /// O(n) merge, a few milliseconds per million names, run under the write
+    /// lock on the tail's apply path. Deliberately a merge, never a re-sort.
+    pub(crate) fn merge_unranked(&mut self) {
+        if self.order.is_empty() {
+            self.build_order();
+            return;
+        }
+        let mut new: Vec<NameId> = core::mem::take(&mut self.unranked);
+        let old: Vec<NameId> = core::mem::take(&mut self.order);
+        let merged = {
+            let Self {
+                pairs,
+                folded,
+                refcount,
+                ..
+            } = &*self;
+            let key = |id: NameId| (folded_in(pairs, folded, id), id);
+            new.retain(|&id| refcount[id as usize] > 0);
+            new.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
+            let mut merged = Vec::with_capacity(old.len() + new.len());
+            let mut old_live = old
+                .iter()
+                .copied()
+                .filter(|&id| refcount[id as usize] > 0)
+                .peekable();
+            let mut new_it = new.into_iter().peekable();
+            while let (Some(o), Some(n)) = (old_live.peek().copied(), new_it.peek().copied()) {
+                if key(n) < key(o) {
+                    merged.push(n);
+                    new_it.next();
+                } else {
+                    merged.push(o);
+                    old_live.next();
+                }
+            }
+            merged.extend(old_live);
+            merged.extend(new_it);
+            merged
+        };
+        self.order = merged;
+        self.dead_ranked = 0;
+        self.rerank();
+    }
+
+    /// Recomputes every rank from the order: equal folded names share the
+    /// position of the first live one of them; dead and waiting ids rank with
+    /// nothing.
+    fn rerank(&mut self) {
+        let Self {
+            order,
+            rank_of,
+            pairs,
+            folded,
+            refcount,
+            ..
+        } = self;
+        rank_of.iter_mut().for_each(|r| *r = UNRANKED);
+        let mut group_start = 0usize;
+        let mut prev_live: Option<&[u8]> = None;
+        for (pos, &id) in order.iter().enumerate() {
+            if refcount[id as usize] == 0 {
+                continue;
+            }
+            let f = folded_in(pairs, folded, id);
+            if prev_live != Some(f) {
+                group_start = pos;
+                prev_live = Some(f);
+            }
+            rank_of[id as usize] = group_start as u32;
+        }
+    }
+
+    /// The integer a name-sorted candidate is ordered by: `2 * rank + 1` for
+    /// a ranked id; for an unranked one, `2 * rank + 1` of the ranked group
+    /// its folded bytes equal, else `2 * p` for the position `p` where they
+    /// would be inserted, which lands strictly between the neighbouring
+    /// ranked keys. So an unranked name sorts exactly where a full re-sort
+    /// would put it. Two unranked names between the same neighbours tie on
+    /// the key; the caller breaks that on the folded bytes.
+    pub(crate) fn rank_key(&self, id: NameId) -> u64 {
+        let r = self.rank_of[id as usize];
+        if r != UNRANKED {
+            return 2 * u64::from(r) + 1;
+        }
+        let x = self.folded_bytes_of(id);
+        let p = self.insertion_point(x);
+        match self.first_live_at(p) {
+            Some(pos) if self.folded_bytes_of(self.order[pos]) == x => {
+                2 * u64::from(self.rank_of[self.order[pos] as usize]) + 1
+            }
+            _ => 2 * p as u64,
+        }
+    }
+
+    /// First position at or after `from` holding a live id.
+    fn first_live_at(&self, from: usize) -> Option<usize> {
+        (from..self.order.len()).find(|&p| self.refcount[self.order[p] as usize] > 0)
+    }
+
+    /// A position `p` in the order such that every live id before `p` folds
+    /// below `x` and every live id from `p` on folds at or above it. Dead ids
+    /// are zero-filled and no longer in byte order, so the search probes past
+    /// them; any `p` inside a run of dead ids is equally valid, since nothing
+    /// live lies between.
+    fn insertion_point(&self, x: &[u8]) -> usize {
+        let (mut lo, mut hi) = (0usize, self.order.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.first_live_at(mid).filter(|&p| p < hi) {
+                None => hi = mid, // [mid, hi) is all dead
+                Some(p) => {
+                    if self.folded_bytes_of(self.order[p]) < x {
+                        lo = p + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+            }
+        }
+        lo
     }
 
     pub(crate) fn raw_mem(&self) -> ComponentBytes {
@@ -368,6 +606,9 @@ impl NameStore {
         ComponentBytes::of_vec(&self.pairs)
             + ComponentBytes::of_vec(&self.refcount)
             + ComponentBytes::of_vec(&self.head)
+            + ComponentBytes::of_vec(&self.order)
+            + ComponentBytes::of_vec(&self.rank_of)
+            + ComponentBytes::of_vec(&self.unranked)
             + ComponentBytes {
                 used: self.by_bytes.len() as u64 * intern_per,
                 allocated: intern_buckets * intern_per,
@@ -387,6 +628,9 @@ impl NameStore {
         shrink_vec(&mut self.pairs);
         shrink_vec(&mut self.refcount);
         shrink_vec(&mut self.head);
+        shrink_vec(&mut self.order);
+        shrink_vec(&mut self.rank_of);
+        shrink_vec(&mut self.unranked);
         let Self {
             by_bytes,
             pairs,

@@ -8,7 +8,7 @@
 //! deferred until a candidate has passed everything else.
 
 use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange};
-use crate::index::VolumeIndex;
+use crate::index::{NameId, VolumeIndex};
 use crate::types::{EntryIdx, Frn, SortDir, SortKey, SortSpec};
 use memchr::memmem;
 use rustc_hash::FxHashMap;
@@ -69,6 +69,11 @@ pub struct CompiledQuery<'a> {
     /// scan. `None` when nothing offers a usable literal (then the query
     /// iterates every entry).
     prefilter: Option<Vec<u8>>,
+    /// `true` when a prefilter hit IS a name match: the prefilter is the
+    /// query's only name term and there is no wildcard or extension filter.
+    /// The scan then skips re-testing the name it has just found, which on a
+    /// broad query was a second `memmem` per distinct name for nothing.
+    prefilter_decides_name: bool,
 }
 
 impl<'a> CompiledQuery<'a> {
@@ -81,17 +86,19 @@ impl<'a> CompiledQuery<'a> {
         // exactly one owned Vec at the end instead of cloning every name term
         // and discarding all but the longest.
         let mut prefilter: Option<Cow<'a, [u8]>> = None;
-        let mut consider = |cand: Cow<'a, [u8]>| {
+        let mut from_name_term = false;
+        let mut consider = |cand: Cow<'a, [u8]>, is_name_term: bool| {
             if cand.len() > prefilter.as_ref().map_or(0, |c| c.len()) {
                 prefilter = Some(cand);
+                from_name_term = is_name_term;
             }
         };
         for term in &parsed.name_terms {
-            consider(Cow::Borrowed(term.as_slice()));
+            consider(Cow::Borrowed(term.as_slice()), true);
         }
         for w in &parsed.wildcards {
             if let Some(lit) = w.longest_literal() {
-                consider(Cow::Owned(lit));
+                consider(Cow::Owned(lit), false);
             }
         }
         // A single `ext:` value contributes `.ext`, which every match's name
@@ -105,7 +112,7 @@ impl<'a> CompiledQuery<'a> {
             let mut lit = Vec::with_capacity(exts[0].len() + 1);
             lit.push(b'.');
             lit.extend_from_slice(&exts[0]);
-            consider(Cow::Owned(lit));
+            consider(Cow::Owned(lit), false);
         }
 
         Self {
@@ -120,6 +127,10 @@ impl<'a> CompiledQuery<'a> {
                 .map(|t| memmem::Finder::new(t.as_slice()))
                 .collect(),
             prefilter: prefilter.map(Cow::into_owned),
+            prefilter_decides_name: from_name_term
+                && parsed.name_terms.len() == 1
+                && parsed.wildcards.is_empty()
+                && parsed.filters.ext.is_none(),
         }
     }
 }
@@ -130,10 +141,10 @@ impl<'a> CompiledQuery<'a> {
 /// page needs it.
 struct Candidate {
     idx: EntryIdx,
-    /// The key the page's sort asks for, filled by [`order`]: the parent
-    /// directory's rank for a path sort (see [`rank_parents`]), the size for a
-    /// size sort, the order-preserving image of the mtime for a date sort,
-    /// unused for a name sort. Candidates used to carry kind, size, date, an
+    /// The key the page's sort asks for, filled by [`order`]: the name's rank
+    /// key for a name sort, the parent directory's rank for a path sort (see
+    /// [`rank_parents`]), the size for a size sort, the order-preserving image
+    /// of the mtime for a date sort. Candidates used to carry kind, size, date, an
     /// optional path and a `fold(parent) + NUL + fold(name)` key string each,
     /// ~300 MB under the index lock for a 100-row page of a broad path sort.
     key: u64,
@@ -159,26 +170,18 @@ pub fn run_query(
     offset: u32,
     limit: Option<u32>,
 ) -> QueryOutcome {
-    let Scan {
-        mut candidates,
-        mut dir_paths,
-    } = scan(index, parsed, scope);
-    let total = candidates.len() as u64;
-    let (start, end) = page_bounds(candidates.len(), offset, limit);
-    order(index, &mut candidates, &mut dir_paths, sort, end);
-    let hits = build_hits(index, &candidates[start..end], &mut dir_paths);
+    let (total, refs) = page_refs(index, parsed, scope, sort, offset, limit, true);
+    let hits = build_hits(index, &refs);
     QueryOutcome { total, hits }
 }
 
 /// Like [`run_query`], but the page comes back as 16-byte [`HitRef`]s and no
 /// path is built: the daemon's entry point.
 ///
-/// The ordering happens here, under the caller's index read lock, because the
-/// comparators read folded names straight from the index and allocate
-/// nothing: a 3M-row set orders in ~160 ms across cores. Building every
-/// row's path under that lock, as the page builder of [`run_query`] does, held
-/// it ~1 s for the same set and peaked at ~1 GB; the daemon now builds paths
-/// per page, from the live index, when it encodes them.
+/// Any ordering happens here, under the caller's index read lock, with
+/// comparators that read the index and allocate nothing; a name-sorted query
+/// over names alone does not order at all (see [`page_refs`]). The daemon
+/// builds each page's paths from the live index when it encodes them.
 pub fn run_query_refs(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
@@ -187,6 +190,38 @@ pub fn run_query_refs(
     offset: u32,
     limit: Option<u32>,
 ) -> RefOutcome {
+    let (total, refs) = page_refs(index, parsed, scope, sort, offset, limit, true);
+    RefOutcome { total, refs }
+}
+
+/// The page of a query as references: the one implementation behind
+/// [`run_query`] and [`run_query_refs`].
+///
+/// A name-sorted query whose predicates are all decided by the file name (see
+/// [`is_name_level`]) never builds a candidate: it matches the distinct names
+/// (about a quarter of the entries on a real volume, since names are
+/// interned), counts matches from each name's refcount, and pages by walking
+/// the matched names in name order and their same-name chains. No sort runs,
+/// and a 100-row page of a broad query leaves as soon as 100 entries have
+/// been walked. Everything else takes the candidate path: scan, order, slice.
+/// `allow_name_level` exists for the test that holds the two paths equal.
+fn page_refs(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    scope: Option<EntryIdx>,
+    sort: SortSpec,
+    offset: u32,
+    limit: Option<u32>,
+    allow_name_level: bool,
+) -> (u64, Vec<HitRef>) {
+    if allow_name_level && sort.key == SortKey::Name && is_name_level(index, parsed, scope) {
+        let compiled = CompiledQuery::new(parsed);
+        let mut cp_buf = CodePointBuf::new();
+        let mut ext_scratch = Vec::new();
+        let (matched, total) = match_names(index, parsed, &compiled, &mut cp_buf, &mut ext_scratch);
+        let (start, end) = page_bounds(total as usize, offset, limit);
+        return (total, name_level_refs(index, matched, sort.dir, start, end));
+    }
     let Scan {
         mut candidates,
         mut dir_paths,
@@ -201,7 +236,221 @@ pub fn run_query_refs(
             frn: index.entry(c.idx).frn(),
         })
         .collect();
-    RefOutcome { total, refs }
+    (total, refs)
+}
+
+/// Whether every predicate of `parsed` is decided by the file name alone, so
+/// the query can run over the distinct names instead of the entries: no
+/// scope, no path term, no kind or size filter, and no orphan whose
+/// presentability would need a per-entry walk. Extensions, wildcards and case
+/// sensitivity are properties of the name and pass.
+fn is_name_level(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> bool {
+    scope.is_none()
+        && parsed.path_terms.is_empty()
+        && parsed.filters.kind.is_none()
+        && parsed.filters.size.is_none()
+        && !index.has_orphans()
+}
+
+/// The name predicates of `parsed` against one distinct name: substring
+/// terms, wildcards and the extension filter, on the folded bytes
+/// (case-insensitive) or the raw bytes (case-sensitive), matching how the
+/// needles were folded at parse time. Shared by the per-entry
+/// [`evaluate`] and the per-name [`match_names`], so the two paths cannot
+/// disagree on what a name matches.
+fn name_matches(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    id: NameId,
+    cp_buf: &mut CodePointBuf,
+    ext_scratch: &mut Vec<u8>,
+) -> bool {
+    let hay = if parsed.match_case {
+        index.name_raw(id)
+    } else {
+        index.name_folded(id)
+    };
+    compiled.name_finders.iter().all(|f| f.find(hay).is_some())
+        && parsed.wildcards.iter().all(|w| w.matches_into(hay, cp_buf))
+        // The ext check folds the extension, so it runs after the
+        // allocation-free predicates that reject most names.
+        && ext_matches(&parsed.filters, index.name_raw(id), ext_scratch)
+}
+
+/// Calls `f` once per distinct name whose folded bytes contain `needle`: one
+/// `memmem` pass over the folded arena, which holds each name once, mapping
+/// the ascending hit offsets to ids with a forward cursor over `name_pairs`
+/// (amortized O(1) per hit; a per-hit binary search cache-thrashes at scale).
+/// The first hit seeds the cursor with one binary search so a rare term whose
+/// matches start deep in the arena does not pay a full forward walk. A name
+/// is a contiguous NUL-separated region, so repeated hits inside one name are
+/// adjacent and a "same as last" check dedups them.
+fn for_each_prefilter_hit(index: &VolumeIndex, needle: &[u8], mut f: impl FnMut(NameId)) {
+    let driver = memmem::Finder::new(needle);
+    let hay = index.folded_bytes();
+    let pairs = index.name_pairs();
+    if pairs.is_empty() {
+        return;
+    }
+    let mut cursor = 0usize;
+    let mut seeded = false;
+    let mut last_id = NameId::MAX;
+    for pos in driver.find_iter(hay) {
+        let pos = pos as u32;
+        if !seeded {
+            cursor = pairs
+                .partition_point(|p| p.folded.off <= pos)
+                .saturating_sub(1);
+            seeded = true;
+        } else {
+            while cursor + 1 < pairs.len() && pairs[cursor + 1].folded.off <= pos {
+                cursor += 1;
+            }
+        }
+        let id = cursor as NameId;
+        if id == last_id {
+            continue;
+        }
+        last_id = id;
+        f(id);
+    }
+}
+
+/// Every distinct name matching `parsed`, in id order, and the number of
+/// live non-synthetic entries bearing them. The count comes from each name's
+/// refcount, which is its chain length, so no entry is touched; the three
+/// names synthetic entries can bear are walked instead.
+fn match_names(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    cp_buf: &mut CodePointBuf,
+    ext_scratch: &mut Vec<u8>,
+) -> (Vec<NameId>, u64) {
+    let mut ids: Vec<NameId> = Vec::new();
+    let mut verify = true;
+    if !parsed.match_case
+        && let Some(needle) = compiled.prefilter.as_deref()
+    {
+        for_each_prefilter_hit(index, needle, |id| ids.push(id));
+        verify = !compiled.prefilter_decides_name;
+    } else {
+        // Case-sensitive, or no literal to drive the arena scan: every live
+        // name is tested. Dead names are zero-filled and have no entries.
+        ids.extend((0..index.name_count() as NameId).filter(|&id| index.name_refcount(id) > 0));
+    }
+    let mut matched = Vec::with_capacity(ids.len());
+    let mut total = 0u64;
+    for id in ids {
+        if verify && !name_matches(index, parsed, compiled, id, cp_buf, ext_scratch) {
+            continue;
+        }
+        total += if index.name_may_bear_synthetic(id) {
+            index
+                .name_chain(id)
+                .filter(|&e| !index.is_synthetic(e))
+                .count() as u64
+        } else {
+            u64::from(index.name_refcount(id))
+        };
+        matched.push(id);
+    }
+    (matched, total)
+}
+
+/// `matched` (any order) in name order: by folded bytes, then id. A sparse
+/// match set is sorted directly; a dense one filters the index's name order
+/// through a bitmap and merges in the few names still waiting unranked, so
+/// a broad query never sorts a million names.
+fn ordered_names(index: &VolumeIndex, mut matched: Vec<NameId>) -> Vec<NameId> {
+    let key = |id: NameId| (index.name_folded(id), id);
+    let order = index.name_order();
+    if order.is_empty() || matched.len() * 8 < order.len() {
+        matched.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
+        return matched;
+    }
+    let mut bits = vec![0u64; index.name_count().div_ceil(64)];
+    let mut waiting: Vec<NameId> = Vec::new();
+    for &id in &matched {
+        if index.name_is_ranked(id) {
+            bits[id as usize / 64] |= 1 << (id % 64);
+        } else {
+            waiting.push(id);
+        }
+    }
+    waiting.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
+    let mut ranked = order
+        .iter()
+        .copied()
+        .filter(|&id| bits[id as usize / 64] & (1 << (id % 64)) != 0)
+        .peekable();
+    let mut waiting = waiting.into_iter().peekable();
+    let mut seq = Vec::with_capacity(matched.len());
+    while let (Some(r), Some(w)) = (ranked.peek().copied(), waiting.peek().copied()) {
+        if key(w) < key(r) {
+            seq.push(w);
+            waiting.next();
+        } else {
+            seq.push(r);
+            ranked.next();
+        }
+    }
+    seq.extend(ranked);
+    seq.extend(waiting);
+    seq
+}
+
+/// Rows `[start, end)` of a name-level query: walks the matched names in
+/// name order (reversed for a descending sort) and each name's same-name
+/// chain. Names with equal folded bytes form one group whose entries
+/// interleave by idx (descending when the sort is), exactly the
+/// `(folded name, idx)` order the candidate comparator produces.
+fn name_level_refs(
+    index: &VolumeIndex,
+    matched: Vec<NameId>,
+    dir: SortDir,
+    start: usize,
+    end: usize,
+) -> Vec<HitRef> {
+    let mut seq = ordered_names(index, matched);
+    if dir == SortDir::Desc {
+        seq.reverse();
+    }
+    let mut refs = Vec::with_capacity((end - start).min(1 << 16));
+    let mut group: Vec<EntryIdx> = Vec::new();
+    let mut seen = 0usize;
+    let mut i = 0;
+    while i < seq.len() && seen < end {
+        let folded = index.name_folded(seq[i]);
+        let mut j = i + 1;
+        while j < seq.len() && index.name_folded(seq[j]) == folded {
+            j += 1;
+        }
+        group.clear();
+        for &id in &seq[i..j] {
+            group.extend(index.name_chain(id).filter(|&e| !index.is_synthetic(e)));
+        }
+        // A chain is in link order, not idx order.
+        group.sort_unstable();
+        if dir == SortDir::Desc {
+            group.reverse();
+        }
+        for &e in &group {
+            if seen >= end {
+                break;
+            }
+            if seen >= start {
+                refs.push(HitRef {
+                    idx: e,
+                    frn: index.entry(e).frn(),
+                });
+            }
+            seen += 1;
+        }
+        i = j;
+    }
+    refs
 }
 
 /// A folder-scoped query walks the scope's subtree instead of scanning the
@@ -266,6 +515,7 @@ fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> S
                 &mut scope_memo,
                 &mut dir_paths,
                 has_path_terms,
+                false,
                 &mut cp_buf,
                 &mut ext_scratch,
             ) {
@@ -281,45 +531,11 @@ fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> S
     } else if !parsed.match_case
         && let Some(needle) = compiled.prefilter.as_deref()
     {
-        let driver = memmem::Finder::new(needle);
-        // The haystack holds each distinct name ONCE (names are interned), so
-        // the scan cost is proportional to the unique-name bytes (~1/3 of the
-        // total on a real volume) and a hit fans out to every entry bearing
+        // The scan cost is proportional to the unique-name bytes (~1/3 of
+        // the total on a real volume); a hit fans out to every entry bearing
         // the name through its same-name chain. The chains are exact, so no
         // per-candidate staleness guard is needed.
-        let hay = index.folded_bytes();
-        let pairs = index.name_pairs();
-        // Merge-walk: both the `memmem` hits and `pairs[id].folded.off` are
-        // ascending, so a forward cursor maps each hit to its name id in
-        // amortized O(1) with no per-hit binary search (which cache-thrashes
-        // at scale). The first hit seeds the cursor with one binary search so
-        // a rare term whose matches start deep in the arena doesn't pay a
-        // full-length forward scan.
-        let mut cursor = 0usize;
-        let mut seeded = false;
-        // A name is a contiguous NUL-separated region, so repeated hits in
-        // one name are adjacent: a single "same as last" check dedups them.
-        let mut last_id = u32::MAX;
-        for pos in driver.find_iter(hay) {
-            let pos = pos as u32;
-            if pairs.is_empty() {
-                break;
-            }
-            if !seeded {
-                cursor = pairs
-                    .partition_point(|p| p.folded.off <= pos)
-                    .saturating_sub(1);
-                seeded = true;
-            } else {
-                while cursor + 1 < pairs.len() && pairs[cursor + 1].folded.off <= pos {
-                    cursor += 1;
-                }
-            }
-            let id = cursor as u32;
-            if id == last_id {
-                continue; // driver term appears twice in one name
-            }
-            last_id = id;
+        for_each_prefilter_hit(index, needle, |id| {
             for idx in index.name_chain(id) {
                 if index.is_synthetic(idx) {
                     continue;
@@ -333,13 +549,14 @@ fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> S
                     &mut scope_memo,
                     &mut dir_paths,
                     has_path_terms,
+                    compiled.prefilter_decides_name,
                     &mut cp_buf,
                     &mut ext_scratch,
                 ) {
                     candidates.push(c);
                 }
             }
-        }
+        });
     } else {
         // Slow path: case-sensitive, or no positive substring term (only
         // wildcards / filters / path terms). Iterate every live entry.
@@ -356,6 +573,7 @@ fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> S
                 &mut scope_memo,
                 &mut dir_paths,
                 has_path_terms,
+                false,
                 &mut cp_buf,
                 &mut ext_scratch,
             ) {
@@ -391,7 +609,14 @@ fn order(
     end: usize,
 ) {
     match sort.key {
-        SortKey::Name => {}
+        // Two integers per comparison instead of two folded names: see
+        // `NameStore::rank_key`. Names still waiting outside the order get a
+        // key between their neighbours, and ties fall back to the bytes.
+        SortKey::Name => {
+            for c in candidates.iter_mut() {
+                c.key = index.name_rank_key(index.name_id(c.idx));
+            }
+        }
         SortKey::Path => rank_parents(index, candidates, dir_paths),
         SortKey::Size => {
             for c in candidates.iter_mut() {
@@ -468,11 +693,8 @@ fn rank_parents(
 /// presentable child (a parent under lost+found or a cycle is `None` and the
 /// hit is dropped, exactly as a per-hit `path_of` would); real volumes never
 /// approach the MAX_PATH_HOPS depth where the two could diverge.
-fn build_hits(
-    index: &VolumeIndex,
-    page: &[Candidate],
-    dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
-) -> Vec<QueryHit> {
+fn build_hits(index: &VolumeIndex, page: &[HitRef]) -> Vec<QueryHit> {
+    let mut dir_paths: FxHashMap<EntryIdx, Option<Vec<u8>>> = FxHashMap::default();
     let mut hits = Vec::with_capacity(page.len());
     for c in page {
         let entry = index.entry(c.idx);
@@ -519,6 +741,7 @@ fn evaluate(
     scope_memo: &mut FxHashMap<EntryIdx, bool>,
     dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
     has_path_terms: bool,
+    name_decided: bool,
     cp_buf: &mut CodePointBuf,
     ext_scratch: &mut Vec<u8>,
 ) -> Option<Candidate> {
@@ -530,31 +753,18 @@ fn evaluate(
         return None;
     }
 
-    // Name/wildcard predicates run against the precomputed folded name
-    // (case-insensitive) or the raw name (case-sensitive), matching how the
-    // needles were folded at parse time.
-    let hay_name = if parsed.match_case {
-        entry.name()
-    } else {
-        index.folded_name(idx)
-    };
-    if !compiled
-        .name_finders
-        .iter()
-        .all(|f| f.find(hay_name).is_some())
+    // `name_decided`: the caller reached this entry through a prefilter hit
+    // that already settles the name predicates (`prefilter_decides_name`).
+    if !name_decided
+        && !name_matches(
+            index,
+            parsed,
+            compiled,
+            index.name_id(idx),
+            cp_buf,
+            ext_scratch,
+        )
     {
-        return None;
-    }
-    if !parsed
-        .wildcards
-        .iter()
-        .all(|w| w.matches_into(hay_name, cp_buf))
-    {
-        return None;
-    }
-    // The ext check folds the candidate extension, so it runs after the
-    // allocation-free name/wildcard predicates that reject most candidates.
-    if !ext_matches(&parsed.filters, entry.name(), ext_scratch) {
         return None;
     }
 
@@ -707,14 +917,12 @@ fn cmp_candidate(
     // holds whatever `order` filled for this sort. The idx tiebreak makes the
     // order total, so an unstable sort is deterministic.
     let by_name = || index.folded_name(a.idx).cmp(index.folded_name(b.idx));
-    let base = match sort.key {
-        SortKey::Name => by_name().then_with(|| a.idx.cmp(&b.idx)),
-        SortKey::Path | SortKey::Size | SortKey::DateModified => a
-            .key
-            .cmp(&b.key)
-            .then_with(by_name)
-            .then_with(|| a.idx.cmp(&b.idx)),
-    };
+    let _ = sort.key; // every key orders the same way: `order` filled `key`
+    let base = a
+        .key
+        .cmp(&b.key)
+        .then_with(by_name)
+        .then_with(|| a.idx.cmp(&b.idx));
     if sort.dir == SortDir::Desc {
         base.reverse()
     } else {
@@ -815,7 +1023,9 @@ mod tests {
     use crate::index::{NTFS_ROOT_FRN, VolumeIndex};
     use crate::query::parse::parse_query;
     use crate::types::Frn;
-    use crate::usn::record::{FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE};
+    use crate::usn::record::{
+        FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
+    };
 
     fn frn(rec: u64) -> Frn {
         Frn(rec | (1u64 << 48))
@@ -1111,6 +1321,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The name-level path (no candidates, no sort) must page exactly like the
+    /// candidate path, and both like a plain sort of the match set by
+    /// `(folded name, idx)`: in both directions, for every slice, with names
+    /// that joined after the order was built (unranked), names that fold
+    /// alike, a repeated name, and the synthetic names kept out of totals.
+    #[test]
+    fn name_level_page_matches_candidate_page() {
+        let mut idx = sample_index();
+        idx.optimize_storage(); // builds the name order
+        // Late arrivals: unranked until merged. Two of them fold alike, one
+        // repeats a name that is already ranked.
+        idx.apply_batch(&[
+            enum_rec(frn(890), NTFS_ROOT_FRN, "late", true),
+            enum_rec(frn(900), NTFS_ROOT_FRN, "Readme.MD", false),
+            enum_rec(frn(901), frn(890), "README.md", false),
+            enum_rec(frn(902), frn(890), "notes.txt", false),
+            enum_rec(frn(903), frn(890), "a.md", false),
+        ]);
+
+        let check = |idx: &VolumeIndex, stage: &str| {
+            for q in [
+                "",
+                "e",
+                "readme",
+                "*.md",
+                "ext:md",
+                "notes",
+                "Report case:",
+                "zzz",
+            ] {
+                let parsed = parse_query(q).unwrap();
+                // Ground truth: the candidate path's match SET (ranks play no
+                // part in which entries match), ordered by the bytes alone.
+                let mut ground: Vec<EntryIdx> =
+                    page_refs(idx, &parsed, None, SortSpec::default(), 0, None, false)
+                        .1
+                        .iter()
+                        .map(|r| r.idx)
+                        .collect();
+                ground.sort_by(|&a, &b| idx.folded_name(a).cmp(idx.folded_name(b)).then(a.cmp(&b)));
+                assert!(ground.iter().all(|&e| !idx.is_synthetic(e)));
+                let total = ground.len() as u32;
+                for dir in [SortDir::Asc, SortDir::Desc] {
+                    let sort = SortSpec {
+                        key: SortKey::Name,
+                        dir,
+                    };
+                    let mut expected_all = ground.clone();
+                    if dir == SortDir::Desc {
+                        expected_all.reverse();
+                    }
+                    for (offset, limit) in [
+                        (0, None),
+                        (0, Some(1)),
+                        (1, Some(2)),
+                        (2, None),
+                        (0, Some(u32::MAX)),
+                        (total, Some(5)),
+                        (total.saturating_sub(1), Some(5)),
+                    ] {
+                        let start = (offset as usize).min(expected_all.len());
+                        let end = limit.map_or(expected_all.len(), |l| {
+                            (start + l as usize).min(expected_all.len())
+                        });
+                        let expected = &expected_all[start..end];
+                        let fast = page_refs(idx, &parsed, None, sort, offset, limit, true);
+                        let slow = page_refs(idx, &parsed, None, sort, offset, limit, false);
+                        let ctx = format!("{stage}: {q:?} {dir:?} offset {offset} limit {limit:?}");
+                        assert_eq!(fast.0, u64::from(total), "total (name-level) {ctx}");
+                        assert_eq!(slow.0, u64::from(total), "total (candidates) {ctx}");
+                        let fast_idx: Vec<EntryIdx> = fast.1.iter().map(|r| r.idx).collect();
+                        let slow_idx: Vec<EntryIdx> = slow.1.iter().map(|r| r.idx).collect();
+                        assert_eq!(fast_idx, expected, "name-level page {ctx}");
+                        assert_eq!(slow_idx, expected, "candidate page {ctx}");
+                        for r in &fast.1 {
+                            assert!(idx.entry_if_frn(r.idx, r.frn).is_some());
+                        }
+                    }
+                }
+            }
+        };
+
+        assert!(
+            idx.name_order_stats().1 > 0,
+            "fixture must have unranked names"
+        );
+        check(&idx, "with unranked names");
+        idx.force_name_merge();
+        assert_eq!(idx.name_order_stats().1, 0);
+        check(&idx, "after the merge");
+        let mut del = enum_rec(frn(901), frn(890), "", false);
+        del.reason = USN_REASON_FILE_DELETE;
+        idx.apply_batch(&[del]);
+        check(&idx, "after a delete");
     }
 
     #[test]

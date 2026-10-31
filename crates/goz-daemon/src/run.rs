@@ -59,11 +59,8 @@ pub(crate) fn build_engine() -> Result<Engine> {
         }));
     }
 
-    for mut bv in scan.ok {
+    for bv in scan.ok {
         total_entries += bv.entries();
-        // One-shot: densify the FRN map and return bootstrap growth slack.
-        // Before the volume is shared, so no lock is even contended.
-        bv.index.optimize_storage();
         let state = Arc::new(VolumeState {
             guid: bv.guid_path.clone(),
             mounts: bv.mounts.clone(),
@@ -125,14 +122,14 @@ pub(crate) fn build_engine() -> Result<Engine> {
     // budget. It takes ownership of the tails; teardown goes through it.
     let supervisor = Supervisor::spawn(tails);
 
-    // Purge THIS thread's allocator heap before handing off. The sparse FRN
-    // maps swapped for dense and the pre-shrink slack were freed on this
-    // thread by `optimize_storage`, and mimalloc heaps are per-thread: the
-    // post-publish purge in `settle_working_set` runs on a DIFFERENT thread
-    // (the SCM thread in service mode) and cannot reach them, which left
-    // ~100 MB of dead bootstrap memory committed for the daemon's lifetime.
-    // (The enumeration buffers were freed on the per-volume bootstrap
-    // threads, whose heaps `abandoned_page_purge` returns at thread exit.)
+    // Purge THIS thread's allocator heap before handing off. mimalloc heaps
+    // are per-thread and the post-publish purge in `settle_working_set` runs
+    // on a DIFFERENT thread (the SCM thread in service mode), which once
+    // left ~100 MB of dead bootstrap memory committed for the daemon's
+    // lifetime. The bootstrap transients (buffers, the sparse FRN maps
+    // swapped for dense, pre-shrink slack) are freed on the per-volume
+    // bootstrap threads, whose heaps `abandoned_page_purge` returns at thread
+    // exit; this covers whatever this thread allocated on the way.
     // SAFETY: mi_collect takes no pointers and is safe from any thread.
     unsafe { libmimalloc_sys::mi_collect(true) };
 

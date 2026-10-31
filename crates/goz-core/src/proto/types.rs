@@ -203,6 +203,11 @@ pub struct VolumeStatus {
     /// a healthy volume reports `false`.
     #[serde(default)]
     pub has_orphans: bool,
+    /// Distinct names waiting to join the volume's name order (the sorted
+    /// list a name-sorted page walks). They join on the tail's next merge;
+    /// until then each costs a name-sorted query a binary search.
+    #[serde(default)]
+    pub names_waiting: u64,
     /// Index drift counters. Non-zero values are not errors on their own (a
     /// missed delete or a slot reuse is normal on a busy volume), but they are
     /// the only outward sign that the index and the volume have diverged.
@@ -373,6 +378,7 @@ mod tests {
                 metadata_pending: i % 2 == 0,
                 journal_max_bytes: (i % 2 == 1).then_some(64 << 20),
                 has_orphans: i % 3 == 0,
+                names_waiting: 7 * i as u64,
                 placeholders_created: i as u64,
                 delete_of_unknown: 2 * i as u64,
                 stale_slots: 3 * i as u64,

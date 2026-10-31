@@ -446,6 +446,12 @@ impl VolumeIndex {
                 }
             }
         }
+        // Names interned since the last merge join the name order once enough
+        // have gathered (see `NameStore::wants_merge`): O(names), a few
+        // milliseconds per million, and far rarer than a batch.
+        if self.names.wants_merge() {
+            self.names.merge_unranked();
+        }
         self.generation += 1;
         // Compaction is NOT performed here: it is reported so the caller can do
         // the expensive part off the write lock. Doing it inline made a single
@@ -1161,13 +1167,145 @@ impl VolumeIndex {
         }
     }
 
-    /// One-shot storage optimization for a freshly bootstrapped volume:
-    /// swap the FRN map to its cheaper dense backing when the record space
-    /// allows it, then return all growth slack. Runs under the write lock in
-    /// tens of milliseconds; do not call it per batch.
+    /// One-shot storage optimization for a freshly built volume: swap the
+    /// FRN map to its cheaper dense backing when the record space allows it,
+    /// build the name order while every name is known (one parallel sort,
+    /// ~100 ms per million names, instead of the tail merging them in a
+    /// thousand at a time), then return all growth slack. Runs before the
+    /// index is published; do not call it per batch.
     pub fn optimize_storage(&mut self) {
         self.by_frn.densify_if_smaller();
+        self.names.build_order();
         self.shrink_to_fit();
+    }
+
+    // -- name order ---------------------------------------------------------
+
+    #[inline]
+    pub(crate) fn name_id(&self, idx: EntryIdx) -> NameId {
+        self.entries.name_id(idx)
+    }
+
+    #[inline]
+    pub(crate) fn name_folded(&self, id: NameId) -> &[u8] {
+        self.names.folded_bytes_of(id)
+    }
+
+    #[inline]
+    pub(crate) fn name_raw(&self, id: NameId) -> &[u8] {
+        self.names.raw_bytes(id)
+    }
+
+    /// Live entries bearing `id`: the chain's length without walking it.
+    #[inline]
+    pub(crate) fn name_refcount(&self, id: NameId) -> u32 {
+        self.names.refcount(id)
+    }
+
+    /// Ids ever allocated, live and dead: the bound of a per-name loop.
+    #[inline]
+    pub(crate) fn name_count(&self) -> usize {
+        self.names.ids()
+    }
+
+    /// Ids in folded-name order; see `NameStore::order`.
+    #[inline]
+    pub(crate) fn name_order(&self) -> &[NameId] {
+        self.names.order()
+    }
+
+    #[inline]
+    pub(crate) fn name_is_ranked(&self, id: NameId) -> bool {
+        self.names.is_ranked(id)
+    }
+
+    /// See `NameStore::rank_key`.
+    #[inline]
+    pub(crate) fn name_rank_key(&self, id: NameId) -> u64 {
+        self.names.rank_key(id)
+    }
+
+    /// Whether entries bearing `id` may be synthetic (the root's empty name,
+    /// lost+found's, a placeholder's), so a count must walk the chain instead
+    /// of trusting the refcount. A real file can carry the latter two names.
+    pub(crate) fn name_may_bear_synthetic(&self, id: NameId) -> bool {
+        let raw = self.names.raw_bytes(id);
+        raw.is_empty() || raw == LOST_FOUND_NAME || raw == PLACEHOLDER_NAME
+    }
+
+    /// `(in the order, waiting)` name counts for `--status`. Waiting names
+    /// join the order on the tail's next merge; until then each costs a
+    /// name-sorted query a binary search.
+    pub fn name_order_stats(&self) -> (u64, u64) {
+        (
+            self.names.order().len() as u64,
+            self.names.unranked().len() as u64,
+        )
+    }
+
+    /// Test-only: folds the waiting names into the order now.
+    #[cfg(test)]
+    pub fn force_name_merge(&mut self) {
+        self.names.merge_unranked();
+    }
+
+    /// The name order's invariant: its live part is every live id not
+    /// waiting, sorted by (folded bytes, id); a ranked id's rank is the
+    /// position of the first live id of its folded group; waiting ids are
+    /// unranked. Asserted by the model-op-tape proptests.
+    #[cfg(test)]
+    pub fn name_order_matches_rebuild(&self) -> bool {
+        let live = |id: NameId| self.names.refcount(id) > 0;
+        let key = |id: NameId| (self.names.folded_bytes_of(id), id);
+        let order = self.names.order();
+        let order_live: Vec<NameId> = order.iter().copied().filter(|&id| live(id)).collect();
+        if !order_live.windows(2).all(|w| key(w[0]) < key(w[1])) {
+            return false;
+        }
+        let mut all: Vec<NameId> = order_live
+            .iter()
+            .copied()
+            .chain(self.names.unranked().iter().copied().filter(|&id| live(id)))
+            .collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        if all.len() != n {
+            return false; // an id both ranked and waiting
+        }
+        let want: Vec<NameId> = (0..self.names.ids() as NameId)
+            .filter(|&id| live(id))
+            .collect();
+        if all != want {
+            return false;
+        }
+        let mut group_start = 0usize;
+        let mut prev: Option<&[u8]> = None;
+        for (pos, &id) in order.iter().enumerate() {
+            if !live(id) {
+                continue;
+            }
+            let f = self.names.folded_bytes_of(id);
+            if prev != Some(f) {
+                group_start = pos;
+                prev = Some(f);
+            }
+            if !self.names.is_ranked(id) || self.names.rank(id) as usize != group_start {
+                return false;
+            }
+        }
+        self.names
+            .unranked()
+            .iter()
+            .all(|&id| !self.names.is_ranked(id))
+    }
+
+    /// Every name's refcount equals its chain length: what lets a name-level
+    /// query count matches without touching an entry.
+    #[cfg(test)]
+    pub fn name_refcounts_match_chains(&self) -> bool {
+        (0..self.names.ids() as NameId)
+            .all(|id| self.names.refcount(id) as usize == self.name_chain(id).count())
     }
 
     // -- folded-arena query support --------------------------------------

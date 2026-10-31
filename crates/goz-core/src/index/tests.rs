@@ -710,11 +710,15 @@ proptest! {
                 prop_assert!(idx.dir_index_matches_rebuild(), "dir index drifted after apply");
                 prop_assert!(idx.name_chains_match_rebuild(), "name chains drifted after apply");
                 prop_assert!(idx.child_chains_match_rebuild(), "child chains drifted after apply");
+                prop_assert!(idx.name_order_matches_rebuild(), "name order drifted after apply");
+                prop_assert!(idx.name_refcounts_match_chains(), "refcounts drifted after apply");
                 idx.apply_batch(std::slice::from_ref(&rec)); // idempotent replay
                 prop_assert_eq!(path_set(&idx), model.path_set());
                 prop_assert!(idx.dir_index_matches_rebuild(), "dir index drifted after replay");
                 prop_assert!(idx.name_chains_match_rebuild(), "name chains drifted after replay");
                 prop_assert!(idx.child_chains_match_rebuild(), "child chains drifted after replay");
+                prop_assert!(idx.name_order_matches_rebuild(), "name order drifted after replay");
+                prop_assert!(idx.name_refcounts_match_chains(), "refcounts drifted after replay");
             }
         }
     }
@@ -781,11 +785,16 @@ proptest! {
                 idx.insert_enum(r);
             }
         }
+        idx.optimize_storage(); // the daemon builds the name order here
         idx.apply_batch(&journal);
 
         prop_assert_eq!(path_set(&idx), model.path_set());
         prop_assert!(idx.dir_index_matches_rebuild(), "dir index drifted after bootstrap race");
         prop_assert!(idx.name_chains_match_rebuild(), "name chains drifted after bootstrap race");
+        prop_assert!(idx.name_order_matches_rebuild(), "name order drifted after bootstrap race");
+        prop_assert!(idx.name_refcounts_match_chains(), "refcounts drifted after bootstrap race");
+        idx.force_name_merge();
+        prop_assert!(idx.name_order_matches_rebuild(), "name order drifted after a merge");
         prop_assert!(idx.child_chains_match_rebuild(), "child chains drifted after bootstrap race");
     }
 }
@@ -871,4 +880,81 @@ fn entry_if_frn_rejects_dead_and_reused_slots() {
         idx.entry_if_frn(u32::MAX - 1, frn(101)).is_none(),
         "out of range is None, not a panic"
     );
+}
+
+/// The name order survives its whole lifecycle: an index starts with every
+/// name waiting, `optimize_storage` ranks them all, a journal insert waits
+/// unranked but already sorts into place through its rank key, a merge folds
+/// it in, a delete leaves a dead id the order tolerates, and a compaction
+/// renumbers every id under it.
+#[test]
+fn name_order_tracks_interns_merges_deletes_and_compaction() {
+    let mut idx = index_from_enum(&[
+        create(frn(100), root_frn(), "b.txt", false),
+        create(frn(101), root_frn(), "a.txt", false),
+    ]);
+    assert!(
+        idx.name_order_matches_rebuild(),
+        "all waiting is a valid state"
+    );
+    idx.optimize_storage();
+    assert!(idx.name_order_matches_rebuild());
+    assert_eq!(idx.name_order_stats().1, 0);
+
+    idx.apply_batch(&[create(frn(102), root_frn(), "aa.txt", false)]);
+    assert_eq!(idx.name_order_stats().1, 1, "a new name waits unranked");
+    assert!(idx.name_order_matches_rebuild());
+    let key =
+        |idx: &VolumeIndex, f: u64| idx.name_rank_key(idx.name_id(idx.head_of(frn(f)).unwrap()));
+    assert!(
+        key(&idx, 101) < key(&idx, 102) && key(&idx, 102) < key(&idx, 100),
+        "an unranked name keys between its ranked neighbours"
+    );
+    // A second copy of a ranked name keys exactly like it.
+    idx.apply_batch(&[create(frn(103), root_frn(), "B.TXT", false)]);
+    assert_eq!(
+        key(&idx, 103),
+        key(&idx, 100),
+        "equal folded names share a key"
+    );
+
+    idx.force_name_merge();
+    assert_eq!(idx.name_order_stats().1, 0);
+    assert!(idx.name_order_matches_rebuild());
+    assert_eq!(key(&idx, 103), key(&idx, 100), "and still do once ranked");
+
+    idx.apply_batch(&[delete(frn(101))]);
+    assert!(
+        idx.name_order_matches_rebuild(),
+        "a dead id in the order is tolerated"
+    );
+    assert!(idx.name_refcounts_match_chains());
+    idx.apply_batch(&[create(frn(104), root_frn(), "a.txt", false)]);
+    assert!(
+        key(&idx, 104) < key(&idx, 102),
+        "a name reborn after dying sorts first again"
+    );
+
+    // Enough churn to trigger a compaction: many long names, most deleted.
+    let mut recs = Vec::new();
+    for i in 0..600u64 {
+        recs.push(create(
+            frn(1000 + i),
+            root_frn(),
+            &format!("compaction-fodder-{i:05}.bin"),
+            false,
+        ));
+    }
+    idx.apply_batch(&recs);
+    idx.force_name_merge();
+    let dels: Vec<_> = (0..500u64).map(|i| delete(frn(1000 + i))).collect();
+    idx.apply_batch(&dels);
+    let plan = idx.plan_compaction().expect("enough garbage to compact");
+    idx.apply_compaction(plan);
+    assert!(
+        idx.name_order_matches_rebuild(),
+        "ids were renumbered under the order"
+    );
+    assert!(idx.name_refcounts_match_chains());
+    assert!(idx.name_chains_match_rebuild());
 }

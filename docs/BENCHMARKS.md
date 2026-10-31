@@ -21,6 +21,18 @@ For the file-manager case (`-path <folder> <term> -n 200`), goz walks the folder
 
 Ryzen 7 7800X3D (8C/16T), 31 GB RAM, Windows 11 Pro 26200, NVMe SSD. 4 live NTFS volumes, ~3.97M entries (C: 3.77M, F: 176k, D: 24k, E: 2.7k). Counts agreed exactly on five of six queries; `e` differed by 0.03% (live churn between the interleaved runs). `WindowsApps` queries were excluded (Everything under-reports them here). Process spawn (~18-21 ms) is included in every number. Inside the daemon, a selective query is single-digit milliseconds (`cargo bench -p goz-core`).
 
+## First page of a broad query
+
+Measured 2026-10-31 with v0.4.0 on the same box (4.2M entries, `e` matches 3.05M of them), wall time of `goz.exe` including its ~15 ms process spawn, best of five:
+
+| Query | v0.3.0 | v0.4.0 |
+| ------------------------- | -----: | -----: |
+| `goz -n 100 e` (name sort) | 183 ms | 51 ms |
+| `goz -sortsize -n 100 e`  | 156 ms | 118 ms |
+| `goz -sortpath -n 100 e`  | 429 ms | 399 ms |
+
+The index keeps its distinct names in folded order (the same idea as Everything's fast sort, at 8 bytes per distinct name rather than per file, since names are interned). A name-sorted query whose predicates are decided by the name alone never builds a candidate list: it matches the ~1M distinct names, counts hits from each name's reference count, and walks the matched names in order until the page is full. Inside the daemon that page costs ~28 ms, of which the `memmem` pass over the 45 MB folded arena and the per-name bookkeeping are most; a page sorted by size or path still has to visit every matching entry. Names created after the order was built wait unranked and are placed by binary search until the tail merges them in (past 1024, or 0.1% of the names); `--status` shows how many are waiting.
+
 ## Memory footprint
 
 Same box, each index warm at ~3.97M entries.

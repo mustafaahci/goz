@@ -312,6 +312,13 @@ mod win {
                             "           orphans: entries whose parent never arrived sit under lost+found; queries pay a presentability walk"
                         );
                     }
+                    if v.names_waiting > 0 {
+                        let _ = writeln!(
+                            out,
+                            "           {} name(s) waiting to join the sort order",
+                            v.names_waiting
+                        );
+                    }
                     // Drift counters, shown only when non-zero. These are the
                     // only outward sign that the index and the volume have
                     // diverged, so reporting them nowhere made a drifting index
