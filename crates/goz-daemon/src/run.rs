@@ -69,8 +69,9 @@ pub(crate) fn build_engine() -> Result<Engine> {
             mounts: bv.mounts.clone(),
             index: RwLock::new(bv.index),
             phase: RwLock::new(VolumePhase::Live),
-            // Bootstrap enriches synchronously, so metadata is present now.
-            metadata_pending: RwLock::new(false),
+            // True only when the FILE_LAYOUT pass stopped and ENUM named the
+            // rest without sizes or dates.
+            metadata_pending: RwLock::new(bv.metadata_pending),
             journal_max_bytes: bv.cursor.map(|c| c.maximum_size),
             scope_cache: parking_lot::Mutex::new(None),
         });

@@ -278,6 +278,56 @@ fn enrich_links(idx: &mut VolumeIndex, fixture: &LayoutFileFixture) {
     idx.enrich(&file);
 }
 
+/// A FILE_LAYOUT-only bootstrap: the root's own record names the root as its
+/// parent (taken as a name it made the root its own parent and left no entry a
+/// path), a file is listed before the directory of its second link (which
+/// starts as a placeholder), and 8.3 aliases are dropped.
+#[test]
+fn insert_layout_builds_every_path_from_the_roots_record_and_hard_links() {
+    let root = root_frn().0;
+    let records = [
+        LayoutFileFixture {
+            frn: root,
+            attributes: FILE_ATTRIBUTE_DIRECTORY,
+            names: vec![LayoutNameFixture::primary(root, ".")],
+            info: None,
+            streams: vec![],
+        },
+        LayoutFileFixture {
+            frn: frn(100).0,
+            attributes: 0x20,
+            names: vec![
+                LayoutNameFixture::primary(root, "report.txt"),
+                LayoutNameFixture::dos_only(root, "REPORT~1.TXT"),
+                LayoutNameFixture::primary(frn(10).0, "copy.txt"),
+            ],
+            info: None,
+            streams: vec![LayoutStreamFixture::unnamed_data(4096)],
+        },
+        LayoutFileFixture {
+            frn: frn(10).0,
+            attributes: FILE_ATTRIBUTE_DIRECTORY,
+            names: vec![LayoutNameFixture::primary(root, "docs")],
+            info: None,
+            streams: vec![],
+        },
+    ];
+    let mut idx = new_index();
+    for record in &records {
+        idx.insert_layout(&record.expected());
+    }
+
+    assert_eq!(
+        path_set(&idx),
+        BTreeSet::from(["docs", "docs\\copy.txt", "report.txt"].map(String::from))
+    );
+    assert!(
+        !idx.has_orphans(),
+        "the placeholder for docs must be filled"
+    );
+    assert_eq!(idx.entry(idx.head_of(frn(100)).unwrap()).size(), Some(4096));
+}
+
 #[test]
 fn enrich_builds_hard_link_chain_findable_under_every_name() {
     // Two dirs and a file that FILE_LAYOUT reports as hard-linked under both.
@@ -669,15 +719,19 @@ proptest! {
         }
     }
 
-    /// Bootstrap race: enumerate a snapshot in ARBITRARY order (parents may
-    /// follow children → placeholder synthesis), then replay the journal tape
-    /// from that point. The result must equal the final model regardless of
-    /// enumeration order.
+    /// Bootstrap race: read a snapshot in ARBITRARY order (parents may follow
+    /// children → placeholder synthesis), then replay the journal tape from
+    /// that point. The result must equal the final model regardless of the
+    /// order, and whether the FILE_LAYOUT pass completed or stopped part way
+    /// and left the ENUM pass to name the rest, as the bootstrap does.
     #[test]
     fn bootstrap_race_converges(
         actions in prop::collection::vec(raw_action_strategy(), 0..70),
         split in 0.0f64..1.0,
         shuffle_seed in any::<u64>(),
+        // `None`: the FILE_LAYOUT pass completed. `Some`: it stopped after
+        // that fraction of the snapshot and ENUM then read all of it.
+        layout_stop in prop::option::of(0.0f64..1.0),
     ) {
         let mut model = Model::default();
         let mut next_frn: u64 = 1000;
@@ -697,7 +751,7 @@ proptest! {
         }
         let snapshot = snapshot.unwrap_or_else(|| model.clone());
 
-        // ENUM the snapshot in a shuffled order (the race the ordering must survive).
+        // Read the snapshot in a shuffled order (the race the ordering must survive).
         let mut enum_recs: Vec<ParsedUsnRecord> = snapshot
             .entries
             .iter()
@@ -705,9 +759,27 @@ proptest! {
             .collect();
         shuffle(&mut enum_recs, shuffle_seed);
 
+        let layout_count = layout_stop
+            .map_or(enum_recs.len(), |stop| (enum_recs.len() as f64 * stop) as usize);
         let mut idx = new_index();
-        for r in &enum_recs {
-            idx.insert_enum(r);
+        for r in &enum_recs[..layout_count] {
+            idx.insert_layout(&LayoutFile {
+                frn: r.frn,
+                attributes: r.attributes,
+                size: None,
+                mtime_ft: None,
+                names: vec![crate::layout::LayoutName {
+                    parent_frn: r.parent_frn,
+                    name: r.name.clone(),
+                    name_lossy: false,
+                    dos_only: false,
+                }],
+            });
+        }
+        if layout_stop.is_some() {
+            for r in &enum_recs {
+                idx.insert_enum(r);
+            }
         }
         idx.apply_batch(&journal);
 

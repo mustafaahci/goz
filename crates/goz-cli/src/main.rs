@@ -304,6 +304,14 @@ mod win {
                         let _ =
                             writeln!(out, "           journal max {} MiB", bytes / (1024 * 1024));
                     }
+                    // Orphans make every query walk each candidate's parent
+                    // chain; a healthy volume has none, so say when it does.
+                    if v.has_orphans {
+                        let _ = writeln!(
+                            out,
+                            "           orphans: entries whose parent never arrived sit under lost+found; queries pay a presentability walk"
+                        );
+                    }
                     // Drift counters, shown only when non-zero. These are the
                     // only outward sign that the index and the volume have
                     // diverged, so reporting them nowhere made a drifting index

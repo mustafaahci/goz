@@ -198,6 +198,11 @@ pub struct VolumeStatus {
     /// the daemon can be down and still replay changes instead of rescanning.
     #[serde(default)]
     pub journal_max_bytes: Option<u64>,
+    /// `true` while entries sit under lost+found because their parent never
+    /// arrived. Every query then pays a presentability walk per candidate, so
+    /// a healthy volume reports `false`.
+    #[serde(default)]
+    pub has_orphans: bool,
     /// Index drift counters. Non-zero values are not errors on their own (a
     /// missed delete or a slot reuse is normal on a busy volume), but they are
     /// the only outward sign that the index and the volume have diverged.
@@ -367,6 +372,7 @@ mod tests {
                 generation: i as u64,
                 metadata_pending: i % 2 == 0,
                 journal_max_bytes: (i % 2 == 1).then_some(64 << 20),
+                has_orphans: i % 3 == 0,
                 placeholders_created: i as u64,
                 delete_of_unknown: 2 * i as u64,
                 stale_slots: 3 * i as u64,

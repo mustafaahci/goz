@@ -1,6 +1,7 @@
-//! Per-volume bootstrap: enumerate the MFT and enrich from FILE_LAYOUT, wiring
-//! the raw Win32 buffers from `goz-winfs` through the pure parsers in
-//! `goz-core` into a `VolumeIndex`.
+//! Per-volume bootstrap: read the MFT once through FILE_LAYOUT, falling back
+//! to an MFT enumeration only when that pass stops, wiring the raw Win32
+//! buffers from `goz-winfs` through the pure parsers in `goz-core` into a
+//! `VolumeIndex`.
 //!
 //! This is the bridge the whole design turns on: `goz-winfs` hands us bytes,
 //! `goz-core` interprets them, and neither knows about the other. The daemon
@@ -35,8 +36,13 @@ const IO_BUFFER_BYTES: usize = 1024 * 1024;
 pub(crate) struct BootstrappedVolume {
     pub guid_path: String,
     pub mounts: Vec<String>,
-    pub enum_secs: f64,
     pub layout_secs: f64,
+    /// ENUM pass duration; `Some` only when the FILE_LAYOUT pass stopped and
+    /// the enumeration named the rest.
+    pub enum_secs: Option<f64>,
+    /// The FILE_LAYOUT pass stopped part way, so the files ENUM named carry no
+    /// size or date.
+    pub metadata_pending: bool,
     /// `None` if the volume has no usable USN journal (bootstrap still works;
     /// only the live tail would be unavailable).
     pub cursor: Option<JournalInfo>,
@@ -149,8 +155,7 @@ pub(crate) fn scan_all() -> Result<Scan> {
     Ok(Scan { ok, failed })
 }
 
-/// Bootstraps a single volume: journal setup → MFT enumeration → FILE_LAYOUT
-/// enrichment.
+/// Bootstraps a single volume: journal setup, then [`build_index`].
 fn bootstrap_volume(vol: &VolumeInfo) -> Result<BootstrappedVolume> {
     let handle = goz_winfs::open_volume(&vol.guid_path).with_context(|| {
         format!(
@@ -163,75 +168,68 @@ fn bootstrap_volume(vol: &VolumeInfo) -> Result<BootstrappedVolume> {
     // MFT directly, so an unavailable journal is not fatal here.
     let cursor = ensure_journal(&handle, &vol.guid_path);
     // First-time bootstrap passes no stop flag, so the rebuild can never abort.
-    let (index, enum_secs, layout_secs) =
-        build_index(&handle, None)?.expect("build_index cannot abort without a stop flag");
+    let built = build_index(&handle, None)?.expect("build_index cannot abort without a stop flag");
 
     Ok(BootstrappedVolume {
         guid_path: vol.guid_path.clone(),
         mounts: vol.mounts.clone(),
-        enum_secs,
-        layout_secs,
+        layout_secs: built.layout_secs,
+        enum_secs: built.enum_secs,
+        metadata_pending: built.metadata_pending,
         cursor,
-        index,
+        index: built.index,
         handle,
     })
 }
 
-/// Builds a fresh [`VolumeIndex`] for an already-open volume handle: a full MFT
-/// enumeration followed by FILE_LAYOUT enrichment. Shared by first-time
-/// bootstrap and the live tail's rescan (after a USN journal wrap/deletion),
-/// which rebuilds the index on the handle it already owns. Returns the index
-/// plus the enum/layout wall-clock timings. The journal is the caller's concern.
+/// A freshly built index and how its passes went.
+pub(crate) struct BuiltIndex {
+    pub index: VolumeIndex,
+    pub layout_secs: f64,
+    /// `Some` only when the FILE_LAYOUT pass stopped and ENUM ran.
+    pub enum_secs: Option<f64>,
+    /// The FILE_LAYOUT pass stopped, so some sizes and dates are unknown.
+    pub metadata_pending: bool,
+}
+
+/// Builds a fresh [`VolumeIndex`] for an already-open volume handle. Shared by
+/// first-time bootstrap and the live tail's rescan (after a USN journal
+/// wrap/deletion), which rebuilds the index on the handle it already owns.
+/// Returns `None` when `stop` aborts the build. The journal is the caller's
+/// concern.
+///
+/// One FILE_LAYOUT pass yields, per file, every hard-link name with its
+/// parent, the attributes, size and last-write time: everything the index
+/// stores, so the MFT is read once. The ENUM pass that used to run first
+/// carried only one name and parent per record and read the same MFT again
+/// (4.2M entries, warm: 17.8 s for both passes, 12.2 s for FILE_LAYOUT alone).
+/// It also never returned `$Extend`, so that directory's children sat under
+/// lost+found forever and every query paid the presentability walk. ENUM now
+/// runs only when the FILE_LAYOUT pass stops part way, into the same index, so
+/// a failed read still drops no file; the files it names carry no size or
+/// date. Approach measured and proposed by SynoSoftware in issue #1.
 pub(crate) fn build_index(
     handle: &VolumeHandle,
     stop: Option<&AtomicBool>,
-) -> Result<Option<(VolumeIndex, f64, f64)>> {
+) -> Result<Option<BuiltIndex>> {
     let cancelled = || stop.is_some_and(|s| s.load(Ordering::Relaxed));
     let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
     let mut buf = vec![0u8; IO_BUFFER_BYTES];
 
-    // --- MFT enumeration ------------------------------------------------
-    let enum_start = Instant::now();
-    let mut next_frn: u64 = 0;
+    // --- FILE_LAYOUT: names, links, sizes, dates in one MFT read ----------
+    let layout_start = Instant::now();
+    let mut restart = true;
+    let mut layout_complete = true;
     loop {
         if cancelled() {
             return Ok(None); // shutdown arrived mid-rebuild: abort cooperatively
-        }
-        let Some(bytes) =
-            enum_usn_data(handle, next_frn, &mut buf).context("FSCTL_ENUM_USN_DATA")?
-        else {
-            break; // ERROR_HANDLE_EOF: enumeration complete
-        };
-        let walk = walk_enum_buffer(&buf[..bytes]).context("parsing ENUM buffer")?;
-        for rec in &walk.records {
-            index.insert_enum(rec);
-        }
-        // The kernel guarantees forward progress; guard against a stuck cursor
-        // anyway so a driver quirk can never spin forever.
-        if walk.next_start_frn == next_frn && walk.records.is_empty() {
-            break;
-        }
-        next_frn = walk.next_start_frn;
-    }
-    let enum_secs = enum_start.elapsed().as_secs_f64();
-
-    // --- FILE_LAYOUT enrichment (sizes, mtimes, hard-link names) --------
-    //
-    // Best-effort: a failure warns and continues, leaving sizes "unknown" which
-    // the query engine and CSV writer handle safely. Degrading beats failing the
-    // whole bootstrap, since names alone still answer most queries.
-    let layout_start = Instant::now();
-    let mut restart = true;
-    loop {
-        if cancelled() {
-            return Ok(None); // shutdown arrived mid-enrichment: abort cooperatively
         }
         match query_file_layout(handle, RECOMMENDED_LAYOUT_FLAGS, restart, &mut buf) {
             Ok(Some(bytes)) => {
                 let files =
                     walk_layout_buffer(&buf[..bytes]).context("parsing FILE_LAYOUT buffer")?;
                 for f in &files {
-                    index.enrich(f);
+                    index.insert_layout(f);
                 }
                 restart = false;
             }
@@ -239,15 +237,49 @@ pub(crate) fn build_index(
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "FILE_LAYOUT enrichment stopped; sizes and dates may be incomplete"
+                    "FILE_LAYOUT pass stopped; enumerating the remaining names, whose sizes and dates stay unknown"
                 );
+                layout_complete = false;
                 break;
             }
         }
     }
     let layout_secs = layout_start.elapsed().as_secs_f64();
 
-    Ok(Some((index, enum_secs, layout_secs)))
+    // --- ENUM fallback: name what a stopped FILE_LAYOUT pass did not reach --
+    let mut enum_secs = None;
+    if !layout_complete {
+        let enum_start = Instant::now();
+        let mut next_frn: u64 = 0;
+        loop {
+            if cancelled() {
+                return Ok(None); // shutdown arrived mid-rebuild: abort cooperatively
+            }
+            let Some(bytes) =
+                enum_usn_data(handle, next_frn, &mut buf).context("FSCTL_ENUM_USN_DATA")?
+            else {
+                break; // ERROR_HANDLE_EOF: enumeration complete
+            };
+            let walk = walk_enum_buffer(&buf[..bytes]).context("parsing ENUM buffer")?;
+            for rec in &walk.records {
+                index.insert_enum(rec);
+            }
+            // The kernel guarantees forward progress; guard against a stuck
+            // cursor anyway so a driver quirk can never spin forever.
+            if walk.next_start_frn == next_frn && walk.records.is_empty() {
+                break;
+            }
+            next_frn = walk.next_start_frn;
+        }
+        enum_secs = Some(enum_start.elapsed().as_secs_f64());
+    }
+
+    Ok(Some(BuiltIndex {
+        index,
+        layout_secs,
+        enum_secs,
+        metadata_pending: !layout_complete,
+    }))
 }
 
 /// How large the USN journal on a volume should be, given the volume's total

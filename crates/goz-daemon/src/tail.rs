@@ -666,7 +666,7 @@ fn rescan(
     // Pass the stop flag so a shutdown arriving mid-rebuild aborts promptly
     // instead of blocking `TailHandle::shutdown`'s join for the full MFT scan.
     let new_index = match bootstrap::build_index(handle, Some(stop)) {
-        Ok(Some((index, _enum_secs, _layout_secs))) => index,
+        Ok(Some(built)) => built.index,
         // Aborted by shutdown: leave the old index in place and stop cleanly;
         // this is NOT a failure, so do not mark the volume Failed.
         Ok(None) => return None,

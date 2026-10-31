@@ -180,8 +180,10 @@ fn run_scan(query: Option<String>) -> anyhow::Result<()> {
         println!("volume {mount}");
         println!("  guid          {}", s.guid_path);
         println!("  entries       {}", s.entries());
-        println!("  enum          {:.2}s", s.enum_secs);
         println!("  file_layout   {:.2}s", s.layout_secs);
+        if let Some(enum_secs) = s.enum_secs {
+            println!("  enum          {enum_secs:.2}s (the file_layout pass stopped)");
+        }
         match &s.cursor {
             Some(c) => println!(
                 "  journal       id={:#x} next_usn={}",

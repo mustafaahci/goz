@@ -428,6 +428,7 @@ fn build_status(volumes: &VolumeSet) -> DaemonStatus {
                 generation: index.generation(),
                 metadata_pending: *v.metadata_pending.read(),
                 journal_max_bytes: v.journal_max_bytes,
+                has_orphans: index.has_orphans(),
                 placeholders_created: stats.placeholders_created,
                 delete_of_unknown: stats.delete_of_unknown,
                 stale_slots: stats.stale_slots,

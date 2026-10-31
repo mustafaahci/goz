@@ -1,10 +1,12 @@
 //! `FSCTL_QUERY_FILE_LAYOUT` output-buffer parsing (pure bytes).
 //!
-//! The bootstrap metadata-enrichment source: one bulk ioctl pass over
-//! a volume yields, per file, its attributes, size, last-write time, and
-//! every hard-link name. The MFT enumeration (`usn`) pass carries
-//! attributes and one name and parent per record, but neither size nor
-//! last-write time, and never more than one name per file. [`walk_layout_buffer`] turns one raw output buffer into structured
+//! The bootstrap's source: one bulk ioctl pass over a volume yields, per
+//! file, its attributes, size, last-write time, and every hard-link name with
+//! its parent, which is everything the index stores. The MFT enumeration
+//! (`usn`) pass carries attributes and one name and parent per record, but
+//! neither size nor last-write time, so the daemon runs it only to name the
+//! files a FILE_LAYOUT pass that stopped part way did not reach.
+//! [`walk_layout_buffer`] turns one raw output buffer into structured
 //! [`LayoutFile`] entries; the daemon pages the ioctl and feeds each buffer in
 //! turn.
 //!

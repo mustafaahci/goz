@@ -336,8 +336,8 @@ impl VolumeIndex {
         // because a rename landed between the ENUM and LAYOUT passes. Tombstone
         // + realloc here would orphan those children under a reused slot.
         if self.head_of(file.frn).is_none() {
-            // ENUM missed this FRN entirely; build the chain from LAYOUT.
-            // No existing entry means nothing to orphan.
+            // No entry of this FRN exists yet (nothing to orphan): build the
+            // chain from LAYOUT.
             let desired: Vec<LinkTarget> = file
                 .names
                 .iter()
@@ -380,6 +380,34 @@ impl VolumeIndex {
                 cur = self.entries.next_link(cur);
             }
         }
+    }
+
+    /// Ingests one FILE_LAYOUT record when FILE_LAYOUT is the bootstrap's
+    /// only pass: the first real (non 8.3) name stands in for the ENUM record,
+    /// so a directory an earlier child left as a placeholder gets its name,
+    /// then [`Self::enrich`] adds the other hard-link names, the size and the
+    /// date. Idempotent, like [`Self::insert_enum`].
+    ///
+    /// The root's own record names the root as its parent, which no ENUM
+    /// record does. Taking that name would make the root its own parent and
+    /// leave every entry without a path, so the root is only enriched.
+    pub fn insert_layout(&mut self, file: &LayoutFile) {
+        let is_dir = file.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        if let Some(name) = file
+            .names
+            .iter()
+            .find(|n| !n.dos_only)
+            .filter(|n| n.parent_frn != file.frn)
+        {
+            self.upsert_link(
+                file.frn,
+                name.parent_frn,
+                &name.name,
+                name.name_lossy,
+                is_dir,
+            );
+        }
+        self.enrich(file);
     }
 
     // -- live apply -------------------------------------------------------
