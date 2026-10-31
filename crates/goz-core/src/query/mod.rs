@@ -14,7 +14,7 @@ pub mod parse;
 pub use crate::fold;
 
 pub use engine::{
-    CompiledQuery, QueryHit, QueryOutcome, resolve_scope, run_query, run_query_deferrable,
-    run_query_unsorted,
+    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, resolve_scope, run_query,
+    run_query_refs,
 };
 pub use parse::{Filters, Kind, ParsedQuery, QueryError, SizeRange, Wildcard, parse_query};

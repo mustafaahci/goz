@@ -9,7 +9,7 @@
 
 use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange};
 use crate::index::VolumeIndex;
-use crate::types::{EntryIdx, SortDir, SortKey, SortSpec};
+use crate::types::{EntryIdx, Frn, SortDir, SortKey, SortSpec};
 use memchr::memmem;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -32,15 +32,29 @@ pub struct QueryHit {
 pub struct QueryOutcome {
     /// Total matches before offset/limit (es `totitems` semantics).
     pub total: u64,
-    /// The requested page of hits, ordered per [`Self::sorted`].
+    /// The requested page of hits, in sort order.
     pub hits: Vec<QueryHit>,
-    /// Whether [`Self::hits`] is already in sort order.
-    ///
-    /// `false` means the executor declined to order under the index lock and
-    /// the CALLER must sort before any k-way merge that assumes sorted runs.
-    /// Always `true` from [`run_query`], always `false` from
-    /// [`run_query_unsorted`]; only [`run_query_deferrable`] varies.
-    pub sorted: bool,
+}
+
+/// One matched entry without its path: 16 bytes. The daemon keeps these for
+/// a whole result set and reads each row's path, size and date from the index
+/// when it encodes the page that carries it, so a multi-million-row export
+/// costs bytes per row, not a path per row. The FRN lets the page builder
+/// prove the slot still holds the same file (see
+/// [`VolumeIndex::entry_if_frn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HitRef {
+    pub idx: EntryIdx,
+    pub frn: Frn,
+}
+
+/// Result of [`run_query_refs`]: the requested page as references, in sort
+/// order, plus the full match count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefOutcome {
+    /// Total matches before offset/limit (es `totitems` semantics).
+    pub total: u64,
+    pub refs: Vec<HitRef>,
 }
 
 /// A [`ParsedQuery`]'s substring needles prebuilt into finders once (rather
@@ -110,19 +124,19 @@ impl<'a> CompiledQuery<'a> {
     }
 }
 
-/// A matched entry before its path is reconstructed (deferred to the final
-/// page unless a path term or path-sort forces it earlier).
+/// A matched entry before its page is built: 16 bytes, so a multi-million
+/// match set costs tens of MB rather than hundreds. Everything else (name,
+/// parent, kind, size, date) is read from the index when a comparison or the
+/// page needs it.
 struct Candidate {
     idx: EntryIdx,
-    is_dir: bool,
-    size: Option<u64>,
-    mtime: Option<i64>,
-    /// Reconstructed volume-relative path, filled only when needed.
-    path: Option<Vec<u8>>,
-    /// Precomputed `-sort-path` key: `fold(parent path) + NUL + fold(name)`.
-    /// Filled once per candidate for path sorts so the comparator is a plain
-    /// byte compare instead of re-folding paths on every comparison.
-    sort_key: Option<Vec<u8>>,
+    /// The key the page's sort asks for, filled by [`order`]: the parent
+    /// directory's rank for a path sort (see [`rank_parents`]), the size for a
+    /// size sort, the order-preserving image of the mtime for a date sort,
+    /// unused for a name sort. Candidates used to carry kind, size, date, an
+    /// optional path and a `fold(parent) + NUL + fold(name)` key string each,
+    /// ~300 MB under the index lock for a 100-row page of a broad path sort.
+    key: u64,
 }
 
 /// Runs a query over `index`.
@@ -145,56 +159,49 @@ pub fn run_query(
     offset: u32,
     limit: Option<u32>,
 ) -> QueryOutcome {
-    run_query_impl(index, parsed, scope, Some(sort), offset, limit, false)
+    let Scan {
+        mut candidates,
+        mut dir_paths,
+    } = scan(index, parsed, scope);
+    let total = candidates.len() as u64;
+    let (start, end) = page_bounds(candidates.len(), offset, limit);
+    order(index, &mut candidates, &mut dir_paths, sort, end);
+    let hits = build_hits(index, &candidates[start..end], &mut dir_paths);
+    QueryOutcome { total, hits }
 }
 
-/// Like [`run_query`], but allowed to hand back an UNSORTED page when ordering
-/// under the index lock would buy nothing.
+/// Like [`run_query`], but the page comes back as 16-byte [`HitRef`]s and no
+/// path is built: the daemon's entry point.
 ///
-/// Ordering inside the lock earns its keep only when the page is a strict slice
-/// of the match set: picking which `limit` matches survive needs the index, and
-/// only that many paths are then reconstructed. When the page already covers
-/// every match there is nothing to pick, so this returns the matches in scan
-/// order with [`QueryOutcome::sorted`] set to `false` and leaves the ordering to
-/// the caller, which can do it after releasing the lock.
-///
-/// That distinction is not knowable before the scan (it depends on the match
-/// count), which is why it lives here rather than in the caller's dispatch.
-///
-/// The caller MUST check [`QueryOutcome::sorted`] and sort when it is `false`,
-/// before any k-way merge that assumes sorted runs.
-pub fn run_query_deferrable(
+/// The ordering happens here, under the caller's index read lock, because the
+/// comparators read folded names straight from the index and allocate
+/// nothing: a 3M-row set orders in ~160 ms across cores. Building every
+/// row's path under that lock, as the page builder of [`run_query`] does, held
+/// it ~1 s for the same set and peaked at ~1 GB; the daemon now builds paths
+/// per page, from the live index, when it encodes them.
+pub fn run_query_refs(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
     scope: Option<EntryIdx>,
     sort: SortSpec,
     offset: u32,
     limit: Option<u32>,
-) -> QueryOutcome {
-    run_query_impl(index, parsed, scope, Some(sort), offset, limit, true)
-}
-
-/// Every match, with paths built, in scan order. The CALLER sorts.
-///
-/// For a full export (`limit: None`) the caller receives every match anyway, so
-/// ordering is pure post-processing that needs no index at all: every sort key
-/// is derivable from the returned [`QueryHit`] (name from the path's last
-/// component, path from the path, size and mtime from the hit).
-///
-/// It matters because of who is waiting. The caller holds the volume's index
-/// READ lock for as long as this runs, and the volume's tail thread cannot apply
-/// a single journal record until that lock is released. Sorting a million rows
-/// inside the lock stalled live updates for ~1.7 s; sorting them after it is
-/// released stalls nothing.
-///
-/// The caller MUST sort the result before any k-way merge that assumes sorted
-/// runs.
-pub fn run_query_unsorted(
-    index: &VolumeIndex,
-    parsed: &ParsedQuery,
-    scope: Option<EntryIdx>,
-) -> QueryOutcome {
-    run_query_impl(index, parsed, scope, None, 0, None, false)
+) -> RefOutcome {
+    let Scan {
+        mut candidates,
+        mut dir_paths,
+    } = scan(index, parsed, scope);
+    let total = candidates.len() as u64;
+    let (start, end) = page_bounds(candidates.len(), offset, limit);
+    order(index, &mut candidates, &mut dir_paths, sort, end);
+    let refs = candidates[start..end]
+        .iter()
+        .map(|c| HitRef {
+            idx: c.idx,
+            frn: index.entry(c.idx).frn(),
+        })
+        .collect();
+    RefOutcome { total, refs }
 }
 
 /// A folder-scoped query walks the scope's subtree instead of scanning the
@@ -207,20 +214,16 @@ pub fn run_query_unsorted(
 /// the folder.
 const SUBTREE_WALK_MAX: usize = 200_000;
 
-/// `sort: None` skips ordering entirely and returns every match.
-///
-/// `allow_defer` lets the executor drop the ordering when the page turns out to
-/// cover every match (see [`run_query_deferrable`]); the reported
-/// [`QueryOutcome::sorted`] says which happened.
-fn run_query_impl(
-    index: &VolumeIndex,
-    parsed: &ParsedQuery,
-    scope: Option<EntryIdx>,
-    sort: Option<SortSpec>,
-    offset: u32,
-    limit: Option<u32>,
-    allow_defer: bool,
-) -> QueryOutcome {
+/// The match set of a query: every candidate that passed all predicates, in
+/// scan order, plus the parent-path memo the scan built. Ordering and page
+/// building share the memo so no parent chain is walked twice.
+struct Scan {
+    candidates: Vec<Candidate>,
+    dir_paths: FxHashMap<EntryIdx, Option<Vec<u8>>>,
+}
+
+/// Collects every match of `parsed` under `scope`.
+fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> Scan {
     let compiled = CompiledQuery::new(parsed);
     let has_path_terms = !parsed.path_terms.is_empty();
     let mut scope_memo: FxHashMap<EntryIdx, bool> = FxHashMap::default();
@@ -361,90 +364,117 @@ fn run_query_impl(
         }
     }
 
-    let total = candidates.len() as u64;
+    Scan {
+        candidates,
+        dir_paths,
+    }
+}
 
-    let start = (offset as usize).min(candidates.len());
+/// `[start, end)` of the requested page within `n` matches.
+fn page_bounds(n: usize, offset: u32, limit: Option<u32>) -> (usize, usize) {
+    let start = (offset as usize).min(n);
     let end = match limit {
-        Some(n) => (start + n as usize).min(candidates.len()),
-        None => candidates.len(),
+        Some(l) => (start + l as usize).min(n),
+        None => n,
     };
+    (start, end)
+}
 
-    // A page that covers every match has nothing to select, so ordering it here
-    // buys nothing the caller cannot do itself once it has released the index
-    // lock. Dropping the sort in that case is the whole point of
-    // `run_query_deferrable`: see `run_query_unsorted` for who is waiting on
-    // that lock. `end` is already clamped to the match count, so this is exactly
-    // "the page is the whole set".
-    //
-    // Everything below keys off the rebound `sort`, so a deferred query also
-    // skips the path-key precompute it would never consult.
-    let sort = match sort {
-        Some(s) if !(allow_defer && end == candidates.len()) => Some(s),
-        _ => None,
-    };
-    let sorted = sort.is_some();
-
-    // Sort-by-path: precompute each candidate's comparison key ONCE,
-    // fold(parent dir path) + NUL + fold(name), so ordering is a plain byte
-    // compare instead of re-folding both paths inside every comparison (the
-    // dominant cost on common queries with many matches). The parent path's
-    // folded form is memoized per directory (siblings share it), so each
-    // directory is walked and folded once. Raw display paths are reconstructed
-    // later, only for the page. The NUL separator (< any real byte, absent from
-    // names) makes the byte order equal es's `(parent, name)` tuple order.
-    if sort.is_some_and(|s| matches!(s.key, SortKey::Path)) {
-        let mut folded_dirs: FxHashMap<EntryIdx, Option<Vec<u8>>> = FxHashMap::default();
-        for c in &mut candidates {
-            let parent = index.entry(c.idx).parent();
-            let folded_parent = folded_dirs
-                .entry(parent)
-                .or_insert_with(|| {
-                    let mut buf = Vec::new();
-                    match index.path_of(parent, &mut buf) {
-                        crate::index::PathStatus::Ok => Some(fold(&buf)),
-                        _ => None, // parent under lost+found or a cycle: not presentable
-                    }
-                })
-                .clone();
-            if let Some(fp) = folded_parent {
-                let mut key = fp;
-                key.push(0);
-                key.extend_from_slice(&fold(index.entry(c.idx).name()));
-                c.sort_key = Some(key);
+/// Orders `candidates` so that `[..end]` holds the first `end` matches under
+/// `sort`, in order (see [`order_top`]). A path sort first ranks each distinct
+/// parent directory; no candidate carries a key string.
+fn order(
+    index: &VolumeIndex,
+    candidates: &mut [Candidate],
+    dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
+    sort: SortSpec,
+    end: usize,
+) {
+    match sort.key {
+        SortKey::Name => {}
+        SortKey::Path => rank_parents(index, candidates, dir_paths),
+        SortKey::Size => {
+            for c in candidates.iter_mut() {
+                c.key = index.entry(c.idx).size().unwrap_or(0);
+            }
+        }
+        SortKey::DateModified => {
+            for c in candidates.iter_mut() {
+                c.key = mtime_key(index.entry(c.idx).mtime());
             }
         }
     }
+    order_top(index, candidates, sort, end);
+}
 
-    // Order only enough to fill the page: quickselect the top `end` by the
-    // sort key (O(M)), then sort just that prefix (O(end log end)). This avoids
-    // an O(M log M) sort of the entire match set on common queries.
-    if let Some(sort) = sort {
-        order_top(index, &mut candidates, sort, end);
+/// Maps an mtime to a `u64` that orders like the `i64`, unknown lowest (as
+/// `unwrap_or(i64::MIN)` ordered it), so a date sort compares one integer.
+fn mtime_key(mtime: Option<i64>) -> u64 {
+    (mtime.unwrap_or(i64::MIN) as u64) ^ (1 << 63)
+}
+
+/// Gives each candidate the rank of its parent directory in folded-path order,
+/// so a path sort compares `(parent rank, folded name, idx)` and builds no key
+/// per candidate. One folded path is built per DISTINCT parent (siblings share
+/// it, and a broad result set has far fewer directories than files), and
+/// parents with equal folded paths share a rank, so the order equals the old
+/// per-candidate `fold(parent) + NUL + fold(name)` key order exactly: es's
+/// `(parent path, name)` tuple order. A parent that is not presentable (under
+/// lost+found, or a cycle) ranks last; its candidates are dropped at page time
+/// anyway.
+fn rank_parents(
+    index: &VolumeIndex,
+    candidates: &mut [Candidate],
+    dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
+) {
+    use rayon::slice::ParallelSliceMut;
+    let mut folded: FxHashMap<EntryIdx, Option<Vec<u8>>> = FxHashMap::default();
+    for c in candidates.iter() {
+        let parent = index.entry(c.idx).parent();
+        folded
+            .entry(parent)
+            .or_insert_with(|| parent_path(index, parent, dir_paths).as_deref().map(fold));
     }
-
-    // Reconstruct paths only for the requested page. A broad result set holds
-    // millions of files under far fewer distinct directories, so memoize each
-    // parent directory's reconstructed path (`path_of` runs once per directory)
-    // and build every file's path as `parent + '\' + name` instead of walking
-    // the whole parent chain per hit. This mirrors the folded-parent memoization
-    // the path-sort branch already uses (`folded_dirs` above). Correct because
-    // `path_of(child) == path_of(parent) + '\' + name` for any presentable child
-    // (a parent under lost+found or a cycle is `None` and the hit is dropped,
-    // exactly as the per-hit `path_of` did); real volumes never approach the
-    // MAX_PATH_HOPS depth where the two could diverge.
-    let mut hits = Vec::with_capacity(end - start);
-    for c in &candidates[start..end] {
-        // Path-term / path-sort queries already reconstructed the path in eval.
-        if let Some(p) = &c.path {
-            hits.push(QueryHit {
-                idx: c.idx,
-                path: p.clone(),
-                is_dir: c.is_dir,
-                size: c.size,
-                mtime: c.mtime,
-            });
-            continue;
+    let mut dirs: Vec<(EntryIdx, Option<Vec<u8>>)> = folded.into_iter().collect();
+    // Presentable parents first, in folded-path order. The idx tiebreak only
+    // makes the sort deterministic; equal paths get one rank below.
+    dirs.par_sort_unstable_by(|a, b| {
+        a.1.is_none()
+            .cmp(&b.1.is_none())
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut ranks: FxHashMap<EntryIdx, u32> =
+        FxHashMap::with_capacity_and_hasher(dirs.len(), Default::default());
+    let mut rank = 0u32;
+    for (i, (dir, path)) in dirs.iter().enumerate() {
+        if i > 0 && dirs[i - 1].1 != *path {
+            rank += 1;
         }
+        ranks.insert(*dir, if path.is_some() { rank } else { u32::MAX });
+    }
+    for c in candidates.iter_mut() {
+        c.key = u64::from(ranks[&index.entry(c.idx).parent()]);
+    }
+}
+
+/// Builds the page's hits with their volume-relative paths.
+///
+/// A broad result set holds millions of files under far fewer distinct
+/// directories, so each parent directory's reconstructed path is memoized
+/// (`path_of` runs once per directory) and every file's path is
+/// `parent + '\' + name` instead of a walk of the whole parent chain per hit.
+/// Correct because `path_of(child) == path_of(parent) + '\' + name` for any
+/// presentable child (a parent under lost+found or a cycle is `None` and the
+/// hit is dropped, exactly as a per-hit `path_of` would); real volumes never
+/// approach the MAX_PATH_HOPS depth where the two could diverge.
+fn build_hits(
+    index: &VolumeIndex,
+    page: &[Candidate],
+    dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
+) -> Vec<QueryHit> {
+    let mut hits = Vec::with_capacity(page.len());
+    for c in page {
         let entry = index.entry(c.idx);
         let parent = entry.parent();
         let parent_path = dir_paths.entry(parent).or_insert_with(|| {
@@ -469,17 +499,12 @@ fn run_query_impl(
         hits.push(QueryHit {
             idx: c.idx,
             path,
-            is_dir: c.is_dir,
-            size: c.size,
-            mtime: c.mtime,
+            is_dir: entry.is_dir(),
+            size: entry.size(),
+            mtime: entry.mtime(),
         });
     }
-
-    QueryOutcome {
-        total,
-        hits,
-        sorted,
-    }
+    hits
 }
 
 /// Verifies all predicates for one candidate, returning it (with a
@@ -557,17 +582,12 @@ fn evaluate(
         return None;
     }
 
-    let mut path = None;
     if has_path_terms {
         let mut buf = Vec::new();
         if !matches!(index.path_of(idx, &mut buf), crate::index::PathStatus::Ok) {
             return None;
         }
-        let folded_p = if parsed.match_case {
-            buf.clone()
-        } else {
-            fold(&buf)
-        };
+        let folded_p = if parsed.match_case { buf } else { fold(&buf) };
         if !compiled
             .path_finders
             .iter()
@@ -575,17 +595,9 @@ fn evaluate(
         {
             return None;
         }
-        path = Some(buf);
     }
 
-    Some(Candidate {
-        idx,
-        is_dir: entry.is_dir(),
-        size: entry.size(),
-        mtime: entry.mtime(),
-        path,
-        sort_key: None,
-    })
+    Some(Candidate { idx, key: 0 })
 }
 
 fn kind_matches(kind: Option<Kind>, is_dir: bool) -> bool {
@@ -691,31 +703,17 @@ fn cmp_candidate(
     a: &Candidate,
     b: &Candidate,
 ) -> core::cmp::Ordering {
+    // Folded names are precomputed, so these are cheap byte compares; `key`
+    // holds whatever `order` filled for this sort. The idx tiebreak makes the
+    // order total, so an unstable sort is deterministic.
+    let by_name = || index.folded_name(a.idx).cmp(index.folded_name(b.idx));
     let base = match sort.key {
-        // Folded names are precomputed, so these are cheap byte compares.
-        SortKey::Name => index
-            .folded_name(a.idx)
-            .cmp(index.folded_name(b.idx))
+        SortKey::Name => by_name().then_with(|| a.idx.cmp(&b.idx)),
+        SortKey::Path | SortKey::Size | SortKey::DateModified => a
+            .key
+            .cmp(&b.key)
+            .then_with(by_name)
             .then_with(|| a.idx.cmp(&b.idx)),
-        SortKey::Path => {
-            // Keys were precomputed for path-sort: fold(parent)+NUL+fold(name).
-            let empty: &[u8] = b"";
-            a.sort_key
-                .as_deref()
-                .unwrap_or(empty)
-                .cmp(b.sort_key.as_deref().unwrap_or(empty))
-                .then_with(|| a.idx.cmp(&b.idx))
-        }
-        SortKey::Size => a
-            .size
-            .unwrap_or(0)
-            .cmp(&b.size.unwrap_or(0))
-            .then_with(|| index.folded_name(a.idx).cmp(index.folded_name(b.idx))),
-        SortKey::DateModified => a
-            .mtime
-            .unwrap_or(i64::MIN)
-            .cmp(&b.mtime.unwrap_or(i64::MIN))
-            .then_with(|| index.folded_name(a.idx).cmp(index.folded_name(b.idx))),
     };
     if sort.dir == SortDir::Desc {
         base.reverse()
@@ -1077,49 +1075,42 @@ mod tests {
         assert_eq!(out.hits.len(), 2);
     }
 
-    /// Ordering under the index lock earns its keep only when the limit really
-    /// slices the match set: picking the survivors needs the index, and only
-    /// that many paths get reconstructed. A page that already covers every
-    /// match has nothing to pick, so the executor must hand the ordering back
-    /// rather than do it while the caller holds the lock.
-    ///
-    /// Regression: the daemon chose by `limit.is_none()`, so a client asking for
-    /// everything as a NUMBER (`-n 4294967295`, or any limit at or above the
-    /// match count) took the in-lock path and sorted the entire set with the
-    /// volume's tail thread blocked behind it. The protection was one number
-    /// away from being skipped.
+    /// The daemon's entry point returns the same page, in the same order, as
+    /// `run_query`, under every sort key, direction and slice: references are
+    /// the hits minus their paths, nothing else, and each one still resolves.
     #[test]
-    fn a_page_covering_every_match_defers_the_sort() {
+    fn refs_follow_run_query_order() {
         let idx = sample_index();
         let parsed = parse_query("").unwrap();
-        let sort = SortSpec::default_for(SortKey::Name);
-        let total = run_query(&idx, &parsed, None, sort, 0, None).total as u32;
-        assert!(total > 1, "fixture must have several matches to slice");
-
-        for limit in [None, Some(u32::MAX), Some(total), Some(total + 1)] {
-            let out = run_query_deferrable(&idx, &parsed, None, sort, 0, limit);
-            assert!(
-                !out.sorted,
-                "limit {limit:?} covers all {total} matches; ordering must be deferred off-lock"
-            );
-            assert_eq!(
-                out.hits.len(),
-                total as usize,
-                "limit {limit:?}: a covering page still returns every match"
-            );
+        let total = run_query(&idx, &parsed, None, SortSpec::default(), 0, None).total as u32;
+        assert!(total > 2, "fixture must have several matches to slice");
+        for key in [
+            SortKey::Name,
+            SortKey::Path,
+            SortKey::Size,
+            SortKey::DateModified,
+        ] {
+            for dir in [SortDir::Asc, SortDir::Desc] {
+                let sort = SortSpec { key, dir };
+                for (offset, limit) in [
+                    (0, None),
+                    (0, Some(1)),
+                    (1, Some(total - 2)),
+                    (0, Some(u32::MAX)),
+                    (total, Some(5)),
+                ] {
+                    let hits = run_query(&idx, &parsed, None, sort, offset, limit);
+                    let refs = run_query_refs(&idx, &parsed, None, sort, offset, limit);
+                    assert_eq!(refs.total, hits.total);
+                    let want: Vec<EntryIdx> = hits.hits.iter().map(|h| h.idx).collect();
+                    let got: Vec<EntryIdx> = refs.refs.iter().map(|r| r.idx).collect();
+                    assert_eq!(got, want, "{key:?}/{dir:?} offset {offset} limit {limit:?}");
+                    for r in &refs.refs {
+                        assert!(idx.entry_if_frn(r.idx, r.frn).is_some());
+                    }
+                }
+            }
         }
-
-        // A limit that genuinely slices still orders here, where the index is
-        // available to pick which matches survive.
-        let sliced = run_query_deferrable(&idx, &parsed, None, sort, 0, Some(total - 1));
-        assert!(sliced.sorted, "a real slice must still order in-lock");
-        assert_eq!(sliced.hits.len(), total as usize - 1);
-
-        // `run_query` keeps its unconditional promise for direct callers.
-        assert!(
-            run_query(&idx, &parsed, None, sort, 0, Some(u32::MAX)).sorted,
-            "run_query must always return sorted hits"
-        );
     }
 
     #[test]

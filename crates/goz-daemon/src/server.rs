@@ -10,17 +10,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use goz_core::fold::fold;
+use goz_core::index::{PathStatus, VolumeIndex};
 use goz_core::proto::{
     DaemonStatus, MemPair, PIPE_NAME, PROTO_VERSION, ProtoError, Request, Response, VolumeMemory,
     VolumeStatus,
 };
 use goz_core::proto::{
-    MAX_CLIENT_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame, push_item,
-    push_results_header,
+    MAX_CLIENT_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame, patch_results_header,
+    push_item, push_results_header,
 };
-use goz_core::query::{parse_query, resolve_scope, run_query_deferrable};
-use goz_core::types::{EntryIdx, SortKey, SortSpec};
+use goz_core::query::{HitRef, parse_query, resolve_scope, run_query_refs};
+use goz_core::types::{EntryIdx, SortDir, SortKey, SortSpec};
 use goz_winfs::{PipeSecurity, build_pipe_security};
+use rustc_hash::FxHashMap;
+use std::cmp::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{Semaphore, watch};
@@ -210,17 +214,15 @@ fn encode_query_binary(volumes: &VolumeSet, q: QueryRequest) -> Vec<u8> {
 /// last), or a single tagged JSON error frame if the query failed to parse. An
 /// empty result set still emits one `more: false` page so the client always sees
 /// a terminal frame. Each framed page is handed to `emit` as soon as it is
-/// encoded, and the matched hits are consumed as it goes, so a full export holds
-/// neither the whole response nor the already-emitted hits' path bytes. `emit`
-/// returning `false` means the consumer is gone; encoding stops.
+/// encoded. `emit` returning `false` means the consumer is gone; encoding stops.
 ///
-/// Pages are encoded straight from each matched hit's stored path bytes: the
-/// mount prefix and the volume-relative path are copied into one reused scratch
-/// buffer and handed to [`push_item`], so a match never allocates an
-/// intermediate `ResultItem`/`String`, and the set is never cloned for paging or
-/// re-serialized as JSON. This is the whole point of the binary wire: on a
-/// multi-million-path result set it is ~12x less serialization work than the old
-/// JSON path.
+/// A result set is held as 16-byte [`HitRef`]s per volume, in sort order. A
+/// page's paths, sizes and dates are read from the index while it is encoded,
+/// under a read lock per page, and each row's slot is checked against its FRN
+/// first (a journal apply since the scan may have reused it; such rows are
+/// dropped). Holding every hit's full path instead peaked at ~1 GB on a 3M-row
+/// export and grew with folder depth; now the set costs ~50 MB and the first
+/// page leaves after the scan and sort instead of after every path.
 fn stream_query_binary(
     volumes: &VolumeSet,
     q: QueryRequest,
@@ -245,9 +247,9 @@ fn stream_query_binary(
     let per_vol_limit = q.limit.map(|l| q.offset.saturating_add(l));
     let targets = targets(volumes, &q.scope);
 
-    // One pre-sorted run per volume that has hits: run_query already ordered each
-    // volume's hits by `q.sort`, so the runs are merged (not re-sorted) below.
-    let mut runs: Vec<Vec<VolHit>> = Vec::new();
+    // One sorted run of references per volume with hits, plus that volume.
+    let mut runs: Vec<Run> = Vec::new();
+    let mut vols: Vec<Arc<VolumeState>> = Vec::new();
     let mut total: u64 = 0;
     let mut volumes_incomplete = false;
     let mut metadata_pending = false;
@@ -269,92 +271,85 @@ fn stream_query_binary(
                 None => continue, // scope folder absent on this volume: no hits
             },
         };
-        // A limited query orders INSIDE the lock only when the limit actually
-        // slices the match set: picking which `per_vol_limit` matches survive
-        // needs the index, and only that many paths are then reconstructed.
-        //
-        // When the page covers every match there is nothing to pick, so ordering
-        // is pure post-processing over owned rows and every sort key comes from
-        // the hit itself (`sort_collected` touches no index). Sorting a million
-        // rows under the read lock blocked this volume's tail thread from
-        // applying a single journal record for the whole sort; doing it after
-        // the guard drops blocks nobody.
-        //
-        // Which case applies depends on the match count, which is not known
-        // until the scan has run, so the executor decides and reports back via
-        // `outcome.sorted`. Testing `limit.is_none()` here instead meant a
-        // client asking for everything as a NUMBER (`-n 4294967295`, or any
-        // limit at or above the match count) took the in-lock path and
-        // re-introduced the very stall the deferral exists to prevent.
-        let outcome = run_query_deferrable(&index, &parsed, scope_entry, q.sort, 0, per_vol_limit);
+        // Ordered under the lock: the comparators read folded names straight
+        // from the index and allocate nothing, so a 3M-row set orders in
+        // ~160 ms across cores, against ~1 s the lock used to be held while
+        // every row's path was built here.
+        let outcome = run_query_refs(&index, &parsed, scope_entry, q.sort, 0, per_vol_limit);
+        drop(index);
         total += outcome.total;
-        let sorted = outcome.sorted;
-        drop(index); // hits own their bytes; release the read lock early
-
-        let mut run: Vec<_> = outcome
-            .hits
-            .into_iter()
-            .map(|hit| (vol.clone(), hit))
-            .collect();
-        if !sorted {
-            // Off the lock. `order_merged` k-way merges runs it assumes are
-            // already sorted, so this is not optional.
-            sort_collected(&mut run, q.sort);
-        }
-        if !run.is_empty() {
-            runs.push(run);
+        if !outcome.refs.is_empty() {
+            runs.push(Run::new(outcome.refs));
+            vols.push(vol.clone());
         }
     }
 
-    // Merge/order the pre-sorted per-volume runs into one global order.
-    let collected = order_merged(runs, q.sort);
-    let start = (q.offset as usize).min(collected.len());
+    let n_total: usize = runs.iter().map(|r| r.refs.len()).sum();
+    let start = (q.offset as usize).min(n_total);
     let end = q
         .limit
-        .map(|l| (start + l as usize).min(collected.len()))
-        .unwrap_or(collected.len());
-    let n_rows = end - start;
+        .map_or(n_total, |l| (start + l as usize).min(n_total));
 
     let page = PAGE_ROWS as usize;
-    let n_pages = n_rows.div_ceil(page).max(1);
-    // Consuming iteration: each emitted page's hits DROP right after
-    // encoding, so the held path bytes drain with export progress instead of
-    // peaking all together (skipped offset rows and beyond-limit rows drop
-    // with the iterator).
-    let mut rows_iter = collected.into_iter().skip(start).take(n_rows);
+    let mut consumed = 0usize; // merged rows taken so far, emitted or not
     let mut path = Vec::new();
-    for i in 0..n_pages {
-        let rows = if i + 1 < n_pages {
-            page
-        } else {
-            n_rows - i * page
-        };
-        // Frame = 4-byte LE length placeholder + payload, length backfilled
-        // once the payload is written (avoids a second buffer + copy per
-        // page). ~96 bytes/row covers a typical path + fields without a
-        // mid-page regrow.
-        let mut out = Vec::with_capacity(rows * 96 + 64);
+    loop {
+        // Every run's volume is read-locked for the page, in volume-set order
+        // (the order every query uses, so readers never wait on each other in
+        // a cycle), and released before the page is handed off, since `emit`
+        // may block on the pipe.
+        let guards: Vec<IndexGuard<'_>> = vols.iter().map(|v| v.index.read()).collect();
+        // Frame = 4-byte LE length placeholder + payload, both backfilled once
+        // the rows are in (the count is known only then). ~96 bytes/row covers
+        // a typical path + fields without a mid-page regrow.
+        let mut out = Vec::with_capacity(page * 96 + 64);
         out.extend_from_slice(&[0u8; 4]);
+        let header_at = out.len();
         push_results_header(
             &mut out,
             total,
             0, // generation: unused by the CLI, matches the prior wire
-            i + 1 < n_pages,
+            false,
             volumes_incomplete,
             metadata_pending,
-            rows as u32,
+            0,
         );
-        for (vol, hit) in rows_iter.by_ref().take(rows) {
-            path.clear();
-            path.extend_from_slice(vol.mount_prefix().as_bytes());
-            path.extend_from_slice(&hit.path);
-            let size = q.want_size.then_some(hit.size).flatten();
-            let mtime = q.want_mtime.then_some(hit.mtime).flatten();
-            push_item(&mut out, &path, hit.is_dir, size, mtime);
+        let mut count = 0u32;
+        let mut taken = 0usize;
+        while taken < page && consumed < end {
+            let Some(ri) = next_head(&mut runs, &guards, &vols, q.sort, &mut consumed) else {
+                break;
+            };
+            let href = runs[ri].take_head();
+            consumed += 1;
+            taken += 1;
+            if consumed <= start {
+                continue; // an offset row: merged in order, then skipped
+            }
+            let index = &*guards[ri];
+            // `next_head` proved the head still is this file.
+            let entry = index.entry(href.idx);
+            let presentable = runs[ri].row_path(
+                index,
+                entry.parent(),
+                entry.name(),
+                vols[ri].mount_prefix(),
+                &mut path,
+            );
+            if !presentable {
+                continue;
+            }
+            let size = q.want_size.then(|| entry.size()).flatten();
+            let mtime = q.want_mtime.then(|| entry.mtime()).flatten();
+            push_item(&mut out, &path, entry.is_dir(), size, mtime);
+            count += 1;
         }
+        drop(guards);
+        let more = consumed < end;
+        patch_results_header(&mut out[header_at..], more, count);
         let payload_len = (out.len() - 4) as u32;
         out[0..4].copy_from_slice(&payload_len.to_le_bytes());
-        if !emit(out) {
+        if !emit(out) || !more {
             return;
         }
     }
@@ -537,145 +532,187 @@ fn scope_entry_valid(index: &goz_core::index::VolumeIndex, entry: EntryIdx, rel:
     goz_core::fold::fold(&buf) == goz_core::fold::fold(rel)
 }
 
-/// A query hit paired with the volume it came from (the source of its mount
-/// prefix), the unit the server orders and pages.
-type VolHit = (Arc<VolumeState>, goz_core::query::QueryHit);
+/// Read guard over one volume's index, held for the span of one page.
+type IndexGuard<'a> = parking_lot::RwLockReadGuard<'a, VolumeIndex>;
 
-/// Orders the merged cross-volume hits by the sort spec (mirrors the engine's
-/// comparator, but on full paths since volumes differ by prefix).
-fn sort_collected(hits: &mut [VolHit], sort: SortSpec) {
-    use std::cmp::Reverse;
-    // Compute each element's folded key ONCE (O(n) folds) instead of re-folding
-    // inside every comparison (O(n log n)). Desc is applied via `Reverse` on the
-    // key so tie/stable order matches the old `sort_by(..).reverse()` exactly.
-    let desc = sort.dir == goz_core::types::SortDir::Desc;
-    match sort.key {
-        SortKey::Name => {
-            if desc {
-                hits.sort_by_cached_key(|(_, a)| Reverse(folded_name(&a.path)));
-            } else {
-                hits.sort_by_cached_key(|(_, a)| folded_name(&a.path));
-            }
-        }
-        SortKey::Path => {
-            if desc {
-                hits.sort_by_cached_key(|(va, a)| Reverse(full_folded(va, a)));
-            } else {
-                hits.sort_by_cached_key(|(va, a)| full_folded(va, a));
-            }
-        }
-        SortKey::Size => {
-            if desc {
-                hits.sort_by_key(|(_, a)| Reverse(a.size.unwrap_or(0)));
-            } else {
-                hits.sort_by_key(|(_, a)| a.size.unwrap_or(0));
-            }
-        }
-        SortKey::DateModified => {
-            if desc {
-                hits.sort_by_key(|(_, a)| Reverse(a.mtime.unwrap_or(i64::MIN)));
-            } else {
-                hits.sort_by_key(|(_, a)| a.mtime.unwrap_or(i64::MIN));
-            }
+/// Parent paths memoized across the pages of one query stay valid only while
+/// the index generation they were read under is current, and are capped so a
+/// result set spread over very many directories cannot regrow the memory this
+/// design exists to remove.
+const PATH_MEMO_CAP_BYTES: usize = 32 << 20;
+
+/// One volume's share of a query: its hits in sort order as 16-byte
+/// references, consumed from the front as pages are built.
+struct Run {
+    refs: Vec<HitRef>,
+    pos: usize,
+    /// Cross-volume path sort only: the current head's
+    /// `fold(prefix + parent path) + NUL + fold(name)`, built once per head
+    /// instead of once per comparison.
+    head_key: Option<Vec<u8>>,
+    /// Parent directory to its path (`None`: not presentable), read under
+    /// `memo_generation`.
+    memo: FxHashMap<EntryIdx, Option<Vec<u8>>>,
+    memo_generation: u64,
+    memo_bytes: usize,
+}
+
+impl Run {
+    fn new(refs: Vec<HitRef>) -> Self {
+        Self {
+            refs,
+            pos: 0,
+            head_key: None,
+            memo: FxHashMap::default(),
+            memo_generation: u64::MAX,
+            memo_bytes: 0,
         }
     }
-}
 
-fn full_folded(vol: &VolumeState, hit: &goz_core::query::QueryHit) -> Vec<u8> {
-    let mut v = Vec::new();
-    v.extend_from_slice(vol.mount_prefix().as_bytes());
-    v.extend_from_slice(&hit.path);
-    goz_core::fold::fold(&v)
-}
-
-/// Folded file name (the last `\`-separated component) of a hit path: the
-/// cross-volume key for a name sort. Matches `VolumeIndex::folded_name`, so a run
-/// the engine ordered by name is already ordered by this key.
-fn folded_name(path: &[u8]) -> Vec<u8> {
-    let ns = path
-        .iter()
-        .rposition(|&b| b == b'\\')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    goz_core::fold::fold(&path[ns..])
-}
-
-/// Globally orders the per-volume runs (each already sorted by `sort` inside
-/// [`run_query_deferrable`]) into one list.
-///
-/// A name sort needs no re-sort: the folded file name is volume-independent and
-/// each run is already in that order, so the runs are k-way merged in O(n),
-/// skipping the O(n log n) re-sort plus the full re-fold that dominated a broad
-/// query (~950 ms -> ~150 ms on a 2.8M-hit set). A single run, the common case
-/// of all matches on one volume, is already global and returned as-is. Other
-/// sort keys, whose cross-volume key differs from the per-volume one (path
-/// carries the mount prefix) or which are rare at scale, fall back to
-/// flatten-and-[`sort_collected`].
-fn order_merged(runs: Vec<Vec<VolHit>>, sort: SortSpec) -> Vec<VolHit> {
-    if runs.len() <= 1 {
-        return runs.into_iter().next().unwrap_or_default();
+    fn head(&self) -> Option<HitRef> {
+        self.refs.get(self.pos).copied()
     }
-    if sort.key != SortKey::Name {
-        let mut all: Vec<_> = runs.into_iter().flatten().collect();
-        sort_collected(&mut all, sort);
-        return all;
-    }
-    let keyed: Vec<Vec<(Vec<u8>, VolHit)>> = runs
-        .into_iter()
-        .map(|run| {
-            run.into_iter()
-                .map(|(v, h)| (folded_name(&h.path), (v, h)))
-                .collect()
-        })
-        .collect();
-    let desc = sort.dir == goz_core::types::SortDir::Desc;
-    debug_assert!(
-        keyed.iter().all(|r| r.windows(2).all(|w| {
-            let ord = w[0].0.cmp(&w[1].0);
-            if desc {
-                ord != std::cmp::Ordering::Less
-            } else {
-                ord != std::cmp::Ordering::Greater
-            }
-        })),
-        "engine run not ordered by the server name key; k-way merge would misorder"
-    );
-    kway_merge(keyed, desc)
-}
 
-/// Stable k-way merge of pre-sorted `(key, item)` runs. Each run must already be
-/// ordered ascending (or descending when `desc`); equal keys resolve to the
-/// earliest run, so the result matches a stable sort of the concatenation. `k`
-/// (the volume count) is tiny, so a linear min-scan over the run heads is used
-/// rather than a heap.
-fn kway_merge<T>(runs: Vec<Vec<(Vec<u8>, T)>>, desc: bool) -> Vec<T> {
-    use std::collections::VecDeque;
-    let total: usize = runs.iter().map(Vec::len).sum();
-    let mut dqs: Vec<VecDeque<(Vec<u8>, T)>> = runs.into_iter().map(VecDeque::from).collect();
-    let mut out = Vec::with_capacity(total);
-    for _ in 0..total {
-        let mut best: Option<usize> = None;
-        for ri in 0..dqs.len() {
-            let Some((k, _)) = dqs[ri].front() else {
-                continue;
+    fn take_head(&mut self) -> HitRef {
+        let h = self.refs[self.pos];
+        self.pos += 1;
+        self.head_key = None;
+        h
+    }
+
+    /// Builds the head's cross-volume path-sort key unless cached. The key is
+    /// the engine's per-volume order, `(parent path, name)`, with the mount
+    /// prefix in front so volumes mounted under one another compare right.
+    fn ensure_head_key(&mut self, index: &VolumeIndex, prefix: &str) {
+        if self.head_key.is_some() {
+            return;
+        }
+        let entry = index.entry(self.refs[self.pos].idx);
+        let mut parent = Vec::new();
+        index.path_of(entry.parent(), &mut parent);
+        let mut raw = Vec::with_capacity(prefix.len() + parent.len());
+        raw.extend_from_slice(prefix.as_bytes());
+        raw.extend_from_slice(&parent);
+        let mut key = fold(&raw);
+        key.push(0);
+        key.extend_from_slice(&fold(entry.name()));
+        self.head_key = Some(key);
+    }
+
+    /// Writes `prefix + parent path + '\' + name` into `path`, memoizing the
+    /// parent's path. `false` when the parent is not presentable (its chain
+    /// ends in lost+found or a cycle): the row is dropped, as the engine's page
+    /// builder drops it.
+    fn row_path(
+        &mut self,
+        index: &VolumeIndex,
+        parent: EntryIdx,
+        name: &[u8],
+        prefix: &str,
+        path: &mut Vec<u8>,
+    ) -> bool {
+        if self.memo_generation != index.generation() || self.memo_bytes > PATH_MEMO_CAP_BYTES {
+            self.memo.clear();
+            self.memo_generation = index.generation();
+            self.memo_bytes = 0;
+        }
+        let memo_bytes = &mut self.memo_bytes;
+        let parent_path = self.memo.entry(parent).or_insert_with(|| {
+            let mut buf = Vec::new();
+            let built = match index.path_of(parent, &mut buf) {
+                PathStatus::Ok => Some(buf),
+                _ => None,
             };
-            best = Some(match best {
-                None => ri,
-                Some(bi) => {
-                    let ord = k.cmp(&dqs[bi][0].0);
-                    let take = if desc {
-                        ord == std::cmp::Ordering::Greater
-                    } else {
-                        ord == std::cmp::Ordering::Less
-                    };
-                    if take { ri } else { bi }
-                }
-            });
+            *memo_bytes += built.as_ref().map_or(0, Vec::len);
+            built
+        });
+        let Some(parent_path) = parent_path.as_deref() else {
+            return false;
+        };
+        path.clear();
+        path.extend_from_slice(prefix.as_bytes());
+        if !parent_path.is_empty() {
+            path.extend_from_slice(parent_path);
+            path.push(b'\\');
         }
-        let bi = best.expect("total counts every remaining item");
-        out.push(dqs[bi].pop_front().expect("front present").1);
+        path.extend_from_slice(name);
+        true
     }
-    out
+}
+
+/// Picks the run whose head comes first under `sort`, stepping every run past
+/// heads whose entry no longer exists (they count as consumed, like any other
+/// merged row). `None` when every run is exhausted. Ties go to the earlier
+/// run, so a multi-volume page equals a stable merge of the per-volume runs.
+fn next_head(
+    runs: &mut [Run],
+    guards: &[IndexGuard<'_>],
+    vols: &[Arc<VolumeState>],
+    sort: SortSpec,
+    consumed: &mut usize,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for ri in 0..runs.len() {
+        while let Some(h) = runs[ri].head() {
+            if guards[ri].entry_if_frn(h.idx, h.frn).is_some() {
+                break;
+            }
+            runs[ri].take_head();
+            *consumed += 1;
+        }
+        if runs[ri].head().is_none() {
+            continue;
+        }
+        best = Some(match best {
+            None => ri,
+            Some(bi) if cmp_heads(runs, ri, bi, guards, vols, sort) == Ordering::Less => ri,
+            Some(bi) => bi,
+        });
+    }
+    best
+}
+
+/// Orders the heads of runs `a` and `b` under `sort`, mirroring the engine's
+/// per-volume comparator so the merged pages form one global order.
+fn cmp_heads(
+    runs: &mut [Run],
+    a: usize,
+    b: usize,
+    guards: &[IndexGuard<'_>],
+    vols: &[Arc<VolumeState>],
+    sort: SortSpec,
+) -> Ordering {
+    let (ia, ib) = (&*guards[a], &*guards[b]);
+    let (ha, hb) = (runs[a].refs[runs[a].pos], runs[b].refs[runs[b].pos]);
+    let by_name = || ia.folded_name(ha.idx).cmp(ib.folded_name(hb.idx));
+    let base = match sort.key {
+        SortKey::Name => by_name(),
+        SortKey::Size => ia
+            .entry(ha.idx)
+            .size()
+            .unwrap_or(0)
+            .cmp(&ib.entry(hb.idx).size().unwrap_or(0))
+            .then_with(by_name),
+        SortKey::DateModified => ia
+            .entry(ha.idx)
+            .mtime()
+            .unwrap_or(i64::MIN)
+            .cmp(&ib.entry(hb.idx).mtime().unwrap_or(i64::MIN))
+            .then_with(by_name),
+        SortKey::Path => {
+            runs[a].ensure_head_key(ia, vols[a].mount_prefix());
+            runs[b].ensure_head_key(ib, vols[b].mount_prefix());
+            runs[a]
+                .head_key
+                .as_deref()
+                .cmp(&runs[b].head_key.as_deref())
+        }
+    };
+    if sort.dir == SortDir::Desc {
+        base.reverse()
+    } else {
+        base
+    }
 }
 
 /// Case-insensitive ASCII prefix test (drive letters and `\` are ASCII).
@@ -687,13 +724,13 @@ fn starts_with_ci(haystack: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        VolScope, build_status, encode_query_binary, handle_request, kway_merge,
-        resolve_scope_cached, scope_entry_valid, starts_with_ci, targets,
+        VolScope, build_status, encode_query_binary, handle_request, resolve_scope_cached,
+        scope_entry_valid, starts_with_ci, targets,
     };
     use crate::volume_state::{VolumeSet, VolumeState};
     use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
     use goz_core::proto::{PAGE_ROWS, PROTO_VERSION, ProtoError, Request, Response};
-    use goz_core::query::{parse_query, resolve_scope, run_query};
+    use goz_core::query::resolve_scope;
     use goz_core::types::{Frn, SortKey, SortSpec, VolumePhase};
     use goz_core::usn::record::{
         FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE,
@@ -1081,40 +1118,6 @@ mod tests {
         assert_eq!(pages[0].items.len(), 1);
     }
 
-    /// `folded_name` here and `VolumeIndex::folded_name` in goz-core are two
-    /// implementations of the same key, in two crates, with nothing linking
-    /// them. [`order_merged`] k-way merges runs the ENGINE sorted, keyed by what
-    /// the SERVER computes, so any drift silently misorders a multi-volume name
-    /// sort. The only guard is a `debug_assert!` that needs a multi-volume,
-    /// multi-hit name sort to fire at all, so drift reaches release unseen.
-    #[test]
-    fn server_folded_name_agrees_with_the_index_key() {
-        let index = merge_index();
-        let parsed = parse_query("log").expect("query parses");
-        let outcome = run_query(
-            &index,
-            &parsed,
-            None,
-            SortSpec::default_for(SortKey::Name),
-            0,
-            None,
-        );
-        assert_eq!(
-            outcome.hits.len(),
-            2,
-            "fixture must produce hits to compare"
-        );
-
-        for hit in &outcome.hits {
-            assert_eq!(
-                super::folded_name(&hit.path),
-                index.folded_name(hit.idx),
-                "server key for {:?} diverged from the index key the engine sorted by",
-                String::from_utf8_lossy(&hit.path)
-            );
-        }
-    }
-
     /// The payoff the key agreement buys: two pre-sorted runs merged into one
     /// global name order without a re-sort. The fixture's name order is the
     /// reverse of its path order, so a merge keyed on the wrong thing cannot
@@ -1137,6 +1140,41 @@ mod tests {
             ["a.log", "a.log", "z.log", "z.log"],
             "merged pages must be globally ordered by name, not by path or by volume"
         );
+    }
+
+    /// A volume mounted under another volume's folder interleaves with it in a
+    /// path sort: `C:\m\z.log` belongs between `C:\z.log` and
+    /// `C:\z.log`. Each run is ordered within its volume; only the merge
+    /// knows the prefixes, so it must compare the heads' full `(parent path,
+    /// name)` keys rather than concatenate the runs.
+    #[test]
+    fn path_sort_merges_a_volume_mounted_inside_another() {
+        use goz_core::types::SortDir;
+        let vols = set(&[
+            volume(r"C:\", merge_index(), VolumePhase::Live),
+            volume(r"C:\m\", merge_index(), VolumePhase::Live),
+        ]);
+        let ordered = |dir| {
+            let mut q = query("log");
+            q.sort = SortSpec {
+                key: SortKey::Path,
+                dir,
+            };
+            paths(&encode_query_binary(&vols, q))
+        };
+        let asc = ordered(SortDir::Asc);
+        assert_eq!(
+            asc,
+            [
+                r"C:\a\z.log",
+                r"C:\m\a\z.log",
+                r"C:\m\z\a.log",
+                r"C:\z\a.log"
+            ]
+        );
+        let mut desc = ordered(SortDir::Desc);
+        desc.reverse();
+        assert_eq!(desc, asc, "descending is the exact reverse");
     }
 
     /// Every emitted path, in wire order, across all pages.
@@ -1250,42 +1288,5 @@ mod tests {
         // Shorter than the prefix: must not panic or match.
         assert!(!starts_with_ci("C:", r"C:\"));
         assert!(!starts_with_ci(r"D:\x", r"C:\"));
-    }
-
-    fn run(items: &[(&str, char)]) -> Vec<(Vec<u8>, char)> {
-        items
-            .iter()
-            .map(|(k, v)| (k.as_bytes().to_vec(), *v))
-            .collect()
-    }
-
-    #[test]
-    fn merge_ascending_is_stable_across_and_within_runs() {
-        // Two pre-sorted runs. On the tied key "c", the earlier run's items come
-        // first and keep their in-run order, matching a stable sort of run0 ++ run1.
-        let a = run(&[("a", '1'), ("c", '2'), ("c", '3')]);
-        let b = run(&[("b", '4'), ("c", '5')]);
-        assert_eq!(kway_merge(vec![a, b], false), vec!['1', '4', '2', '3', '5']);
-    }
-
-    #[test]
-    fn merge_descending_picks_largest_head() {
-        let a = run(&[("c", '1'), ("a", '2')]); // each run already in desc order
-        let b = run(&[("b", '3')]);
-        assert_eq!(kway_merge(vec![a, b], true), vec!['1', '3', '2']);
-    }
-
-    #[test]
-    fn merge_handles_empty_and_single() {
-        assert_eq!(kway_merge::<char>(vec![], false), Vec::<char>::new());
-        assert_eq!(
-            kway_merge(vec![run(&[("x", '1'), ("y", '2')])], false),
-            vec!['1', '2']
-        );
-        // An empty run interleaved with a non-empty one is skipped cleanly.
-        assert_eq!(
-            kway_merge(vec![run(&[]), run(&[("a", '1')]), run(&[])], false),
-            vec!['1']
-        );
     }
 }

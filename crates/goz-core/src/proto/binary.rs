@@ -81,6 +81,21 @@ pub fn push_results_header(
     out.extend_from_slice(&count.to_le_bytes());
 }
 
+/// Rewrites `more` and `count` in a results header that
+/// [`push_results_header`] wrote at the start of `page`. The daemon knows both
+/// only after it has resolved a page's rows (a row whose entry vanished since
+/// the scan is dropped), so it pushes the header first and fixes it up here.
+pub fn patch_results_header(page: &mut [u8], more: bool, count: u32) {
+    const FLAGS_AT: usize = 1 + 8 + 8; // tag, total, generation
+    const COUNT_AT: usize = FLAGS_AT + 1;
+    if more {
+        page[FLAGS_AT] |= FLAG_MORE;
+    } else {
+        page[FLAGS_AT] &= !FLAG_MORE;
+    }
+    page[COUNT_AT..COUNT_AT + 4].copy_from_slice(&count.to_le_bytes());
+}
+
 /// Appends one item: raw WTF-8 path bytes (mount prefix already prepended) plus
 /// its metadata. No allocation; the daemon calls this straight from a reused
 /// scratch holding `prefix + hit.path`.
@@ -223,6 +238,24 @@ pub fn decode_results_payload(body: &[u8]) -> Result<QueryResults, BinError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn patch_results_header_rewrites_more_and_count_only() {
+        let mut page = Vec::new();
+        super::push_results_header(&mut page, 7, 3, false, true, false, 0);
+        super::patch_results_header(&mut page, true, 42);
+        let flags_at = 1 + 8 + 8;
+        assert_eq!(page[flags_at] & super::FLAG_MORE, super::FLAG_MORE);
+        assert_eq!(
+            page[flags_at] & super::FLAG_VOLUMES_INCOMPLETE,
+            super::FLAG_VOLUMES_INCOMPLETE,
+            "other flags survive the patch"
+        );
+        let count = u32::from_le_bytes(page[flags_at + 1..flags_at + 5].try_into().unwrap());
+        assert_eq!(count, 42);
+        super::patch_results_header(&mut page, false, 1);
+        assert_eq!(page[flags_at] & super::FLAG_MORE, 0);
+    }
+
     use super::*;
 
     fn round_trip(page: &QueryResults) {

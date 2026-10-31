@@ -439,6 +439,7 @@ dependencies = [
  "libmimalloc-sys",
  "mimalloc",
  "parking_lot",
+ "rustc-hash",
  "tokio",
  "tracing",
  "tracing-subscriber",

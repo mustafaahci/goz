@@ -844,3 +844,31 @@ fn model_names_are_path_unique() {
         assert!(seen.insert(p), "paths must be unique");
     }
 }
+
+/// The daemon resolves a page's rows by `(idx, frn)` after the scan: a slot
+/// that was tombstoned, or reused by another file, must not answer, and an
+/// index that no longer has the slot at all must not panic.
+#[test]
+fn entry_if_frn_rejects_dead_and_reused_slots() {
+    let mut idx = index_from_enum(&[create(frn(100), root_frn(), "a.txt", false)]);
+    let a = idx.head_of(frn(100)).unwrap();
+    assert!(idx.entry_if_frn(a, frn(100)).is_some());
+
+    idx.apply_batch(&[delete(frn(100))]);
+    assert!(
+        idx.entry_if_frn(a, frn(100)).is_none(),
+        "a tombstoned entry is gone"
+    );
+
+    idx.apply_batch(&[create(frn(101), root_frn(), "b.txt", false)]);
+    let b = idx.head_of(frn(101)).unwrap();
+    assert!(idx.entry_if_frn(b, frn(101)).is_some());
+    assert!(
+        idx.entry_if_frn(a, frn(100)).is_none(),
+        "the old (idx, frn) must not resolve, whether or not the slot was reused"
+    );
+    assert!(
+        idx.entry_if_frn(u32::MAX - 1, frn(101)).is_none(),
+        "out of range is None, not a panic"
+    );
+}

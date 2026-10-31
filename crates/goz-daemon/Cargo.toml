@@ -21,6 +21,7 @@ clap.workspace = true
 [target.'cfg(windows)'.dependencies]
 tokio.workspace = true
 parking_lot.workspace = true
+rustc-hash.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 windows-service.workspace = true

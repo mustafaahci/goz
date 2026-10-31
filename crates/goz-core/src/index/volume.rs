@@ -545,6 +545,19 @@ impl VolumeIndex {
         (self.entries.frn(head) == frn).then_some(head)
     }
 
+    /// The entry at `idx` if it is still alive and still the one with FRN
+    /// `frn`. The daemon resolves a query's hits this way when it encodes a
+    /// page: between the scan and the page a journal apply may have reused
+    /// the slot, or a rescan may have swapped the whole index, so a bare
+    /// `idx` can name another file or nothing. `None` means the row is gone
+    /// and is dropped. Never panics, whatever `idx` is.
+    pub fn entry_if_frn(&self, idx: EntryIdx, frn: Frn) -> Option<EntryView<'_>> {
+        if (idx as usize) >= self.entries.capacity() || self.entries.is_tombstone(idx) {
+            return None;
+        }
+        (self.entries.frn(idx) == frn).then(|| self.entry(idx))
+    }
+
     /// Looks up a child directory by its folded name via the persistent scope
     /// index: O(1), no scan. Case-insensitive by construction (the key hashes
     /// the folded name); the query engine's `resolve_scope` walks it component

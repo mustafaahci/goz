@@ -11,7 +11,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
-use goz_core::query::{parse_query, run_query, run_query_unsorted};
+use goz_core::query::{parse_query, run_query, run_query_refs};
 use goz_core::types::{Frn, SortSpec};
 use goz_core::usn::record::{FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE};
 use std::hint::black_box;
@@ -172,10 +172,17 @@ fn bench_query(c: &mut Criterion) {
                 black_box(out.hits.len())
             })
         });
-        broad.bench_function("common(document) LOCKED: sort outside (new)", |b| {
+        broad.bench_function("common(document) LOCKED: refs, no paths (new)", |b| {
             b.iter(|| {
-                let out = run_query_unsorted(black_box(&idx), black_box(&parsed), None);
-                black_box(out.hits.len())
+                let out = run_query_refs(
+                    black_box(&idx),
+                    black_box(&parsed),
+                    None,
+                    SortSpec::default(),
+                    0,
+                    None,
+                );
+                black_box(out.refs.len())
             })
         });
     }
