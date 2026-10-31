@@ -94,10 +94,10 @@ Memory, same box, each index warm at ~3.97M entries:
 | Committed memory (private bytes)                | 527 MB     | **525 MB** |
 | Resident RAM, idle after indexing               | 369 MB     | **12 MB**  |
 | Resident RAM, steady after heavy querying       | 554 MB     | **215 MB** |
-| Resident RAM, peak (2.88M-match sorted export)  | 1.2 GB     | 1.2 GB     |
-| Committed memory, peak (same query)             | **1.2 GB** | 1.5 GB     |
+| Resident RAM, peak (full sorted export)         | 1.2 GB     | **0.56 GB** |
+| Committed memory, peak (same query)             | 1.2 GB     | **0.71 GB** |
 
-goz wins the resident-RAM rows that matter for a background daemon and edges out committed memory at rest. It loses two: a larger (statically linked) binary, and ~0.3 GB more peak committed memory during a full sorted export. Hardware and methodology are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+goz wins every memory row but one, the larger (statically linked) binary. The two peak rows were re-measured for v0.3.0, which keeps a query's matches as 16-byte references and builds paths per page: the same export used to peak at 1.5 GB committed. Hardware and methodology are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## How it works
 

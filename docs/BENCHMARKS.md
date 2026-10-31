@@ -31,9 +31,11 @@ Same box, each index warm at ~3.97M entries.
 | Committed memory (private bytes)                | 527 MB     | **525 MB** |
 | Resident RAM, idle after indexing               | 369 MB     | **12 MB**  |
 | Resident RAM, steady after heavy querying       | 554 MB     | **215 MB** |
-| Resident RAM, peak (2.88M-match sorted export)  | 1.2 GB     | 1.2 GB     |
-| Committed memory, peak (same query)             | **1.2 GB** | 1.5 GB     |
+| Resident RAM, peak (full sorted export)         | 1.2 GB     | **0.56 GB** |
+| Committed memory, peak (same query)             | 1.2 GB     | **0.71 GB** |
 
-goz wins the two resident-RAM rows that matter for a background daemon and edges out committed memory at rest. It loses two: a larger binary (a statically linked Rust build vs Everything's shared runtime), and ~0.3 GB more peak committed memory during a full sorted export, where sorting 2.88M matches materializes sort keys that Everything does not.
+goz wins every memory row but one: the larger binary (a statically linked Rust build vs Everything's shared runtime).
+
+The two peak rows for goz were re-measured on 2026-10-31 with v0.3.0 on a larger index (4.2M entries, 3.16M matches for `e`, sorted by name) by sampling the daemon's private bytes and working set every 15 ms during the export from an idle daemon; Everything's values are from the original run (2.88M matches). Before v0.3.0 the same export held every match's full path and a sort key per row and peaked at 1.5 GB committed; it now holds 16-byte references and builds each page's paths from the index, and no longer raises the process peak that the initial MFT read sets (about 1.0 GB committed on this index).
 
 Why the resident footprint is small: filenames are interned (only ~31% are unique in the real world), entries carry a 4-byte name id, and paths are rebuilt from parent pointers. About 12 of the ~57 bytes per entry are the child chains that make folder-scoped queries cost the folder instead of the disk; this was a deliberate trade (~45 MB of committed memory for the folder-scoped speedup). After indexing, the daemon trims its working set once; set `GOZ_PIN_WORKING_SET=1` to pin the index resident instead. Verify any of this with `goz --status`, which prints the daemon's memory and a per-component breakdown of every index.
