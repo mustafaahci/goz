@@ -180,7 +180,7 @@ pub fn run_query(
 ///
 /// Any ordering happens here, under the caller's index read lock, with
 /// comparators that read the index and allocate nothing; a name-sorted query
-/// over names alone does not order at all (see [`page_refs`]). The daemon
+/// over names alone does not order at all (see `page_refs`). The daemon
 /// builds each page's paths from the live index when it encodes them.
 pub fn run_query_refs(
     index: &VolumeIndex,
