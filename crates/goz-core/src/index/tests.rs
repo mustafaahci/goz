@@ -7,7 +7,7 @@ use crate::index::store::FrnMap;
 use crate::types::Frn;
 use crate::usn::record::{
     FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
-    USN_REASON_RENAME_NEW_NAME,
+    USN_REASON_HARD_LINK_CHANGE, USN_REASON_RENAME_NEW_NAME,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -468,6 +468,121 @@ fn reconcile_links_adds_and_removes_individual_links() {
             "dirB".to_string(),
             "dirA\\only".to_string(),
         ])
+    );
+}
+
+/// Every link of `f`, sorted by name, with the size and date it carries.
+fn link_stats(idx: &VolumeIndex, f: Frn) -> Vec<(String, Option<u64>, Option<i64>)> {
+    let mut out = Vec::new();
+    let mut cur = idx.head_of(f).unwrap();
+    while cur != crate::types::NIL {
+        let e = idx.entry(cur);
+        out.push((
+            String::from_utf8_lossy(e.name()).into_owned(),
+            e.size(),
+            e.mtime(),
+        ));
+        cur = e.next_link();
+    }
+    out.sort();
+    out
+}
+
+fn link(parent: crate::types::EntryIdx, name: &str) -> LinkTarget {
+    LinkTarget {
+        parent,
+        name: WtfName::new(name.as_bytes().to_vec(), false),
+    }
+}
+
+/// The tail stats a file before it reconciles the file's names, so the stat
+/// lands on the old chain and nothing stats the link reconciliation adds. The
+/// new link must take the size and date its file already carries.
+#[test]
+fn a_new_hard_link_gets_the_size_and_date_of_its_file() {
+    let mut idx = index_from_enum(&[
+        create(frn(10), root_frn(), "dirA", true),
+        create(frn(11), root_frn(), "dirB", true),
+        create(frn(100), frn(10), "orig.txt", false),
+    ]);
+    idx.set_stat(frn(100), 17, 1234);
+    let a = idx.head_of(frn(10)).unwrap();
+    let b = idx.head_of(frn(11)).unwrap();
+
+    // `fsutil hardlink create dirB\link.txt dirA\orig.txt`, applied the way
+    // the tail does: the batch, then the stat, then the reconcile.
+    let outcome = idx.apply_batch(&[record(
+        frn(100),
+        frn(11),
+        "link.txt",
+        false,
+        USN_REASON_HARD_LINK_CHANGE,
+    )]);
+    assert_eq!(outcome.needs_link_reconcile, [frn(100)]);
+    idx.set_stat(frn(100), 17, 1234);
+    idx.reconcile_links(frn(100), &[link(a, "orig.txt"), link(b, "link.txt")]);
+
+    assert_eq!(
+        link_stats(&idx, frn(100)),
+        [
+            ("link.txt".to_string(), Some(17), Some(1234)),
+            ("orig.txt".to_string(), Some(17), Some(1234)),
+        ]
+    );
+}
+
+/// Renaming one name of a hard-linked file goes through reconciliation, which
+/// drops the old entry and allocates one for the new name.
+#[test]
+fn a_renamed_hard_link_keeps_the_size_and_date_of_its_file() {
+    let mut idx = index_from_enum(&[
+        create(frn(10), root_frn(), "dirA", true),
+        create(frn(11), root_frn(), "dirB", true),
+        create(frn(100), frn(10), "orig.txt", false),
+    ]);
+    let a = idx.head_of(frn(10)).unwrap();
+    let b = idx.head_of(frn(11)).unwrap();
+    idx.reconcile_links(frn(100), &[link(a, "orig.txt"), link(b, "link.txt")]);
+    idx.set_stat(frn(100), 17, 1234);
+
+    let outcome = idx.apply_batch(&[rename(frn(100), frn(10), "renamed.txt", false)]);
+    assert_eq!(outcome.needs_link_reconcile, [frn(100)]);
+    assert!(
+        outcome.needs_stat.is_empty(),
+        "a rename carries no stat reason"
+    );
+    // Listed new name first, so the new entry also becomes the chain's head.
+    idx.reconcile_links(frn(100), &[link(a, "renamed.txt"), link(b, "link.txt")]);
+
+    assert_eq!(
+        link_stats(&idx, frn(100)),
+        [
+            ("link.txt".to_string(), Some(17), Some(1234)),
+            ("renamed.txt".to_string(), Some(17), Some(1234)),
+        ]
+    );
+    let head = idx.head_of(frn(100)).unwrap();
+    assert_eq!(idx.entry(head).size(), Some(17));
+}
+
+/// A file never statted stays unknown: reconciliation copies what the chain
+/// knows and never invents a size or date.
+#[test]
+fn a_new_hard_link_of_an_unstatted_file_stays_unknown() {
+    let mut idx = index_from_enum(&[
+        create(frn(10), root_frn(), "dirA", true),
+        create(frn(11), root_frn(), "dirB", true),
+        create(frn(100), frn(10), "orig.txt", false),
+    ]);
+    let a = idx.head_of(frn(10)).unwrap();
+    let b = idx.head_of(frn(11)).unwrap();
+    idx.reconcile_links(frn(100), &[link(a, "orig.txt"), link(b, "link.txt")]);
+    assert_eq!(
+        link_stats(&idx, frn(100)),
+        [
+            ("link.txt".to_string(), None, None),
+            ("orig.txt".to_string(), None, None),
+        ]
     );
 }
 

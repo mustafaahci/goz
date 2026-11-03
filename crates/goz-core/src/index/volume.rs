@@ -1030,6 +1030,13 @@ impl VolumeIndex {
             }
         }
 
+        // Every link names the same file record, so a new link starts with the
+        // size and date its chain already carries. Nothing stats a link added
+        // here: the tail stats the file before it reconciles the names.
+        let (size, mtime) = current.first().map_or((SIZE_UNKNOWN, MTIME_UNKNOWN), |&e| {
+            (self.entries.size(e), self.entries.mtime(e))
+        });
+
         // Match each desired link to an existing entry, else allocate.
         let mut kept: SmallVec<[EntryIdx; 4]> = SmallVec::new();
         let mut used: SmallVec<[bool; 4]> = SmallVec::from_elem(false, current.len());
@@ -1047,15 +1054,9 @@ impl VolumeIndex {
                 let flags = EntryFlags::EMPTY
                     .with(EntryFlags::DIR, is_dir)
                     .with(EntryFlags::NON_UNICODE_NAME, target.name.lossy);
-                let idx = self.entries.alloc(
-                    frn,
-                    target.parent,
-                    id,
-                    flags,
-                    SIZE_UNKNOWN,
-                    MTIME_UNKNOWN,
-                    NIL,
-                );
+                let idx = self
+                    .entries
+                    .alloc(frn, target.parent, id, flags, size, mtime, NIL);
                 self.link_same_name(idx, id);
                 self.link_child(idx);
                 self.dir_index_insert(idx);
