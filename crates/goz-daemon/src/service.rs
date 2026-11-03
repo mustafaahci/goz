@@ -285,19 +285,18 @@ fn run_service() -> Result<()> {
 
     // Build the index on a dedicated thread, then serve until stopped. The SCM
     // thread stays free to pump checkpoints and receive Stop.
-    let engine_thread = std::thread::spawn(move || {
+    let engine_thread = std::thread::spawn(move || -> Result<()> {
         let engine = match run::build_engine() {
             Ok(engine) => engine,
             Err(e) => {
                 let _ = ready_tx.send(Err(e.to_string()));
-                return;
+                return Err(e);
             }
         };
         let _ = ready_tx.send(Ok(engine.total_entries));
-        if let Err(e) = server::run(engine.volumes, stop_rx) {
-            tracing::error!(error = %e, "pipe server error");
-        }
+        let served = server::run(engine.volumes, stop_rx);
         engine.supervisor.shutdown();
+        served
     });
 
     // Heartbeat StartPending until the engine reports ready (or fails).
@@ -340,13 +339,32 @@ fn run_service() -> Result<()> {
         }
     }
 
-    // Block until the engine thread returns; it does so once the server stops
-    // after the Stop control flips `stop_tx`.
-    let _ = engine_thread.join();
-
-    tracing::info!("goz service stopped");
-    status_handle.set_service_status(stopped_report(ServiceExitCode::Win32(0)))?;
+    // Block until the engine thread returns: after the Stop control flips
+    // `stop_tx`, or when the pipe server fails or the thread panics.
+    let exit_code = service_exit_code(engine_thread.join());
+    tracing::info!(?exit_code, "goz service stopped");
+    status_handle.set_service_status(stopped_report(exit_code))?;
     Ok(())
+}
+
+/// The exit code the service stops with once the engine thread has ended.
+///
+/// Only a requested stop is 0. The SCM's failure actions (see
+/// [`set_failure_actions`]) restart the service only on a non-zero exit, so a
+/// failed pipe server or a panic must not report 0, or every client finds no
+/// daemon until the next boot.
+fn service_exit_code(engine: std::thread::Result<Result<()>>) -> ServiceExitCode {
+    match engine {
+        Ok(Ok(())) => ServiceExitCode::NO_ERROR,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "pipe server failed");
+            ServiceExitCode::ServiceSpecific(1)
+        }
+        Err(_) => {
+            tracing::error!("engine thread panicked");
+            ServiceExitCode::ServiceSpecific(1)
+        }
+    }
 }
 
 fn status_report(
@@ -413,5 +431,22 @@ impl std::io::Write for FileWriter {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::Write::flush(&mut &*self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_exit_code;
+    use windows_service::service::ServiceExitCode;
+
+    /// A requested stop exits 0; a failed pipe server or a panicked engine
+    /// thread exits non-zero, which is what makes the SCM restart the service.
+    #[test]
+    fn only_a_requested_stop_exits_zero() {
+        assert_eq!(service_exit_code(Ok(Ok(()))), ServiceExitCode::NO_ERROR);
+        let failed = service_exit_code(Ok(Err(anyhow::anyhow!("pipe connect"))));
+        assert_ne!(failed, ServiceExitCode::NO_ERROR);
+        let panicked = std::thread::spawn(|| -> anyhow::Result<()> { panic!("engine") }).join();
+        assert_ne!(service_exit_code(panicked), ServiceExitCode::NO_ERROR);
     }
 }

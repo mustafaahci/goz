@@ -7,7 +7,7 @@
 //! (bootstrap + tail) stays on dedicated OS threads; tokio only serves the pipe.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use goz_core::fold::fold;
@@ -42,6 +42,23 @@ const QUERY_PAGE_BACKLOG: usize = 4;
 /// connected-but-silent client cannot block a task forever. The one-shot CLI
 /// client always writes immediately after connecting, well within this window.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pause after a failed pipe connect before listening again. A connect fails
+/// only on an unexpected `ConnectNamedPipe` error (a client that closed before
+/// the server saw it counts as connected), and such an error tends to repeat,
+/// so this holds the accept loop to about 100 turns a second instead of a busy
+/// loop. A client that connects during the pause waits for it, not longer: the
+/// next instance already exists.
+const CONNECT_RETRY_PAUSE: Duration = Duration::from_millis(10);
+/// At most one log line per this period for failed connects. It counts the
+/// failures since the last line, so the service log cannot grow with them.
+const CONNECT_WARN_EVERY: Duration = Duration::from_secs(60);
+/// How often to try the pipe name again while another process holds it.
+const CLAIM_RETRY_EVERY: Duration = Duration::from_secs(2);
+/// `CreateNamedPipe` errors that mean another process already holds the name:
+/// `FIRST_PIPE_INSTANCE` is refused with access denied, and a holder that
+/// allowed one instance reports every instance busy.
+const ERROR_ACCESS_DENIED: i32 = 5;
+const ERROR_PIPE_BUSY: i32 = 231;
 
 /// Runs the pipe server until stopped. Blocks on a tokio runtime.
 ///
@@ -63,13 +80,35 @@ async fn accept_loop(
     security: PipeSecurity,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut server = create_instance(&security, true)?;
+    let Some(mut server) = claim_first_instance(&security, &mut shutdown).await? else {
+        return Ok(());
+    };
     let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut connect_failures = 0u64;
+    let mut last_connect_warning: Option<Instant> = None;
     tracing::info!(pipe = PIPE_NAME, "query server listening");
     loop {
         tokio::select! {
             r = server.connect() => {
-                r.context("pipe connect")?;
+                if let Err(e) = r {
+                    // A failed connect ends only that connection. Returning
+                    // here stopped the server for every user until the next
+                    // boot. The new instance is created before the old one
+                    // drops, so the pipe always has a listener.
+                    connect_failures += 1;
+                    if last_connect_warning.is_none_or(|t| t.elapsed() >= CONNECT_WARN_EVERY) {
+                        tracing::warn!(
+                            error = %e,
+                            failures = connect_failures,
+                            "pipe connect failed; still listening"
+                        );
+                        connect_failures = 0;
+                        last_connect_warning = Some(Instant::now());
+                    }
+                    server = create_instance(&security, false)?;
+                    tokio::time::sleep(CONNECT_RETRY_PAUSE).await;
+                    continue;
+                }
                 let connected = server;
                 // Create the next instance before handling, so there is never
                 // a window with no listener for a client to race into.
@@ -118,6 +157,59 @@ fn create_instance(security: &PipeSecurity, first: bool) -> Result<NamedPipeServ
         unsafe { opts.create_with_security_attributes_raw(PIPE_NAME, security.attributes_ptr()) }
             .with_context(|| format!("creating pipe instance {PIPE_NAME}"))?;
     Ok(server)
+}
+
+/// Creates the first pipe instance, waiting while another process holds the
+/// name.
+///
+/// Any local user can create [`PIPE_NAME`] while gozd builds its indexes (see
+/// `goz_winfs::pipe_trust`), and the first instance is then refused. Failing
+/// here would make the SCM restart the service and read every MFT again about
+/// once a minute for as long as the name is held, so the built index waits
+/// instead and the server starts once the name is free. Any other error is
+/// returned. `None` when a stop arrives first.
+async fn claim_first_instance(
+    security: &PipeSecurity,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Option<NamedPipeServer>> {
+    let mut waiting = false;
+    loop {
+        match create_instance(security, true) {
+            Ok(server) => {
+                if waiting {
+                    tracing::info!(pipe = PIPE_NAME, "pipe name is free again");
+                }
+                return Ok(Some(server));
+            }
+            Err(e) if name_taken(&e) => {
+                if !waiting {
+                    tracing::warn!(
+                        pipe = PIPE_NAME,
+                        error = %e,
+                        "another process holds the pipe name; waiting for it"
+                    );
+                    waiting = true;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(CLAIM_RETRY_EVERY) => {}
+            _ = tokio::signal::ctrl_c() => return Ok(None),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Whether creating an instance failed because another process holds the name.
+fn name_taken(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| code == ERROR_ACCESS_DENIED || code == ERROR_PIPE_BUSY)
 }
 
 async fn handle_connection(mut server: NamedPipeServer, volumes: VolumeSet) -> Result<()> {
@@ -1031,6 +1123,25 @@ mod tests {
         assert_eq!(pages[1].items.len(), 1);
         assert_eq!(pages[0].total, n, "total is the whole match count");
         assert_eq!(pages[1].total, n, "total must not drift across pages");
+    }
+
+    /// A taken pipe name must read as taken through the context `create_instance`
+    /// adds, or `claim_first_instance` returns the error and the SCM rebuilds
+    /// every index once a minute for as long as a squatter holds the name.
+    #[test]
+    fn a_held_pipe_name_is_recognized_through_its_context() {
+        use anyhow::Context;
+        let held = |code| {
+            Err::<(), _>(std::io::Error::from_raw_os_error(code))
+                .with_context(|| "creating pipe instance")
+                .unwrap_err()
+        };
+        assert!(super::name_taken(&held(super::ERROR_ACCESS_DENIED)));
+        assert!(super::name_taken(&held(super::ERROR_PIPE_BUSY)));
+        assert!(
+            !super::name_taken(&held(2)),
+            "file not found is a real failure"
+        );
     }
 
     /// When the page consumer reports it is gone (`emit` returns false, i.e.
