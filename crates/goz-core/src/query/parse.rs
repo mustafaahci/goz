@@ -7,8 +7,9 @@
 //! the functions `ext:`, `size:`, `path:`, `file:`, `folder:`, `case:`, whose
 //! value may be quoted. The boolean operators `|` and `!` are rejected loudly
 //! rather than silently mis-executed: es's own precedence for them is
-//! undocumented, so guessing it would be a compatibility trap. Unknown `func:`
-//! prefixes are treated as literal text, matching es.
+//! undocumented, so guessing it would be a compatibility trap. An unknown
+//! `func:` prefix is refused too: as text it could match nothing, since no name
+//! contains `:`.
 //!
 //! Terms are folded at parse time when the query is case-insensitive, so the
 //! engine compares candidate data (folded iff `!match_case`) against
@@ -237,6 +238,12 @@ pub enum QueryError {
     /// More terms than a query may hold; carries the query's count.
     #[error("the query has {0} terms; a query may have at most {max}", max = MAX_QUERY_TERMS)]
     TooManyTerms(usize),
+    /// A `func:` goz does not know, carried with its colon. Searching it as text
+    /// would match nothing, since no name contains `:`.
+    #[error(
+        "unknown search function '{0}'; goz supports ext:, size:, path:, file:, folder:, dir: and case:"
+    )]
+    UnknownFunction(String),
 }
 
 /// The most terms one query may hold. The engine tests each candidate against
@@ -338,9 +345,20 @@ pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuer
                     push_text_term(&mut q, value, tok.quoted, false, &fold_term);
                     continue;
                 }
-                _ => {
-                    // Unknown function → literal text (es behavior).
+                // Not one of the directives `case_directive` consumed.
+                "case" => {
+                    return Err(QueryError::Malformed {
+                        what: "case:",
+                        detail: format!("expected case:, case:0 or case:1, got case:{value}"),
+                    });
                 }
+                // A drive letter, as in `C:\Windows`: a path, not a function.
+                f if f.len() == 1 => {}
+                f if f.len() > 1 && f.bytes().all(|b| b.is_ascii_alphabetic()) => {
+                    return Err(QueryError::UnknownFunction(text[..=colon].to_string()));
+                }
+                // Not a function name (`12:30`): plain text.
+                _ => {}
             }
         }
 
@@ -731,11 +749,27 @@ mod tests {
         assert_eq!(q("\"a|b\"").name_terms, vec![b"a|b".to_vec()]);
     }
 
+    /// Searched as text, an unknown function could only match nothing, since no
+    /// name contains `:`; it is refused so the user learns why. A drive letter
+    /// and text that is no function name are not functions.
     #[test]
-    fn unknown_function_is_literal_text() {
-        // `parent:` is not supported in v1 → treated as literal name text.
-        let p = q("parent:foo");
-        assert_eq!(p.name_terms, vec![b"parent:foo".to_vec()]);
+    fn unknown_functions_are_refused_but_drives_are_paths() {
+        assert_eq!(
+            parse_query("dm:today"),
+            Err(QueryError::UnknownFunction("dm:".to_string()))
+        );
+        assert_eq!(
+            parse_query("report Parent:foo"),
+            Err(QueryError::UnknownFunction("Parent:".to_string()))
+        );
+        assert_eq!(q(r"C:\Windows").path_terms, vec![br"c:\windows".to_vec()]);
+        assert_eq!(q("12:30").name_terms, vec![b"12:30".to_vec()]);
+        assert_eq!(q(r":\docs").path_terms, vec![br":\docs".to_vec()]);
+        assert_eq!(q(r#""a:b""#).name_terms, vec![b"a:b".to_vec()]);
+        assert!(matches!(
+            parse_query("case:2"),
+            Err(QueryError::Malformed { what: "case:", .. })
+        ));
     }
 
     /// The `-case` switch is the parser's default, and a `case:` directive in
