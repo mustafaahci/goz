@@ -17,8 +17,8 @@ use goz_core::proto::{
     VolumeStatus,
 };
 use goz_core::proto::{
-    MAX_CLIENT_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame, patch_results_header,
-    push_item, push_results_header,
+    MAX_CLIENT_FRAME, MAX_SERVER_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame,
+    patch_results_header, push_item, push_results_header,
 };
 use goz_core::query::{HitRef, parse_query, resolve_scope, run_query_refs};
 use goz_core::types::{EntryIdx, SortDir, SortKey, SortSpec};
@@ -42,6 +42,14 @@ const QUERY_PAGE_BACKLOG: usize = 4;
 /// connected-but-silent client cannot block a task forever. The one-shot CLI
 /// client always writes immediately after connecting, well within this window.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A client that leaves a reply page untaken this long is dropped, so one that
+/// stops reading cannot hold its result set and connection slot forever. A
+/// write returns once the pipe has buffered the page, so this bounds the wait
+/// for the page before it; [`IDLE_TIMEOUT`] covers the last one. Long, so a
+/// client that streams pages to a console its user has paused is not cut off.
+/// goz's own CLI reads the whole reply before it prints and gives up after
+/// 30 s, so it never comes near this.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Pause after a failed pipe connect before listening again. A connect fails
 /// only on an unexpected `ConnectNamedPipe` error (a client that closed before
 /// the server saw it counts as connected), and such an error tends to repeat,
@@ -52,6 +60,13 @@ const CONNECT_RETRY_PAUSE: Duration = Duration::from_millis(10);
 /// At most one log line per this period for failed connects. It counts the
 /// failures since the last line, so the service log cannot grow with them.
 const CONNECT_WARN_EVERY: Duration = Duration::from_secs(60);
+/// A results page ends once its frame passes this many bytes, half the
+/// client's [`MAX_SERVER_FRAME`]. One row is at most `MAX_PATH_HOPS` names of
+/// up to 255 UTF-16 units each, about 3 MiB, so the row that crosses the budget
+/// still fits under the cap. Cutting by row count alone let [`PAGE_ROWS`] rows
+/// of 4 KB paths, which any local user can create, build a page the client
+/// refuses.
+const PAGE_BYTE_BUDGET: usize = MAX_SERVER_FRAME as usize / 2;
 /// How often to try the pipe name again while another process holds it.
 const CLAIM_RETRY_EVERY: Duration = Duration::from_secs(2);
 /// `CreateNamedPipe` errors that mean another process already holds the name:
@@ -121,9 +136,16 @@ async fn accept_loop(
                         let vols = volumes.clone();
                         tokio::spawn(async move {
                             let _permit = permit; // held for the connection's lifetime
-                            if let Err(e) = handle_connection(connected, vols).await {
+                            let mut connected = connected;
+                            if let Err(e) = handle_connection(&mut connected, vols).await {
                                 tracing::debug!(error = %e, "connection ended");
                             }
+                            // Dropping the instance cancels only reads and
+                            // connects, so a page the client never took keeps
+                            // the handle and its buffer alive until the client
+                            // reads or closes, outside MAX_CONNECTIONS.
+                            // Disconnecting fails that write and frees both.
+                            let _ = connected.disconnect();
                         });
                     }
                     Err(_) => {
@@ -212,7 +234,7 @@ fn name_taken(e: &anyhow::Error) -> bool {
         .is_some_and(|code| code == ERROR_ACCESS_DENIED || code == ERROR_PIPE_BUSY)
 }
 
-async fn handle_connection(mut server: NamedPipeServer, volumes: VolumeSet) -> Result<()> {
+async fn handle_connection(server: &mut NamedPipeServer, volumes: VolumeSet) -> Result<()> {
     let mut decoder = goz_core::proto::FrameDecoder::new(MAX_CLIENT_FRAME);
     let mut read_buf = vec![0u8; 16 * 1024];
     loop {
@@ -251,7 +273,7 @@ async fn handle_connection(mut server: NamedPipeServer, volumes: VolumeSet) -> R
                     });
                     let mut write_err: Option<std::io::Error> = None;
                     while let Some(page) = rx.recv().await {
-                        if let Err(e) = server.write_all(&page).await {
+                        if let Err(e) = write_reply(server, &page).await {
                             write_err = Some(e);
                             break;
                         }
@@ -283,9 +305,17 @@ async fn handle_connection(mut server: NamedPipeServer, volumes: VolumeSet) -> R
                     out
                 }
             };
-            server.write_all(&out).await?;
+            write_reply(server, &out).await?;
         }
     }
+}
+
+/// Writes reply bytes to the client, failing with `TimedOut` when the client
+/// has not taken them within [`WRITE_TIMEOUT`].
+async fn write_reply(server: &mut NamedPipeServer, bytes: &[u8]) -> std::io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, server.write_all(bytes))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "client stopped reading"))?
 }
 
 /// Collects every streamed page into one buffer: the tests' view of
@@ -302,8 +332,9 @@ fn encode_query_binary(volumes: &VolumeSet, q: QueryRequest) -> Vec<u8> {
 }
 
 /// Runs a query and emits the framed response as it is produced: one or more
-/// binary results-page frames (paged at [`PAGE_ROWS`], `more` set on all but the
-/// last), or a single tagged JSON error frame if the query failed to parse. An
+/// binary results-page frames (each ends at [`PAGE_ROWS`] rows or once it
+/// passes [`PAGE_BYTE_BUDGET`] bytes, `more` set on all but the last), or a
+/// single tagged JSON error frame if the query failed to parse. An
 /// empty result set still emits one `more: false` page so the client always sees
 /// a terminal frame. Each framed page is handed to `emit` as soon as it is
 /// encoded. `emit` returning `false` means the consumer is gone; encoding stops.
@@ -408,7 +439,7 @@ fn stream_query_binary(
         );
         let mut count = 0u32;
         let mut taken = 0usize;
-        while taken < page && consumed < end {
+        while taken < page && consumed < end && out.len() < PAGE_BYTE_BUDGET {
             let Some(ri) = next_head(&mut runs, &guards, &vols, q.sort, &mut consumed) else {
                 break;
             };
@@ -822,7 +853,10 @@ mod tests {
     };
     use crate::volume_state::{VolumeSet, VolumeState};
     use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
-    use goz_core::proto::{PAGE_ROWS, PROTO_VERSION, ProtoError, Request, Response};
+    use goz_core::proto::{
+        FrameDecoder, MAX_SERVER_FRAME, PAGE_ROWS, PROTO_VERSION, ProtoError, Request, Response,
+        decode_response_frame,
+    };
     use goz_core::query::resolve_scope;
     use goz_core::types::{Frn, SortKey, SortSpec, VolumePhase};
     use goz_core::usn::record::{
@@ -1123,6 +1157,54 @@ mod tests {
         assert_eq!(pages[1].items.len(), 1);
         assert_eq!(pages[0].total, n, "total is the whole match count");
         assert_eq!(pages[1].total, n, "total must not drift across pages");
+    }
+
+    /// Every page must fit the 16 MiB frame cap the client decodes with, or
+    /// the client refuses it and the search fails. [`PAGE_ROWS`] paths of
+    /// about 4 KB pass that cap, and any local user can create them.
+    #[test]
+    fn pages_of_long_paths_fit_the_clients_frame_cap() {
+        let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        // 17 nested folders with 250-character names make every full path
+        // below them about 4.3 KB, so PAGE_ROWS rows would need 17.6 MB.
+        let mut parent = NTFS_ROOT_FRN.0;
+        for level in 0..17 {
+            index.insert_enum(&dir_record(100 + level, parent, &"d".repeat(250)));
+            parent = 100 + level;
+        }
+        for i in 0..PAGE_ROWS as u64 {
+            let mut rec = dir_record(1000 + i, parent, &format!("hit{i:05}.log"));
+            rec.attributes = 0;
+            index.insert_enum(&rec);
+        }
+        let vols = set(&[volume(r"C:\", index, VolumePhase::Live)]);
+
+        let mut decoder = FrameDecoder::new(MAX_SERVER_FRAME);
+        decoder.feed(&encode_query_binary(&vols, query("hit")));
+        let mut pages = Vec::new();
+        while let Some(frame) = decoder
+            .next_frame()
+            .expect("every frame fits the client's cap")
+        {
+            match decode_response_frame(&frame).expect("decodes") {
+                Response::Results(page) => pages.push(page),
+                other => panic!("expected Results, got {other:?}"),
+            }
+        }
+        assert!(pages.len() > 1, "the byte budget splits the rows");
+        let (last, rest) = pages.split_last().expect("at least one page");
+        assert!(
+            rest.iter().all(|p| p.more),
+            "every page but the last says more"
+        );
+        assert!(!last.more, "the last page is terminal");
+        let names: Vec<String> = pages
+            .iter()
+            .flat_map(|page| &page.items)
+            .map(|item| item.path.rsplit('\\').next().unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = (0..PAGE_ROWS).map(|i| format!("hit{i:05}.log")).collect();
+        assert_eq!(names, expected, "every row arrives once, in order");
     }
 
     /// A taken pipe name must read as taken through the context `create_instance`

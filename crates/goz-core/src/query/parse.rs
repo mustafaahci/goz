@@ -212,6 +212,26 @@ pub enum QueryError {
     UnsupportedOperator(char),
     #[error("malformed {what}: {detail}")]
     Malformed { what: &'static str, detail: String },
+    /// More terms than a query may hold; carries the query's count.
+    #[error("the query has {0} terms; a query may have at most {max}", max = MAX_QUERY_TERMS)]
+    TooManyTerms(usize),
+}
+
+/// The most terms one query may hold. The engine tests each candidate against
+/// every term under the volume's index read lock, so a query's cost grows with
+/// its term count; without a cap, one query from any local user holds that
+/// lock, and the journal tail waiting behind it, for minutes. Real queries use
+/// a few terms.
+const MAX_QUERY_TERMS: usize = 256;
+
+/// How many terms `q` holds, as [`MAX_QUERY_TERMS`] counts them: name and path
+/// terms, wildcards and `ext:` values, since each costs a candidate one test.
+/// `size:` and the kind filters cost the same whatever their value.
+fn term_count(q: &ParsedQuery) -> usize {
+    q.name_terms.len()
+        + q.path_terms.len()
+        + q.wildcards.len()
+        + q.filters.ext.as_ref().map_or(0, Vec::len)
 }
 
 /// Recognizes the `case:` directive: `case:`/`case:1` enable case-sensitivity,
@@ -304,6 +324,10 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery, QueryError> {
         push_text_term(&mut q, text, &fold_term);
     }
 
+    let terms = term_count(&q);
+    if terms > MAX_QUERY_TERMS {
+        return Err(QueryError::TooManyTerms(terms));
+    }
     Ok(q)
 }
 
@@ -672,5 +696,32 @@ mod tests {
     fn empty_query_has_no_text_constraints() {
         assert!(q("").is_text_empty());
         assert!(q("   ").is_text_empty());
+    }
+
+    /// Every term costs each candidate a test under the index read lock, so a
+    /// query past the cap is refused rather than holding the lock for minutes.
+    #[test]
+    fn a_query_with_more_than_the_maximum_terms_is_refused() {
+        let terms = |n: usize| vec!["a"; n].join(" ");
+        assert!(parse_query(&terms(MAX_QUERY_TERMS)).is_ok());
+        assert_eq!(
+            parse_query(&terms(MAX_QUERY_TERMS + 1)),
+            Err(QueryError::TooManyTerms(MAX_QUERY_TERMS + 1))
+        );
+    }
+
+    /// A long `ext:` list costs each candidate a test per value, so its values
+    /// count toward the cap; `size:` and `file:` do not.
+    #[test]
+    fn ext_values_count_toward_the_term_cap() {
+        let exts = |n: usize| {
+            let list: Vec<String> = (0..n).map(|i| format!("e{i}")).collect();
+            format!("a size:>1kb file: ext:{}", list.join(";"))
+        };
+        assert!(parse_query(&exts(MAX_QUERY_TERMS - 1)).is_ok());
+        assert_eq!(
+            parse_query(&exts(MAX_QUERY_TERMS)),
+            Err(QueryError::TooManyTerms(MAX_QUERY_TERMS + 1))
+        );
     }
 }
