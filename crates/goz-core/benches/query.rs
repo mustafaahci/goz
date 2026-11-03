@@ -110,6 +110,7 @@ fn bench_query(c: &mut Criterion) {
             b.iter(|| {
                 let out = run_query(
                     black_box(&idx),
+                    r"C:\",
                     black_box(&parsed),
                     None,
                     SortSpec::default(),
@@ -136,6 +137,7 @@ fn bench_query(c: &mut Criterion) {
             b.iter(|| {
                 let out = run_query(
                     black_box(&idx),
+                    r"C:\",
                     black_box(&parsed),
                     None,
                     SortSpec::default(),
@@ -163,6 +165,7 @@ fn bench_query(c: &mut Criterion) {
             b.iter(|| {
                 let out = run_query(
                     black_box(&idx),
+                    r"C:\",
                     black_box(&parsed),
                     None,
                     SortSpec::default(),
@@ -176,6 +179,7 @@ fn bench_query(c: &mut Criterion) {
             b.iter(|| {
                 let out = run_query_refs(
                     black_box(&idx),
+                    r"C:\",
                     black_box(&parsed),
                     None,
                     SortSpec::default(),

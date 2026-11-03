@@ -33,6 +33,7 @@ fn interned_shared_names_are_found() {
     let parsed = goz_core::query::parse_query("index.js").unwrap();
     let out = goz_core::query::run_query(
         &idx,
+        r"C:\",
         &parsed,
         None,
         goz_core::types::SortSpec::default(),
@@ -43,6 +44,7 @@ fn interned_shared_names_are_found() {
     idx.optimize_storage();
     let out2 = goz_core::query::run_query(
         &idx,
+        r"C:\",
         &parsed,
         None,
         goz_core::types::SortSpec::default(),
@@ -101,6 +103,7 @@ fn scoped_results_equal_prefix_filtered_unscoped_results() {
 
     let scoped = goz_core::query::run_query(
         &idx,
+        r"C:\",
         &parsed,
         Some(scope),
         goz_core::types::SortSpec::default(),
@@ -109,6 +112,7 @@ fn scoped_results_equal_prefix_filtered_unscoped_results() {
     );
     let unscoped = goz_core::query::run_query(
         &idx,
+        r"C:\",
         &parsed,
         None,
         goz_core::types::SortSpec::default(),

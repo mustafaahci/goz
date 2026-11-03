@@ -398,7 +398,15 @@ fn stream_query_binary(
         // from the index and allocate nothing, so a 3M-row set orders in
         // ~160 ms across cores, against ~1 s the lock used to be held while
         // every row's path was built here.
-        let outcome = run_query_refs(&index, &parsed, scope_entry, q.sort, 0, per_vol_limit);
+        let outcome = run_query_refs(
+            &index,
+            vol.mount_prefix(),
+            &parsed,
+            scope_entry,
+            q.sort,
+            0,
+            per_vol_limit,
+        );
         drop(index);
         total += outcome.total;
         if !outcome.refs.is_empty() {
@@ -1314,6 +1322,20 @@ mod tests {
         assert_eq!(
             scoped("case:0 system32", r"C:\windows", true),
             [r"C:\Windows\System32"]
+        );
+    }
+
+    /// An absolute path finds what is on that volume and nothing on another.
+    #[test]
+    fn an_absolute_path_term_matches_only_its_drive() {
+        let vols = set(&[live_volume(r"C:\"), live_volume(r"D:\")]);
+        assert_eq!(
+            result_paths(&vols, query(r"C:\Windows\System32")),
+            [r"C:\Windows\System32"]
+        );
+        assert_eq!(
+            result_paths(&vols, query(r"d:/windows/")),
+            [r"D:\Windows\System32"]
         );
     }
 

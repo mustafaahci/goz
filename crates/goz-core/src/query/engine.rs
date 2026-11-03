@@ -74,10 +74,18 @@ pub struct CompiledQuery<'a> {
     /// The scan then skips re-testing the name it has just found, which on a
     /// broad query was a second `memmem` per distinct name for nothing.
     prefilter_decides_name: bool,
+    /// The volume's mount prefix, folded iff the query is case-insensitive:
+    /// path terms and path wildcards match `prefix + path`.
+    prefix: Vec<u8>,
+    /// `false` when a path term or path wildcard cannot match anywhere under
+    /// `prefix` (see [`term_admits`]), so the volume has no hits.
+    volume_admits: bool,
 }
 
 impl<'a> CompiledQuery<'a> {
-    pub fn new(parsed: &'a ParsedQuery) -> Self {
+    /// Compiles `parsed` for the volume mounted at `mount_prefix` (`C:\`, or a
+    /// mount folder such as `C:\mnt\data\`).
+    pub fn new(parsed: &'a ParsedQuery, mount_prefix: &str) -> Self {
         // The prefilter is the longest literal from any name term, wildcard, or
         // single `ext:` value;
         // every match must contain it, so scanning for it yields a superset of
@@ -115,6 +123,18 @@ impl<'a> CompiledQuery<'a> {
             consider(Cow::Owned(lit), false);
         }
 
+        let prefix = if parsed.match_case {
+            mount_prefix.as_bytes().to_vec()
+        } else {
+            fold(mount_prefix.as_bytes())
+        };
+        let volume_admits = parsed.path_terms.iter().all(|t| term_admits(t, &prefix))
+            && parsed.path_wildcards.iter().all(|w| {
+                let lit = w.leading_literal();
+                let n = lit.len().min(prefix.len());
+                lit[..n] == prefix[..n]
+            });
+
         Self {
             name_finders: parsed
                 .name_terms
@@ -131,8 +151,26 @@ impl<'a> CompiledQuery<'a> {
                 && parsed.name_terms.len() == 1
                 && parsed.wildcards.is_empty()
                 && parsed.filters.ext.is_none(),
+            prefix,
+            volume_admits,
         }
     }
+}
+
+/// Whether path term `term` can match a full path that starts with `prefix`
+/// (both folded alike). Windows refuses `:` in a name, so a term's first `:` can
+/// only be the drive's, the first `:` in `prefix`; that fixes where the term
+/// starts, and the part of it that overlaps the prefix must equal the prefix
+/// there. `D:\data` thus skips every volume but D: without reading an entry.
+fn term_admits(term: &[u8], prefix: &[u8]) -> bool {
+    let Some(k) = memchr::memchr(b':', term) else {
+        return true;
+    };
+    let Some(start) = memchr::memchr(b':', prefix).and_then(|c| c.checked_sub(k)) else {
+        return false;
+    };
+    let overlap = (prefix.len() - start).min(term.len());
+    term[..overlap] == prefix[start..start + overlap]
 }
 
 /// A matched entry before its page is built: 16 bytes, so a multi-million
@@ -164,13 +202,23 @@ struct Candidate {
 /// hot path off per-query folding and off per-match path building.
 pub fn run_query(
     index: &VolumeIndex,
+    mount_prefix: &str,
     parsed: &ParsedQuery,
     scope: Option<EntryIdx>,
     sort: SortSpec,
     offset: u32,
     limit: Option<u32>,
 ) -> QueryOutcome {
-    let (total, refs) = page_refs(index, parsed, scope, sort, offset, limit, true);
+    let (total, refs) = page_refs(
+        index,
+        mount_prefix,
+        parsed,
+        scope,
+        sort,
+        offset,
+        limit,
+        true,
+    );
     let hits = build_hits(index, &refs);
     QueryOutcome { total, hits }
 }
@@ -184,13 +232,23 @@ pub fn run_query(
 /// builds each page's paths from the live index when it encodes them.
 pub fn run_query_refs(
     index: &VolumeIndex,
+    mount_prefix: &str,
     parsed: &ParsedQuery,
     scope: Option<EntryIdx>,
     sort: SortSpec,
     offset: u32,
     limit: Option<u32>,
 ) -> RefOutcome {
-    let (total, refs) = page_refs(index, parsed, scope, sort, offset, limit, true);
+    let (total, refs) = page_refs(
+        index,
+        mount_prefix,
+        parsed,
+        scope,
+        sort,
+        offset,
+        limit,
+        true,
+    );
     RefOutcome { total, refs }
 }
 
@@ -205,8 +263,10 @@ pub fn run_query_refs(
 /// and a 100-row page of a broad query leaves as soon as 100 entries have
 /// been walked. Everything else takes the candidate path: scan, order, slice.
 /// `allow_name_level` exists for the test that holds the two paths equal.
+#[allow(clippy::too_many_arguments)]
 fn page_refs(
     index: &VolumeIndex,
+    mount_prefix: &str,
     parsed: &ParsedQuery,
     scope: Option<EntryIdx>,
     sort: SortSpec,
@@ -214,8 +274,8 @@ fn page_refs(
     limit: Option<u32>,
     allow_name_level: bool,
 ) -> (u64, Vec<HitRef>) {
+    let compiled = CompiledQuery::new(parsed, mount_prefix);
     if allow_name_level && sort.key == SortKey::Name && is_name_level(index, parsed, scope) {
-        let compiled = CompiledQuery::new(parsed);
         let mut cp_buf = CodePointBuf::new();
         let mut ext_scratch = Vec::new();
         let (matched, total) = match_names(index, parsed, &compiled, &mut cp_buf, &mut ext_scratch);
@@ -225,7 +285,7 @@ fn page_refs(
     let Scan {
         mut candidates,
         mut dir_paths,
-    } = scan(index, parsed, scope);
+    } = scan(index, parsed, &compiled, scope);
     let total = candidates.len() as u64;
     let (start, end) = page_bounds(candidates.len(), offset, limit);
     order(index, &mut candidates, &mut dir_paths, sort, end);
@@ -247,6 +307,7 @@ fn page_refs(
 fn is_name_level(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> bool {
     scope.is_none()
         && parsed.path_terms.is_empty()
+        && parsed.path_wildcards.is_empty()
         && parsed.filters.kind.is_none()
         && parsed.filters.size.is_none()
         && !index.has_orphans()
@@ -472,9 +533,19 @@ struct Scan {
 }
 
 /// Collects every match of `parsed` under `scope`.
-fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> Scan {
-    let compiled = CompiledQuery::new(parsed);
-    let has_path_terms = !parsed.path_terms.is_empty();
+fn scan(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    scope: Option<EntryIdx>,
+) -> Scan {
+    if !compiled.volume_admits {
+        return Scan {
+            candidates: Vec::new(),
+            dir_paths: FxHashMap::default(),
+        };
+    }
+    let has_path_terms = !parsed.path_terms.is_empty() || !parsed.path_wildcards.is_empty();
     let mut scope_memo: FxHashMap<EntryIdx, bool> = FxHashMap::default();
     // Each parent directory's reconstructed path, or None when it has none (its
     // ancestry ends in lost+found, or hit the hop cap). ONE memo, shared by the
@@ -509,7 +580,7 @@ fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> S
             if let Some(c) = evaluate(
                 index,
                 parsed,
-                &compiled,
+                compiled,
                 idx,
                 None,
                 &mut scope_memo,
@@ -543,7 +614,7 @@ fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> S
                 if let Some(c) = evaluate(
                     index,
                     parsed,
-                    &compiled,
+                    compiled,
                     idx,
                     scope,
                     &mut scope_memo,
@@ -567,7 +638,7 @@ fn scan(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> S
             if let Some(c) = evaluate(
                 index,
                 parsed,
-                &compiled,
+                compiled,
                 idx,
                 scope,
                 &mut scope_memo,
@@ -797,11 +868,24 @@ fn evaluate(
         if !matches!(index.path_of(idx, &mut buf), crate::index::PathStatus::Ok) {
             return None;
         }
-        let folded_p = if parsed.match_case { buf } else { fold(&buf) };
+        // The full path a user sees, `C:\` included, so `C:\Windows\` and a
+        // rooted `\Windows\` both match. `path_of` puts a separator before
+        // anything already in its buffer, so the prefix goes in afterwards.
+        let mut full = Vec::with_capacity(compiled.prefix.len() + buf.len());
+        full.extend_from_slice(&compiled.prefix);
+        if parsed.match_case {
+            full.extend_from_slice(&buf);
+        } else {
+            crate::fold::fold_into(&buf, &mut full);
+        }
         if !compiled
             .path_finders
             .iter()
-            .all(|f| f.find(&folded_p).is_some())
+            .all(|f| f.find(&full).is_some())
+            || !parsed
+                .path_wildcards
+                .iter()
+                .all(|w| w.matches_into(&full, cp_buf))
         {
             return None;
         }
@@ -1103,6 +1187,7 @@ mod tests {
 
         let all = run_query(
             &idx,
+            r"C:\",
             &parsed,
             None,
             SortSpec::default_for(SortKey::Name),
@@ -1117,7 +1202,15 @@ mod tests {
 
         // The failing case: a limit small enough that orphans would have filled it.
         for key in [SortKey::Name, SortKey::Path] {
-            let page = run_query(&idx, &parsed, None, SortSpec::default_for(key), 0, Some(3));
+            let page = run_query(
+                &idx,
+                r"C:\",
+                &parsed,
+                None,
+                SortSpec::default_for(key),
+                0,
+                Some(3),
+            );
             assert_eq!(
                 page.hits.len(),
                 2,
@@ -1153,7 +1246,7 @@ mod tests {
 
     fn run(idx: &VolumeIndex, query: &str) -> Vec<String> {
         let parsed = parse_query(query).unwrap();
-        let out = run_query(idx, &parsed, None, SortSpec::default(), 0, None);
+        let out = run_query(idx, r"C:\", &parsed, None, SortSpec::default(), 0, None);
         out.hits
             .iter()
             .map(|h| crate::wtf8::to_string_lossy(&h.path))
@@ -1219,17 +1312,79 @@ mod tests {
         assert_eq!(hits, vec!["docs\\sub", "docs\\sub\\Report.PDF"]);
     }
 
+    /// Sorted paths of the hits of `query` on `idx` mounted at `prefix`.
+    fn hits_under(idx: &VolumeIndex, prefix: &str, parsed: &ParsedQuery) -> Vec<String> {
+        let out = run_query(idx, prefix, parsed, None, SortSpec::default(), 0, None);
+        let mut paths: Vec<String> = out
+            .hits
+            .iter()
+            .map(|h| crate::wtf8::to_string_lossy(&h.path))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// Path terms match the full path a user sees, drive included, so a typed
+    /// `C:\docs\sub` or a rooted `\docs\sub` finds what is below it.
+    #[test]
+    fn path_terms_match_the_drive_and_a_leading_separator() {
+        let idx = sample_index();
+        let hits = |prefix, query| hits_under(&idx, prefix, &parse_query(query).unwrap());
+        assert_eq!(
+            hits(r"C:\", r"C:\docs\sub report"),
+            [r"docs\sub\Report.PDF"]
+        );
+        assert_eq!(
+            hits(r"C:\", r"\docs\sub"),
+            [r"docs\sub", r"docs\sub\Report.PDF"]
+        );
+        assert_eq!(hits(r"C:\", "c:/docs/notes"), [r"docs\notes.txt"]);
+        assert_eq!(hits(r"C:\mnt\data\", r"C:\mnt\data\photo"), ["photo.JPG"]);
+        assert!(hits(r"D:\", r"C:\docs").is_empty(), "another drive's path");
+    }
+
+    /// A wildcard with a separator matches the whole full path; `*` crosses
+    /// folders, and the drive in front still has to agree.
+    #[test]
+    fn path_wildcards_match_the_whole_full_path() {
+        let idx = sample_index();
+        let hits = |prefix, query| hits_under(&idx, prefix, &parse_query(query).unwrap());
+        assert_eq!(hits(r"C:\", r"*\sub\*.pdf"), [r"docs\sub\Report.PDF"]);
+        assert_eq!(hits(r"C:\", r"C:\docs\*.txt"), [r"docs\notes.txt"]);
+        assert_eq!(hits(r"C:\", "path:*.jpg"), ["photo.JPG"]);
+        assert!(hits(r"D:\", r"C:\docs\*.txt").is_empty());
+    }
+
+    /// Windows refuses `:` in a name, so a term's colon is the drive's, and a
+    /// volume whose prefix disagrees with the term is skipped unread.
+    #[test]
+    fn a_term_with_a_colon_must_line_up_with_the_drive() {
+        assert!(term_admits(br"c:\docs", br"c:\"));
+        assert!(term_admits(br":\docs", br"c:\"));
+        assert!(term_admits(br"c:\mnt", br"c:\mnt\data\"));
+        assert!(term_admits(b"docs", br"c:\"));
+        assert!(!term_admits(br"d:\docs", br"c:\"));
+        assert!(
+            !term_admits(br"ab:\docs", br"c:\"),
+            "a colon past the drive's"
+        );
+        assert!(
+            !term_admits(br"c:\docs", br"\\?\volume{1}\"),
+            "no drive at all"
+        );
+    }
+
     /// `-case` reaches the matcher: the parser's default decides how names are
     /// compared, not only how the scope folder is looked up.
     #[test]
     fn the_case_switch_reaches_the_matcher() {
         let idx = sample_index();
-        let total = |query| {
-            let parsed = crate::query::parse_query_with_case(query, true).unwrap();
-            run_query(&idx, &parsed, None, SortSpec::default(), 0, None).total
-        };
-        assert_eq!(total("report"), 0);
-        assert_eq!(total("Report"), 1);
+        let parsed = |query| crate::query::parse_query_with_case(query, true).unwrap();
+        assert!(hits_under(&idx, r"C:\", &parsed("report")).is_empty());
+        assert_eq!(
+            hits_under(&idx, r"C:\", &parsed("Report")),
+            [r"docs\sub\Report.PDF"]
+        );
     }
 
     #[test]
@@ -1237,7 +1392,15 @@ mod tests {
         let idx = sample_index();
         let parsed = parse_query("").unwrap();
         let scope = resolve_scope(&idx, b"docs\\sub", false).unwrap();
-        let out = run_query(&idx, &parsed, Some(scope), SortSpec::default(), 0, None);
+        let out = run_query(
+            &idx,
+            r"C:\",
+            &parsed,
+            Some(scope),
+            SortSpec::default(),
+            0,
+            None,
+        );
         let paths: Vec<String> = out
             .hits
             .iter()
@@ -1252,6 +1415,7 @@ mod tests {
         let parsed = parse_query("").unwrap();
         let out = run_query(
             &idx,
+            r"C:\",
             &parsed,
             None,
             SortSpec {
@@ -1285,6 +1449,7 @@ mod tests {
         let parsed = parse_query("").unwrap();
         let out = run_query(
             &idx,
+            r"C:\",
             &parsed,
             None,
             SortSpec {
@@ -1305,7 +1470,8 @@ mod tests {
     fn refs_follow_run_query_order() {
         let idx = sample_index();
         let parsed = parse_query("").unwrap();
-        let total = run_query(&idx, &parsed, None, SortSpec::default(), 0, None).total as u32;
+        let total =
+            run_query(&idx, r"C:\", &parsed, None, SortSpec::default(), 0, None).total as u32;
         assert!(total > 2, "fixture must have several matches to slice");
         for key in [
             SortKey::Name,
@@ -1322,8 +1488,8 @@ mod tests {
                     (0, Some(u32::MAX)),
                     (total, Some(5)),
                 ] {
-                    let hits = run_query(&idx, &parsed, None, sort, offset, limit);
-                    let refs = run_query_refs(&idx, &parsed, None, sort, offset, limit);
+                    let hits = run_query(&idx, r"C:\", &parsed, None, sort, offset, limit);
+                    let refs = run_query_refs(&idx, r"C:\", &parsed, None, sort, offset, limit);
                     assert_eq!(refs.total, hits.total);
                     let want: Vec<EntryIdx> = hits.hits.iter().map(|h| h.idx).collect();
                     let got: Vec<EntryIdx> = refs.refs.iter().map(|r| r.idx).collect();
@@ -1369,12 +1535,20 @@ mod tests {
                 let parsed = parse_query(q).unwrap();
                 // Ground truth: the candidate path's match SET (ranks play no
                 // part in which entries match), ordered by the bytes alone.
-                let mut ground: Vec<EntryIdx> =
-                    page_refs(idx, &parsed, None, SortSpec::default(), 0, None, false)
-                        .1
-                        .iter()
-                        .map(|r| r.idx)
-                        .collect();
+                let mut ground: Vec<EntryIdx> = page_refs(
+                    idx,
+                    r"C:\",
+                    &parsed,
+                    None,
+                    SortSpec::default(),
+                    0,
+                    None,
+                    false,
+                )
+                .1
+                .iter()
+                .map(|r| r.idx)
+                .collect();
                 ground.sort_by(|&a, &b| idx.folded_name(a).cmp(idx.folded_name(b)).then(a.cmp(&b)));
                 assert!(ground.iter().all(|&e| !idx.is_synthetic(e)));
                 let total = ground.len() as u32;
@@ -1401,8 +1575,9 @@ mod tests {
                             (start + l as usize).min(expected_all.len())
                         });
                         let expected = &expected_all[start..end];
-                        let fast = page_refs(idx, &parsed, None, sort, offset, limit, true);
-                        let slow = page_refs(idx, &parsed, None, sort, offset, limit, false);
+                        let fast = page_refs(idx, r"C:\", &parsed, None, sort, offset, limit, true);
+                        let slow =
+                            page_refs(idx, r"C:\", &parsed, None, sort, offset, limit, false);
                         let ctx = format!("{stage}: {q:?} {dir:?} offset {offset} limit {limit:?}");
                         assert_eq!(fast.0, u64::from(total), "total (name-level) {ctx}");
                         assert_eq!(slow.0, u64::from(total), "total (candidates) {ctx}");
@@ -1504,7 +1679,7 @@ mod tests {
             let idx = flat_index(&uniq);
             let query = terms.join(" ");
             let parsed = parse_query(&query).unwrap();
-            let out = run_query(&idx, &parsed, None, SortSpec::default(), 0, None);
+            let out = run_query(&idx, r"C:\", &parsed, None, SortSpec::default(), 0, None);
             let engine: BTreeSet<String> = out
                 .hits
                 .iter()

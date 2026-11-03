@@ -197,6 +197,7 @@ fn main() {
     let t2 = std::time::Instant::now();
     let out = goz_core::query::run_query(
         &idx,
+        r"C:\",
         &parsed,
         None,
         goz_core::types::SortSpec::default(),

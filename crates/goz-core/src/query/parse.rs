@@ -1,12 +1,14 @@
 //! Query tokenizer and grammar for goz's v1 search syntax.
 //!
 //! Supported: space-separated terms (implicit AND), `"quoted phrases"`,
-//! `*`/`?` wildcards (anchored to the whole name), path terms (a term
-//! containing `\` or `/`), and the functions `ext:`, `size:`, `path:`,
-//! `file:`, `folder:`, `case:`. The boolean operators `|` and `!` are
-//! rejected loudly rather than silently mis-executed: es's own precedence
-//! for them is undocumented, so guessing it would be a compatibility trap.
-//! Unknown `func:` prefixes are treated as literal text, matching es.
+//! `*`/`?` wildcards (anchored to the whole name, or to the whole full path
+//! for a path wildcard), path terms (a term
+//! containing `\` or `/`, matched against the full path with its drive), and
+//! the functions `ext:`, `size:`, `path:`, `file:`, `folder:`, `case:`, whose
+//! value may be quoted. The boolean operators `|` and `!` are rejected loudly
+//! rather than silently mis-executed: es's own precedence for them is
+//! undocumented, so guessing it would be a compatibility trap. Unknown `func:`
+//! prefixes are treated as literal text, matching es.
 //!
 //! Terms are folded at parse time when the query is case-insensitive, so the
 //! engine compares candidate data (folded iff `!match_case`) against
@@ -17,10 +19,12 @@ use smallvec::SmallVec;
 
 /// Scratch buffer of decoded code points, reused across candidates so a
 /// wildcard scan doesn't heap-allocate per candidate. NTFS names are <= 255
-/// code points, so the inline capacity never spills.
+/// code points, so a name fits inline; a path wildcard's full path may spill
+/// it once, and `clear` keeps that capacity for the rest of the scan.
 pub type CodePointBuf = SmallVec<[u32; 256]>;
 
-/// A compiled wildcard pattern (whole-name match).
+/// A compiled wildcard pattern, matched against a whole name or, for a path
+/// wildcard, a whole full path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wildcard {
     tokens: Vec<GlobTok>,
@@ -55,9 +59,9 @@ impl Wildcard {
         Wildcard { tokens }
     }
 
-    /// Matches the whole of `name`, decoding its code points into the caller's
-    /// reusable `buf` (cleared first) instead of allocating one per candidate.
-    /// NTFS names are <= 255 code points, so the inline capacity never spills.
+    /// Matches the whole of `name` (or of a full path), decoding its code points
+    /// into the caller's reusable `buf` (cleared first) instead of allocating
+    /// one per candidate.
     pub fn matches_into(&self, name: &[u8], buf: &mut CodePointBuf) -> bool {
         buf.clear();
         buf.extend(crate::wtf8::CodePoints::new(name));
@@ -94,6 +98,17 @@ impl Wildcard {
             best = run;
         }
         (!best.is_empty()).then_some(best)
+    }
+
+    /// The literal characters before the pattern's first `*` or `?`, as WTF-8
+    /// bytes: what every match must start with.
+    pub fn leading_literal(&self) -> Vec<u8> {
+        let mut lit = Vec::new();
+        for tok in &self.tokens {
+            let GlobTok::Lit(cp) = tok else { break };
+            encode_wtf8(*cp, &mut lit);
+        }
+        lit
     }
 }
 
@@ -187,10 +202,14 @@ pub struct Filters {
 pub struct ParsedQuery {
     /// Filename substrings (all must match, AND). Folded iff `!match_case`.
     pub name_terms: Vec<Vec<u8>>,
-    /// Full-path substrings (all must match). Folded iff `!match_case`.
+    /// Full-path substrings, mount prefix included (all must match). Folded iff
+    /// `!match_case`; `/` is stored as `\`.
     pub path_terms: Vec<Vec<u8>>,
     /// Whole-name wildcard patterns (all must match).
     pub wildcards: Vec<Wildcard>,
+    /// Whole-full-path wildcard patterns, from a wildcard with a separator or a
+    /// `path:` value with one (all must match).
+    pub path_wildcards: Vec<Wildcard>,
     pub filters: Filters,
     pub match_case: bool,
 }
@@ -199,7 +218,10 @@ impl ParsedQuery {
     /// `true` when there are no positive text constraints: the query matches
     /// everything subject to `filters`.
     pub fn is_text_empty(&self) -> bool {
-        self.name_terms.is_empty() && self.path_terms.is_empty() && self.wildcards.is_empty()
+        self.name_terms.is_empty()
+            && self.path_terms.is_empty()
+            && self.wildcards.is_empty()
+            && self.path_wildcards.is_empty()
     }
 }
 
@@ -231,6 +253,7 @@ fn term_count(q: &ParsedQuery) -> usize {
     q.name_terms.len()
         + q.path_terms.len()
         + q.wildcards.len()
+        + q.path_wildcards.len()
         + q.filters.ext.as_ref().map_or(0, Vec::len)
 }
 
@@ -260,7 +283,7 @@ pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuer
     // last `case:` directive wins over the caller's default.
     let match_case = tokens
         .iter()
-        .filter(|t| !t.quoted)
+        .filter(|t| t.func_colon.is_some())
         .filter_map(|t| case_directive(&t.text))
         .next_back()
         .unwrap_or(match_case);
@@ -271,23 +294,18 @@ pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuer
         name_terms: Vec::new(),
         path_terms: Vec::new(),
         wildcards: Vec::new(),
+        path_wildcards: Vec::new(),
         filters: Filters::default(),
         match_case,
     };
 
     for tok in &tokens {
-        if tok.quoted {
-            // Quoted phrases are literal filename substrings.
-            q.name_terms.push(fold_term(tok.text.as_bytes()));
-            continue;
-        }
-        let text = &tok.text;
-        if case_directive(text).is_some() {
+        let text = tok.text.as_str();
+        if tok.func_colon.is_some() && case_directive(text).is_some() {
             continue; // case:/case:0/case:1 are consumed, never search terms
         }
 
-        // Function tokens: prefix before the first ':'.
-        if let Some(colon) = text.find(':') {
+        if let Some(colon) = tok.func_colon {
             let func = text[..colon].to_ascii_lowercase();
             let value = &text[colon + 1..];
             match func.as_str() {
@@ -307,19 +325,17 @@ pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuer
                     continue;
                 }
                 "path" => {
-                    if !value.is_empty() {
-                        q.path_terms.push(fold_term(value.as_bytes()));
-                    }
+                    push_text_term(&mut q, value, tok.quoted, true, &fold_term);
                     continue;
                 }
                 "file" => {
                     q.filters.kind = Some(Kind::File);
-                    push_text_term(&mut q, value, &fold_term);
+                    push_text_term(&mut q, value, tok.quoted, false, &fold_term);
                     continue;
                 }
                 "folder" | "dir" => {
                     q.filters.kind = Some(Kind::Folder);
-                    push_text_term(&mut q, value, &fold_term);
+                    push_text_term(&mut q, value, tok.quoted, false, &fold_term);
                     continue;
                 }
                 _ => {
@@ -328,7 +344,7 @@ pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuer
             }
         }
 
-        push_text_term(&mut q, text, &fold_term);
+        push_text_term(&mut q, text, tok.quoted, false, &fold_term);
     }
 
     let terms = term_count(&q);
@@ -338,24 +354,49 @@ pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuer
     Ok(q)
 }
 
-/// Routes an unquoted text token to the wildcard, path, or name bucket.
-fn push_text_term(q: &mut ParsedQuery, text: &str, fold_term: &impl Fn(&[u8]) -> Vec<u8>) {
+/// Routes a text term to the name, path or wildcard buckets.
+///
+/// A term with a separator, or any `path:` value (`as_path`), matches the
+/// full path; `/` is a separator like `\`, since no name contains either.
+/// `*` and `?` make a wildcard, matched against the whole name or, for a path,
+/// the whole full path. Quotes keep them literal in a name, but in a path they
+/// stay wildcards: the quotes are there for the spaces in a folder name.
+fn push_text_term(
+    q: &mut ParsedQuery,
+    text: &str,
+    quoted: bool,
+    as_path: bool,
+    fold_term: &impl Fn(&[u8]) -> Vec<u8>,
+) {
     if text.is_empty() {
         return;
     }
-    if text.contains('*') || text.contains('?') {
+    let is_path = as_path || text.contains(['\\', '/']);
+    let wildcard = text.contains(['*', '?']) && (is_path || !quoted);
+    if is_path {
+        let path = fold_term(text.replace('/', "\\").as_bytes());
+        if wildcard {
+            q.path_wildcards.push(Wildcard::compile(&path));
+        } else {
+            q.path_terms.push(path);
+        }
+    } else if wildcard {
         q.wildcards
             .push(Wildcard::compile(&fold_term(text.as_bytes())));
-    } else if text.contains('\\') || text.contains('/') {
-        q.path_terms.push(fold_term(text.as_bytes()));
     } else {
         q.name_terms.push(fold_term(text.as_bytes()));
     }
 }
 
 struct Token {
+    /// The token with its quotes removed.
     text: String,
+    /// Whether any part of it was quoted.
     quoted: bool,
+    /// Where `text` has the colon of a `func:` prefix: the token's first `:`,
+    /// when no quote came before it. A quoted value keeps its spaces, as in
+    /// `path:"C:\Program Files"`, while a quoted `"a:b"` stays plain text.
+    func_colon: Option<usize>,
 }
 
 /// Splits on unquoted whitespace, honoring `"double quotes"`, and rejects the
@@ -365,6 +406,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
     let mut cur = String::new();
     let mut in_quotes = false;
     let mut token_quoted = false;
+    let mut func_colon = None;
     let mut has_content = false;
 
     for ch in input.chars() {
@@ -392,12 +434,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
                     tokens.push(Token {
                         text: std::mem::take(&mut cur),
                         quoted: token_quoted,
+                        func_colon: func_colon.take(),
                     });
                     token_quoted = false;
                     has_content = false;
                 }
             }
             c => {
+                if c == ':' && !token_quoted && func_colon.is_none() {
+                    func_colon = Some(cur.len());
+                }
                 cur.push(c);
                 has_content = true;
             }
@@ -407,6 +453,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
         tokens.push(Token {
             text: cur,
             quoted: token_quoted,
+            func_colon,
         });
     }
     Ok(tokens)
@@ -691,14 +738,6 @@ mod tests {
         assert_eq!(p.name_terms, vec![b"parent:foo".to_vec()]);
     }
 
-    #[test]
-    fn malformed_size_is_reported() {
-        assert!(matches!(
-            parse_query("size:abc"),
-            Err(QueryError::Malformed { what: "size:", .. })
-        ));
-    }
-
     /// The `-case` switch is the parser's default, and a `case:` directive in
     /// the text still wins, so matching and the scope lookup follow one value.
     #[test]
@@ -716,7 +755,68 @@ mod tests {
                 .unwrap()
                 .match_case
         );
+        assert!(
+            q(r#"Report case:"1""#).match_case,
+            "a quoted value still sets it"
+        );
         assert!(!q("Report").match_case);
+    }
+
+    /// No name contains `/`, so it separates folders like `\`.
+    #[test]
+    fn a_slash_is_a_separator() {
+        assert_eq!(
+            q("Projects/src").path_terms,
+            vec![br"projects\src".to_vec()]
+        );
+        assert_eq!(q("path:a/b").path_terms, vec![br"a\b".to_vec()]);
+        let p = q("*/docs/*.md");
+        assert!(p.wildcards.is_empty());
+        assert!(p.path_wildcards[0].matches(br"c:\repo\docs\a.md"));
+    }
+
+    /// A wildcard with a separator, or in a `path:` value, matches the whole
+    /// full path and never the name, which holds no separator.
+    #[test]
+    fn separator_and_path_wildcards_match_the_full_path() {
+        let p = q(r"C:\repo\*.cs");
+        assert!(p.wildcards.is_empty() && p.path_terms.is_empty());
+        let w = &p.path_wildcards[0];
+        assert!(w.matches(br"c:\repo\main.cs"));
+        assert!(w.matches(br"c:\repo\sub\main.cs"), "* crosses folders");
+        assert!(!w.matches(br"d:\repo\main.cs"));
+        assert!(q("path:*.md").path_wildcards[0].matches(br"c:\notes\a.md"));
+    }
+
+    /// Quotes let a value keep its spaces: a quoted term with a separator is a
+    /// path, whose wildcards stay wildcards, and a function's quoted value is
+    /// still that function's. A quoted name keeps `*` literal.
+    #[test]
+    fn quoted_paths_and_function_values() {
+        assert_eq!(
+            q(r#""C:\Program Files\app""#).path_terms,
+            vec![br"c:\program files\app".to_vec()]
+        );
+        assert!(
+            q(r#""C:\Program Files\*.exe""#).path_wildcards[0].matches(br"c:\program files\a.exe")
+        );
+        assert_eq!(
+            q(r#"path:"C:\Program Files""#).path_terms,
+            vec![br"c:\program files".to_vec()]
+        );
+        let p = q(r#"file:"my report""#);
+        assert_eq!(p.name_terms, vec![b"my report".to_vec()]);
+        assert_eq!(p.filters.kind, Some(Kind::File));
+        assert_eq!(q(r#"ext:"rs""#).filters.ext, Some(vec![b"rs".to_vec()]));
+        assert_eq!(q(r#""*.rs""#).name_terms, vec![b"*.rs".to_vec()]);
+    }
+
+    #[test]
+    fn malformed_size_is_reported() {
+        assert!(matches!(
+            parse_query("size:abc"),
+            Err(QueryError::Malformed { what: "size:", .. })
+        ));
     }
 
     #[test]
