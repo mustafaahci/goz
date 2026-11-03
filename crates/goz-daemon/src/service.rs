@@ -397,12 +397,18 @@ fn stopped_report(exit_code: ServiceExitCode) -> ServiceStatus {
 }
 
 /// Best-effort file logging for service mode (no console). Writes to
-/// `%ProgramData%\goz\logs\gozd.log`; any failure skips logging.
+/// `%SystemRoot%\Logs\goz\gozd.log`; any failure skips logging.
+///
+/// The log must live where only SYSTEM and Administrators can create entries.
+/// Standard users may create folders in `%ProgramData%` itself and in any
+/// subfolder that inherits its ACL, so a user could pre-create
+/// `%ProgramData%\goz\logs` as a junction before the service first ran and make
+/// this LocalSystem writer create or append to a file of their choosing.
 fn init_service_tracing() {
-    let Ok(program_data) = std::env::var("ProgramData") else {
+    let Ok(system_root) = std::env::var("SystemRoot") else {
         return;
     };
-    let dir = std::path::Path::new(&program_data).join("goz").join("logs");
+    let dir = std::path::Path::new(&system_root).join("Logs").join("goz");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
