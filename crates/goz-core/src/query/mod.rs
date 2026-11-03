@@ -17,4 +17,6 @@ pub use engine::{
     CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, resolve_scope, run_query,
     run_query_refs,
 };
-pub use parse::{Filters, Kind, ParsedQuery, QueryError, SizeRange, Wildcard, parse_query};
+pub use parse::{
+    Filters, Kind, ParsedQuery, QueryError, SizeRange, Wildcard, parse_query, parse_query_with_case,
+};

@@ -245,18 +245,25 @@ fn case_directive(text: &str) -> Option<bool> {
     }
 }
 
-/// Parses a query string into a [`ParsedQuery`].
+/// Parses a query string into a [`ParsedQuery`], case-insensitive unless a
+/// `case:` directive says otherwise.
 pub fn parse_query(input: &str) -> Result<ParsedQuery, QueryError> {
+    parse_query_with_case(input, false)
+}
+
+/// Parses a query string into a [`ParsedQuery`] whose case sensitivity is
+/// `match_case` (the `-case` switch) unless a `case:` directive overrides it.
+pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuery, QueryError> {
     let tokens = tokenize(input)?;
 
     // First pass: detect case-sensitivity so text folding is correct. The
-    // last `case:` directive wins; default is case-insensitive.
+    // last `case:` directive wins over the caller's default.
     let match_case = tokens
         .iter()
         .filter(|t| !t.quoted)
         .filter_map(|t| case_directive(&t.text))
         .next_back()
-        .unwrap_or(false);
+        .unwrap_or(match_case);
 
     let fold_term = |s: &[u8]| -> Vec<u8> { if match_case { s.to_vec() } else { fold(s) } };
 
@@ -690,6 +697,26 @@ mod tests {
             parse_query("size:abc"),
             Err(QueryError::Malformed { what: "size:", .. })
         ));
+    }
+
+    /// The `-case` switch is the parser's default, and a `case:` directive in
+    /// the text still wins, so matching and the scope lookup follow one value.
+    #[test]
+    fn the_case_switch_is_the_default_a_directive_overrides() {
+        let p = parse_query_with_case("Report", true).unwrap();
+        assert!(p.match_case);
+        assert_eq!(p.name_terms, vec![b"Report".to_vec()]);
+        assert!(
+            !parse_query_with_case("Report case:0", true)
+                .unwrap()
+                .match_case
+        );
+        assert!(
+            parse_query_with_case("Report case:", false)
+                .unwrap()
+                .match_case
+        );
+        assert!(!q("Report").match_case);
     }
 
     #[test]

@@ -1219,6 +1219,19 @@ mod tests {
         assert_eq!(hits, vec!["docs\\sub", "docs\\sub\\Report.PDF"]);
     }
 
+    /// `-case` reaches the matcher: the parser's default decides how names are
+    /// compared, not only how the scope folder is looked up.
+    #[test]
+    fn the_case_switch_reaches_the_matcher() {
+        let idx = sample_index();
+        let total = |query| {
+            let parsed = crate::query::parse_query_with_case(query, true).unwrap();
+            run_query(&idx, &parsed, None, SortSpec::default(), 0, None).total
+        };
+        assert_eq!(total("report"), 0);
+        assert_eq!(total("Report"), 1);
+    }
+
     #[test]
     fn scope_restricts_to_descendants() {
         let idx = sample_index();

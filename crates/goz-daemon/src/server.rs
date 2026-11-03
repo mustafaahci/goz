@@ -20,7 +20,7 @@ use goz_core::proto::{
     MAX_CLIENT_FRAME, MAX_SERVER_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame,
     patch_results_header, push_item, push_results_header,
 };
-use goz_core::query::{HitRef, parse_query, resolve_scope, run_query_refs};
+use goz_core::query::{HitRef, parse_query_with_case, resolve_scope, run_query_refs};
 use goz_core::types::{EntryIdx, SortDir, SortKey, SortSpec};
 use goz_winfs::{PipeSecurity, build_pipe_security};
 use rustc_hash::FxHashMap;
@@ -351,7 +351,7 @@ fn stream_query_binary(
     q: QueryRequest,
     emit: &mut dyn FnMut(Vec<u8>) -> bool,
 ) {
-    let parsed = match parse_query(&q.query) {
+    let parsed = match parse_query_with_case(&q.query, q.match_case) {
         Ok(p) => p,
         Err(e) => {
             let mut out = Vec::new();
@@ -389,7 +389,7 @@ fn stream_query_binary(
         let index = vol.index.read();
         let scope_entry = match scope {
             VolScope::All => None,
-            VolScope::Rel(rel) => match resolve_scope_cached(vol, &index, rel, q.match_case) {
+            VolScope::Rel(rel) => match resolve_scope_cached(vol, &index, rel, parsed.match_case) {
                 Some(e) => Some(e),
                 None => continue, // scope folder absent on this volume: no hits
             },
@@ -1271,6 +1271,49 @@ mod tests {
             item.path.starts_with(r"C:\"),
             "path {:?} must carry the mount prefix",
             item.path
+        );
+    }
+
+    /// The paths of every row `q` returns.
+    fn result_paths(vols: &VolumeSet, q: goz_core::proto::QueryRequest) -> Vec<String> {
+        results(&encode_query_binary(vols, q))
+            .into_iter()
+            .flat_map(|page| page.items)
+            .map(|item| item.path)
+            .collect()
+    }
+
+    /// The request's `match_case` (the `-case` switch) decides matching, not
+    /// only the `-path` lookup.
+    #[test]
+    fn the_case_switch_reaches_matching() {
+        let vols = set(&[live_volume(r"C:\")]);
+        let mut q = query("system32");
+        q.match_case = true;
+        assert!(result_paths(&vols, q.clone()).is_empty());
+        q.match_case = false;
+        assert_eq!(result_paths(&vols, q), [r"C:\Windows\System32"]);
+    }
+
+    /// The `-path` folder is looked up with the case the query ends up with, so
+    /// a `case:` directive decides it as it decides matching.
+    #[test]
+    fn the_scope_lookup_follows_the_case_directive() {
+        let vols = set(&[live_volume(r"C:\")]);
+        let scoped = |text: &str, scope: &str, match_case| {
+            let mut q = query(text);
+            q.scope = Some(scope.to_string());
+            q.match_case = match_case;
+            result_paths(&vols, q)
+        };
+        assert!(scoped("case: System32", r"C:\windows", false).is_empty());
+        assert_eq!(
+            scoped("case: System32", r"C:\Windows", false),
+            [r"C:\Windows\System32"]
+        );
+        assert_eq!(
+            scoped("case:0 system32", r"C:\windows", true),
+            [r"C:\Windows\System32"]
         );
     }
 
