@@ -87,6 +87,9 @@ fn build_index() -> (VolumeIndex, usize) {
             }
         }
     }
+    // What the daemon's bootstrap ends with: the name order a name-sorted
+    // query pages from.
+    idx.optimize_storage();
     (idx, count)
 }
 
@@ -122,6 +125,51 @@ fn bench_query(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    // Path terms and path wildcards match the full path, which the index does
+    // not store, so they cannot drive the folded-name scan. `module_group_007`
+    // plays `system32`: a folder name repeated across the volume, each copy
+    // holding a modest subtree.
+    let mut path = c.benchmark_group("query_2M_path");
+    path.sample_size(10);
+    for (label, query) in [
+        (
+            r"path-only(module_group_007\bin_x64_03)",
+            r"module_group_007\bin_x64_03",
+        ),
+        (
+            r"path+rare(module_group_007\ kernel32)",
+            r"module_group_007\ kernel32",
+        ),
+        (
+            r"path+broad(module_group_007\ report)",
+            r"module_group_007\ report",
+        ),
+        (
+            r"absolute(C:\amd64...005...\subcomponent_003)",
+            r"C:\amd64_microsoft-windows-component-005_31bf3856ad364e35_10.0.26100.1_none_deadbeef\subcomponent_003",
+        ),
+        (r"wildcard(*\bin_x64_05\*.dll)", r"*\bin_x64_05\*.dll"),
+        (r"broad-path(_none_deadbeef\)", r"_none_deadbeef\"),
+        (r"drive-only(C:\)", r"C:\"),
+    ] {
+        let parsed = parse_query(query).unwrap();
+        path.bench_function(label, |b| {
+            b.iter(|| {
+                let out = run_query(
+                    black_box(&idx),
+                    r"C:\",
+                    black_box(&parsed),
+                    None,
+                    SortSpec::default(),
+                    0,
+                    Some(100),
+                );
+                black_box(out.total)
+            })
+        });
+    }
+    path.finish();
 
     // Broad limit=None: reconstructs and sorts the ENTIRE match set (~2M paths),
     // the "dump everything" workload (export / `goz foo | wc`) where path
