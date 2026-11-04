@@ -330,6 +330,9 @@ fn tail_loop(
                     Some(c) => {
                         start_usn = c.next_usn;
                         journal_id = c.journal_id;
+                        failing_since = None;
+                        backoff = RETRY_BACKOFF_MIN;
+                        degraded = false;
                     }
                     None => return,
                 }
