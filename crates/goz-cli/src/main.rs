@@ -66,17 +66,25 @@ fn main() -> ExitCode {
     }
 }
 
-/// Writes `text` to stdout. A reader closing early (`goz --help | more`) is a
-/// clean stop; a genuine write failure reports exit 5.
+/// Writes `text` to stdout, with the exit code [`output_failed`] gives a
+/// failed write.
 fn print(text: &str) -> ExitCode {
     let mut out = std::io::stdout().lock();
     match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
-        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
-            eprintln!("goz: writing to stdout failed: {e}");
-            Exit::WriteFailed.into()
-        }
-        _ => Exit::Success.into(),
+        Ok(()) => Exit::Success.into(),
+        Err(e) => output_failed(&e, "to stdout"),
     }
+}
+
+/// The exit code for output that could not be written `to` a destination
+/// such as `to stdout`. A reader closing early (`goz --help | more`) is a
+/// clean stop; any other failure is reported and exits 5.
+fn output_failed(error: &std::io::Error, to: &str) -> ExitCode {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        return Exit::Success.into();
+    }
+    eprintln!("goz: writing {to} failed: {error}");
+    Exit::WriteFailed.into()
 }
 
 #[cfg(not(windows))]
@@ -249,8 +257,7 @@ mod win {
         if let Some(mut file) = export_file {
             let bytes = render_csv(plan, results);
             if let Err(e) = file.write_all(&bytes) {
-                eprintln!("goz: writing export CSV failed: {e}");
-                return Err(Exit::WriteFailed.into());
+                return Err(super::output_failed(&e, "export CSV"));
             }
             return Ok(ExitCode::SUCCESS);
         }
@@ -258,11 +265,13 @@ mod win {
         if plan.json {
             match serde_json::to_string_pretty(results) {
                 Ok(s) => {
-                    // Locked writeln! that tolerates a broken pipe (`goz --json '*' | head`)
-                    // instead of println!, which panics on any stdout write error.
+                    // A locked writeln! instead of println!, which panics on any
+                    // stdout write error.
                     let stdout = std::io::stdout();
                     let mut out = stdout.lock();
-                    let _ = writeln!(out, "{s}");
+                    if let Err(e) = writeln!(out, "{s}").and_then(|()| out.flush()) {
+                        return Err(super::output_failed(&e, "results"));
+                    }
                 }
                 Err(e) => {
                     eprintln!("goz: JSON encoding failed: {e}");
@@ -274,24 +283,16 @@ mod win {
 
         // Default: one path per line. StdoutLock is a LineWriter (it flushes on every
         // newline), so wrap it in a BufWriter to batch a large result set into a few
-        // writes. A reader closing early (`goz * | head`) is a clean stop; a genuine
-        // write failure reports exit 5.
+        // writes.
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         for item in &results.items {
             if let Err(e) = writeln!(out, "{}", item.path) {
-                if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    return Ok(ExitCode::SUCCESS);
-                }
-                eprintln!("goz: writing results failed: {e}");
-                return Err(Exit::WriteFailed.into());
+                return Err(super::output_failed(&e, "results"));
             }
         }
-        if let Err(e) = out.flush()
-            && e.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            eprintln!("goz: writing results failed: {e}");
-            return Err(Exit::WriteFailed.into());
+        if let Err(e) = out.flush() {
+            return Err(super::output_failed(&e, "results"));
         }
         Ok(ExitCode::SUCCESS)
     }
@@ -312,8 +313,7 @@ mod win {
         }
         bytes.extend_from_slice(format!("{number}\r\n").as_bytes());
         if let Err(e) = file.write_all(&bytes) {
-            eprintln!("goz: writing export CSV failed: {e}");
-            return Err(Exit::WriteFailed.into());
+            return Err(super::output_failed(&e, "export CSV"));
         }
         Ok(ExitCode::SUCCESS)
     }
@@ -369,15 +369,11 @@ mod win {
     fn status(connection: &mut Client) -> Result<ExitCode, ExitCode> {
         match connection.request(&Request::Status) {
             Ok(Response::Status(s)) => {
-                // Locked write that tolerates a broken pipe (`goz --status | head`)
-                // instead of print!, which panics on any stdout write error.
-                let stdout = std::io::stdout();
-                let mut out = stdout.lock();
-                let _ = out.write_all(super::status::render(&s).as_bytes());
+                let code = super::print(&super::status::render(&s));
                 if s.volumes_incomplete {
                     eprintln!("goz: some volumes are not fully live");
                 }
-                Ok(ExitCode::SUCCESS)
+                Ok(code)
             }
             Ok(_) => {
                 eprintln!("goz: unexpected reply to status");
@@ -396,12 +392,7 @@ mod win {
             client: VERSION_LINE.to_owned(),
         };
         match connection.request(&hello) {
-            Ok(Response::Hello { server, .. }) => {
-                let stdout = std::io::stdout();
-                let mut out = stdout.lock();
-                let _ = writeln!(out, "{server}");
-                Ok(ExitCode::SUCCESS)
-            }
+            Ok(Response::Hello { server, .. }) => Ok(super::print(&format!("{server}\n"))),
             // A daemon that speaks another protocol refuses the Hello.
             Ok(Response::Error { message, .. }) => {
                 eprintln!("goz: {message}");
@@ -431,5 +422,29 @@ mod win {
                 Exit::Untrusted.into()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    /// `goz ... | head` closing the pipe early is not a failure.
+    #[test]
+    fn a_closed_reader_is_a_clean_stop() {
+        let closed = Error::from(ErrorKind::BrokenPipe);
+        assert_eq!(output_failed(&closed, "results"), ExitCode::SUCCESS);
+    }
+
+    /// Any other failed write, a full disk or a handle opened read only,
+    /// exits 5 rather than 0 with output missing.
+    #[test]
+    fn a_failed_write_exits_5() {
+        let denied = Error::from(ErrorKind::PermissionDenied);
+        assert_eq!(
+            output_failed(&denied, "to stdout"),
+            ExitCode::from(Exit::WriteFailed.code())
+        );
     }
 }
