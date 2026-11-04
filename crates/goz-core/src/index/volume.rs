@@ -114,10 +114,11 @@ pub struct IndexStats {
     /// Hard-link changes the daemon saw but could not reconcile.
     ///
     /// Reconciling walks the file's real link set from Win32 and applies it
-    /// (see [`VolumeIndex::reconcile_links`]). This counts only the walks that could
-    /// NOT complete (file gone, locked, or a parent not yet indexed): those
-    /// are skipped rather than reconciled to a partial set, so a few names may
-    /// be stale until the next rescan. Counted so the gap is visible in
+    /// (see [`VolumeIndex::reconcile_links`]). This counts the walks that could
+    /// NOT complete (one that failed or stopped part way, a file locked or
+    /// pending delete, or a link in a folder not indexed yet): those are
+    /// skipped rather than reconciled to a partial set, so a few names may be
+    /// stale until the next rescan. A file that is gone is not counted. Counted so the gap is visible in
     /// `Status` rather than silent.
     pub link_reconciles_dropped: u64,
 }

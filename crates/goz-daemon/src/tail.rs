@@ -12,9 +12,11 @@
 //! Hard links are reconciled out of band: a `HARD_LINK_CHANGE` record names one
 //! link and may name a dead one, so the real set comes from a Win32 link walk
 //! (`goz_winfs::link_paths`) fed to `VolumeIndex::reconcile_links`. A walk that
-//! cannot be resolved is skipped, never applied as an empty set (which would
-//! delete a live file), and counted as `IndexStats::link_reconciles_dropped` so
-//! `--status` shows it rather than hiding it.
+//! fails, even part way, or names a folder the index does not hold yet, is
+//! skipped, never applied as a partial set (which would delete the links it
+//! missed), and counted as `IndexStats::link_reconciles_dropped` so `--status`
+//! shows it rather than hiding it. A file that is gone is left to its delete
+//! record.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -502,8 +504,8 @@ fn reconcile_links(
         pulse.beat();
         let links = match goz_winfs::link_paths(handle, frn.0) {
             Ok(Some(l)) if !l.is_empty() => l,
-            // Gone, locked, or unwalkable: leave the entry alone. The structural
-            // delete, if there was one, already arrived through the journal.
+            // Gone: its delete record removes it. (A walk always holds the
+            // name it started from, so an empty set never reaches here.)
             Ok(_) => continue,
             Err(e) => {
                 tracing::debug!(volume = %state.mount_prefix(), frn = frn.0, error = %e, "link walk failed");
