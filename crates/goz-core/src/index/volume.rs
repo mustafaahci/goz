@@ -11,7 +11,8 @@
 //!   so the same logical change reappears; applying a batch twice equals
 //!   applying it once.
 //! - Orphans are never dropped. An unknown parent becomes a placeholder under
-//!   lost+found, filled in when the parent's real record arrives.
+//!   lost+found, filled in when the parent's real record arrives, and a removed
+//!   folder's children move there until their own records re-parent them.
 //! - Slot reuse can never alias. The FRN map is keyed by record number and
 //!   every hit is re-checked against the full FRN (sequence included).
 
@@ -91,6 +92,9 @@ pub enum PathStatus {
     /// The hop cap was hit: corrupt/raced parent links; the volume should
     /// rescan rather than trust this path.
     CycleDetected,
+    /// The entry was removed. Only an index held across changes, such as the
+    /// daemon's cached `-path` scope, can name one.
+    Removed,
 }
 
 /// A non-fatal irregularity observed during apply, counted for diagnostics.
@@ -192,14 +196,6 @@ pub struct VolumeIndex {
     by_frn: FrnMap,
     root: EntryIdx,
     lost_found: EntryIdx,
-    /// Placeholders currently alive, i.e. parents synthesized under lost+found
-    /// because their real record has not arrived. While this is zero, nothing in
-    /// the index is an orphan and every entry reconstructs to a real path.
-    ///
-    /// Exists to keep the query engine's presentability filter off the hot path:
-    /// on a healthy index the filter is a single load, not a parent walk per
-    /// candidate directory.
-    live_placeholders: u64,
     generation: u64,
     stats: IndexStats,
     /// Entries structurally mutated since the last [`Self::take_write_count`].
@@ -259,7 +255,6 @@ impl VolumeIndex {
             by_frn: frn_map,
             root,
             lost_found,
-            live_placeholders: 0,
             generation: 0,
             stats: IndexStats::default(),
             dirty: 0,
@@ -272,11 +267,12 @@ impl VolumeIndex {
 
     /// Whether any entry could fail to reconstruct to a real path.
     ///
-    /// False means no placeholder is alive, so nothing sits under lost+found and
-    /// every entry is presentable. The query engine uses this to skip its
-    /// per-directory presentability walk entirely on a healthy index.
+    /// False means nothing sits under lost+found (no placeholder for a parent
+    /// whose record has not arrived, no child of a removed folder), so every
+    /// entry is presentable. The query engine uses this single load to skip
+    /// its per-directory presentability walk entirely on a healthy index.
     pub fn has_orphans(&self) -> bool {
-        self.live_placeholders > 0
+        self.entries.first_child(self.lost_found) != NIL
     }
 
     pub fn root(&self) -> EntryIdx {
@@ -507,6 +503,10 @@ impl VolumeIndex {
     /// Appends `dir\dir\name` (no volume/mount prefix) for `idx` into `out` as
     /// WTF-8, returning how the walk terminated.
     pub fn path_of(&self, idx: EntryIdx, out: &mut Vec<u8>) -> PathStatus {
+        // A live entry's parent is always live, so only the start can be dead.
+        if self.entries.is_tombstone(idx) {
+            return PathStatus::Removed;
+        }
         let mut chain: SmallVec<[EntryIdx; 32]> = SmallVec::new();
         let mut cur = idx;
         for _ in 0..MAX_PATH_HOPS {
@@ -694,11 +694,6 @@ impl VolumeIndex {
             self.entries.set_prev_child(old_head, idx);
         }
         self.entries.set_first_child(parent, idx);
-        let flags = self.entries.flags(idx);
-        if flags.contains(EntryFlags::CHAIN_DETACHED) {
-            self.entries
-                .set_flags(idx, flags.with(EntryFlags::CHAIN_DETACHED, false));
-        }
     }
 
     /// O(1) removal from the parent's child chain. Must run BEFORE the
@@ -707,12 +702,6 @@ impl VolumeIndex {
     fn unlink_child(&mut self, idx: EntryIdx) {
         let parent = self.entries.parent(idx);
         if parent == NIL {
-            return;
-        }
-        // A severed entry is in NO chain; its parent slot may have been
-        // reused by an unrelated entry, so touching that slot's chain head
-        // here would corrupt the new tenant's children.
-        if self.entries.flags(idx).contains(EntryFlags::CHAIN_DETACHED) {
             return;
         }
         let prev = self.entries.prev_child(idx);
@@ -729,25 +718,38 @@ impl VolumeIndex {
         self.entries.set_prev_child(idx, NIL);
     }
 
-    /// Detaches every chained child of a directory that is about to be
-    /// tombstoned with its children still live (a missed delete followed by
-    /// record reuse). The children keep their dangling parent pointer, the
-    /// existing semantics (they resolve under lost+found once the slot's new
-    /// tenant is a placeholder, and their own records re-parent them), but
-    /// they leave the chain world entirely until relinked, so no later
-    /// mutation can cross-link a reused slot's chain.
-    fn sever_children(&mut self, dir: EntryIdx) {
+    /// Moves every child of a directory that is being removed under
+    /// lost+found. A removed directory still has children only after a missed
+    /// record (a child's delete or move, or the directory's own delete before
+    /// NTFS gave its record to another file) or while a hard link in it waits
+    /// for its link walk. Moving them keeps every live entry's parent live, so
+    /// no path runs through a freed slot or the entry that reuses it. They have
+    /// no full path until their own records re-parent them.
+    fn orphan_children(&mut self, dir: EntryIdx) {
         let mut cur = self.entries.first_child(dir);
         while cur != NIL {
             let next = self.entries.next_child(cur);
-            self.entries.set_next_child(cur, NIL);
-            self.entries.set_prev_child(cur, NIL);
-            let flags = self.entries.flags(cur);
-            self.entries
-                .set_flags(cur, flags.with(EntryFlags::CHAIN_DETACHED, true));
+            self.dir_index_remove(cur); // keyed under `dir`
+            self.entries.set_parent(cur, self.lost_found);
+            self.link_child(cur);
+            self.dir_index_insert(cur);
+            self.dirty += 1;
             cur = next;
         }
         self.entries.set_first_child(dir, NIL);
+    }
+
+    /// Removes one entry: takes it out of the scope index and both chains,
+    /// moves its children under lost+found, releases its name and frees its
+    /// slot. The one removal path, so the order cannot drift between callers.
+    fn remove_entry(&mut self, idx: EntryIdx) {
+        self.dir_index_remove(idx); // while the name and parent are readable
+        self.unlink_same_name(idx);
+        self.unlink_child(idx);
+        self.orphan_children(idx);
+        self.names.release(self.entries.name_id(idx));
+        self.entries.tombstone(idx);
+        self.dirty += 1;
     }
 
     /// O(1) removal from the doubly-linked same-name chain. Must run BEFORE
@@ -872,7 +874,6 @@ impl VolumeIndex {
         self.unlink_child(idx);
         self.entries.set_parent(idx, parent_idx);
         self.link_child(idx);
-        let was_placeholder = self.entries.flags(idx).contains(EntryFlags::PLACEHOLDER);
         let flags = self
             .entries
             .flags(idx)
@@ -880,10 +881,6 @@ impl VolumeIndex {
             .with(EntryFlags::NON_UNICODE_NAME, name_lossy)
             .with(EntryFlags::PLACEHOLDER, false);
         self.entries.set_flags(idx, flags);
-        if was_placeholder {
-            // The real record arrived and moved it out of lost+found.
-            self.live_placeholders = self.live_placeholders.saturating_sub(1);
-        }
         self.dir_index_insert(idx);
         self.dirty += 1;
     }
@@ -935,7 +932,6 @@ impl VolumeIndex {
         self.link_child(idx);
         self.by_frn.set(record, idx);
         self.stats.placeholders_created += 1;
-        self.live_placeholders += 1;
         self.dirty += 1;
         idx
     }
@@ -957,16 +953,7 @@ impl VolumeIndex {
         let mut cur = head;
         while cur != NIL {
             let next = self.entries.next_link(cur);
-            if self.entries.flags(cur).contains(EntryFlags::PLACEHOLDER) {
-                self.live_placeholders = self.live_placeholders.saturating_sub(1);
-            }
-            self.dir_index_remove(cur); // while the name/parent are still readable
-            self.unlink_same_name(cur);
-            self.unlink_child(cur);
-            self.sever_children(cur);
-            self.names.release(self.entries.name_id(cur));
-            self.entries.tombstone(cur);
-            self.dirty += 1;
+            self.remove_entry(cur);
             cur = next;
         }
     }
@@ -1069,13 +1056,7 @@ impl VolumeIndex {
         // Tombstone entries that no desired link matched.
         for (i, &e) in current.iter().enumerate() {
             if !used[i] {
-                self.dir_index_remove(e);
-                self.unlink_same_name(e);
-                self.unlink_child(e);
-                self.sever_children(e);
-                self.names.release(self.entries.name_id(e));
-                self.entries.tombstone(e);
-                self.dirty += 1;
+                self.remove_entry(e);
             }
         }
 
@@ -1367,7 +1348,7 @@ impl VolumeIndex {
         let mut want: FxHashMap<EntryIdx, FxHashSet<EntryIdx>> = FxHashMap::default();
         for idx in self.entries.iter_live() {
             let p = self.entries.parent(idx);
-            if p != NIL && !self.entries.flags(idx).contains(EntryFlags::CHAIN_DETACHED) {
+            if p != NIL {
                 want.entry(p).or_default().insert(idx);
             }
         }
@@ -1385,6 +1366,16 @@ impl VolumeIndex {
             }
         }
         want.is_empty()
+    }
+
+    /// Every live entry's parent is live (or NIL for the root and
+    /// lost+found), so no path walk ever reads a freed slot.
+    #[cfg(test)]
+    pub fn parents_are_live(&self) -> bool {
+        self.entries.iter_live().all(|idx| {
+            let p = self.entries.parent(idx);
+            p == NIL || !self.entries.is_tombstone(p)
+        })
     }
 
     /// The invariant the same-name chains must uphold: walking every name's

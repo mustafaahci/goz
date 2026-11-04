@@ -687,11 +687,6 @@ impl EntryFlags {
     pub const PLACEHOLDER: EntryFlags = EntryFlags(1 << 3);
     /// The name contained unpaired UTF-16 surrogates (WTF-8, not UTF-8).
     pub const NON_UNICODE_NAME: EntryFlags = EntryFlags(1 << 4);
-    /// Not a member of its parent's child chain: the parent's slot was
-    /// reclaimed (stale record reuse) while this entry still pointed at it,
-    /// so the entry was severed rather than left to cross-link a reused
-    /// slot's chain. Cleared when a rename relinks it under a real parent.
-    pub const CHAIN_DETACHED: EntryFlags = EntryFlags(1 << 5);
 
     pub const EMPTY: EntryFlags = EntryFlags(0);
 
@@ -720,7 +715,6 @@ impl core::fmt::Debug for EntryFlags {
             (Self::LOST_FOUND, "LOST_FOUND"),
             (Self::PLACEHOLDER, "PLACEHOLDER"),
             (Self::NON_UNICODE_NAME, "NON_UNICODE_NAME"),
-            (Self::CHAIN_DETACHED, "CHAIN_DETACHED"),
         ] {
             if self.contains(bit) {
                 parts.push(name);
@@ -818,12 +812,17 @@ impl EntryTable {
     }
 
     /// Marks a slot dead and pushes it on the free list. The caller must have
-    /// already unlinked the entry from its same-name chain and released its
-    /// name.
+    /// already unlinked the entry from its same-name chain, moved its
+    /// children out and released its name.
     pub(crate) fn tombstone(&mut self, idx: EntryIdx) {
         let i = idx as usize;
         debug_assert!(!self.flags[i].contains(EntryFlags::TOMBSTONE));
         self.flags[i] = EntryFlags::TOMBSTONE;
+        // A dead slot keeps no link into the tree or the name store: its
+        // parent may die too, and a compaction gives its name id to another
+        // name or to none.
+        self.parent[i] = NIL;
+        self.name_id[i] = NIL;
         self.next_link[i] = NIL;
         self.next_same[i] = NIL;
         self.prev_same[i] = NIL;

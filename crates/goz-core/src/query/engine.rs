@@ -853,8 +853,8 @@ fn evaluate(
     //
     // Calls the very function the page loop uses rather than re-deriving its
     // rules, so the two cannot drift, and memoizes per parent directory rather
-    // than per file. Gated on `has_orphans` because an index with no live
-    // placeholder cannot contain an unpresentable entry: `has_orphans` is a
+    // than per file. Gated on `has_orphans` because an index with nothing
+    // under lost+found cannot contain an unpresentable entry: `has_orphans` is a
     // single load, while the walk it guards is one `path_of` per distinct parent
     // directory, which on a broad limited query is tens of thousands of walks
     // the page (100 rows) would never have needed. Paying it unconditionally
@@ -1686,6 +1686,57 @@ mod tests {
                 .map(|h| crate::wtf8::to_string_lossy(&h.path))
                 .collect();
             prop_assert_eq!(engine, oracle(&uniq, &terms));
+        }
+    }
+
+    /// A child of a removed folder has no full path. The name-level page
+    /// trusts each name's refcount only while `has_orphans` is false, so the
+    /// child used to be counted and shown under the folder's zero-filled
+    /// name, and once a compaction ran its page panicked.
+    #[test]
+    fn child_of_a_removed_folder_is_neither_counted_nor_shown() {
+        let root = NTFS_ROOT_FRN;
+        let delete = |f: Frn| {
+            let mut rec = enum_rec(f, root, "", false);
+            rec.reason = USN_REASON_FILE_DELETE;
+            rec
+        };
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        let mut recs: Vec<_> = (0..400)
+            .map(|i| enum_rec(frn(1000 + i), root, &format!("{i:040}"), false))
+            .collect();
+        recs.push(enum_rec(frn(100), root, "docs", true));
+        recs.push(enum_rec(frn(101), frn(100), "orphan.log", false));
+        recs.push(enum_rec(frn(102), root, "real.log", false));
+        idx.apply_batch(&recs);
+        idx.optimize_storage();
+        // orphan.log's own delete is missed.
+        let dels: Vec<_> = (0..400)
+            .map(|i| delete(frn(1000 + i)))
+            .chain([delete(frn(100))])
+            .collect();
+        idx.apply_batch(&dels);
+        let plan = idx.plan_compaction().expect("garbage");
+        idx.apply_compaction(plan);
+
+        let parsed = parse_query("log").unwrap();
+        for key in [SortKey::Name, SortKey::Path] {
+            let out = run_query(
+                &idx,
+                r"C:\",
+                &parsed,
+                None,
+                SortSpec::default_for(key),
+                0,
+                Some(10),
+            );
+            let paths: Vec<String> = out
+                .hits
+                .iter()
+                .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                .collect();
+            assert_eq!(paths, ["real.log"], "{key:?}");
+            assert_eq!(out.total, 1, "{key:?}");
         }
     }
 }

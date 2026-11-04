@@ -825,6 +825,7 @@ proptest! {
                 prop_assert!(idx.dir_index_matches_rebuild(), "dir index drifted after apply");
                 prop_assert!(idx.name_chains_match_rebuild(), "name chains drifted after apply");
                 prop_assert!(idx.child_chains_match_rebuild(), "child chains drifted after apply");
+                prop_assert!(idx.parents_are_live(), "a live entry's parent died after apply");
                 prop_assert!(idx.name_order_matches_rebuild(), "name order drifted after apply");
                 prop_assert!(idx.name_refcounts_match_chains(), "refcounts drifted after apply");
                 idx.apply_batch(std::slice::from_ref(&rec)); // idempotent replay
@@ -832,6 +833,7 @@ proptest! {
                 prop_assert!(idx.dir_index_matches_rebuild(), "dir index drifted after replay");
                 prop_assert!(idx.name_chains_match_rebuild(), "name chains drifted after replay");
                 prop_assert!(idx.child_chains_match_rebuild(), "child chains drifted after replay");
+                prop_assert!(idx.parents_are_live(), "a live entry's parent died after replay");
                 prop_assert!(idx.name_order_matches_rebuild(), "name order drifted after replay");
                 prop_assert!(idx.name_refcounts_match_chains(), "refcounts drifted after replay");
             }
@@ -911,6 +913,7 @@ proptest! {
         idx.force_name_merge();
         prop_assert!(idx.name_order_matches_rebuild(), "name order drifted after a merge");
         prop_assert!(idx.child_chains_match_rebuild(), "child chains drifted after bootstrap race");
+        prop_assert!(idx.parents_are_live(), "a live entry's parent died after bootstrap race");
     }
 }
 
@@ -1072,4 +1075,177 @@ fn name_order_tracks_interns_merges_deletes_and_compaction() {
     );
     assert!(idx.name_refcounts_match_chains());
     assert!(idx.name_chains_match_rebuild());
+}
+
+// -- removed entries -----------------------------------------------------
+
+/// Every structural invariant the proptests assert, plus live parents.
+fn assert_whole(idx: &VolumeIndex) {
+    assert!(
+        idx.parents_are_live(),
+        "a live entry points at a freed slot"
+    );
+    assert!(idx.dir_index_matches_rebuild(), "dir index drifted");
+    assert!(idx.child_chains_match_rebuild(), "child chains drifted");
+    assert!(idx.name_chains_match_rebuild(), "name chains drifted");
+    assert!(idx.name_refcounts_match_chains(), "refcounts drifted");
+    assert!(idx.name_order_matches_rebuild(), "name order drifted");
+}
+
+/// The daemon caches the entry of the last `-path` folder and checks it with
+/// `path_of` on the next query. A removed entry kept its name id, which a
+/// compaction gives to another name or to none, so the check built a wrong
+/// path or panicked.
+#[test]
+fn removed_entry_has_no_path_after_compaction() {
+    let mut idx = new_index();
+    let mut batch: Vec<_> = (0..400)
+        .map(|i| create(frn(1000 + i), root_frn(), &format!("{i:040}"), false))
+        .collect();
+    batch.push(create(frn(100), root_frn(), "proj", true));
+    idx.apply_batch(&batch);
+    let proj = idx.head_of(frn(100)).unwrap();
+
+    let deletes: Vec<_> = (0..400)
+        .map(|i| delete(frn(1000 + i)))
+        .chain([delete(frn(100))])
+        .collect();
+    idx.apply_batch(&deletes);
+    assert_eq!(idx.path_of(proj, &mut Vec::new()), PathStatus::Removed);
+    let plan = idx
+        .plan_compaction()
+        .expect("every deleted name is garbage");
+    idx.apply_compaction(plan);
+
+    assert_eq!(idx.path_of(proj, &mut Vec::new()), PathStatus::Removed);
+    assert_whole(&idx);
+}
+
+/// A folder can be removed while a child is still indexed, because the
+/// child's own delete was missed. The child kept pointing at the folder's
+/// freed slot, so the next entry in that slot showed the child under its own
+/// path, and `-path` resolved the child as that entry's subfolder.
+#[test]
+fn children_of_a_removed_folder_move_to_lost_found() {
+    let mut idx = index_from_enum(&[
+        create(frn(100), root_frn(), "old", true),
+        create(frn(101), frn(100), "sub", true),
+    ]);
+    // The delete of `sub` is missed; `old` goes, and `new` reuses its slot.
+    idx.apply_batch(&[delete(frn(100)), create(frn(102), root_frn(), "new", true)]);
+    let new = idx.head_of(frn(102)).unwrap();
+    assert_eq!(path_set(&idx), BTreeSet::from(["new".to_string()]));
+    assert_eq!(idx.child_dir(new, b"sub".to_vec()), None);
+    assert!(
+        idx.has_orphans(),
+        "queries must check for entries without a path"
+    );
+    assert_whole(&idx);
+
+    // The child's own record re-parents it.
+    idx.apply_batch(&[rename(frn(101), frn(102), "sub", true)]);
+    assert_eq!(
+        path_set(&idx),
+        BTreeSet::from(["new".to_string(), r"new\sub".to_string()])
+    );
+    assert_eq!(idx.child_dir(new, b"sub".to_vec()), idx.head_of(frn(101)));
+    assert!(!idx.has_orphans());
+    assert_whole(&idx);
+}
+
+/// Before its slot was reused, a child of a removed folder had an `Ok` path
+/// spelled with the folder's zero-filled name, and after a compaction the
+/// same walk read a name id past the end of the name table and panicked:
+/// for any query that hit the child, not only a `-path` one.
+#[test]
+fn child_of_a_removed_folder_survives_a_compaction() {
+    let mut idx = new_index();
+    let mut batch: Vec<_> = (0..400)
+        .map(|i| create(frn(1000 + i), root_frn(), &format!("{i:040}"), false))
+        .collect();
+    batch.push(create(frn(100), root_frn(), "old", true));
+    batch.push(create(frn(101), frn(100), "sub", true));
+    batch.push(create(frn(102), frn(101), "a.txt", false));
+    idx.apply_batch(&batch);
+    let deletes: Vec<_> = (0..400)
+        .map(|i| delete(frn(1000 + i)))
+        .chain([delete(frn(100))]) // the deletes of sub and a.txt are missed
+        .collect();
+    idx.apply_batch(&deletes);
+    assert_eq!(path_of_frn(&idx, frn(101)), None);
+    assert!(path_set(&idx).is_empty(), "{:?}", path_set(&idx));
+
+    let plan = idx
+        .plan_compaction()
+        .expect("every deleted name is garbage");
+    idx.apply_compaction(plan);
+    let sub = idx.head_of(frn(101)).unwrap();
+    assert_eq!(idx.path_of(sub, &mut Vec::new()), PathStatus::InLostFound);
+    assert_eq!(path_of_frn(&idx, frn(102)), None);
+    assert!(idx.has_orphans());
+    assert_whole(&idx);
+}
+
+/// A folder's record is reused while a file still points at it: the file
+/// used to land under the placeholder that took the slot, and once that
+/// placeholder's real record arrived it showed inside an unrelated folder.
+#[test]
+fn a_stale_child_never_shows_under_the_slots_next_tenant() {
+    let mut idx = new_index();
+    idx.insert_enum(&create(frn_seq(100, 3), root_frn(), "olddir", true));
+    idx.insert_enum(&create(frn(200), frn_seq(100, 3), "ghost.txt", false));
+    idx.apply_batch(&[create(frn(201), frn_seq(100, 4), "new.txt", false)]);
+    idx.apply_batch(&[create(frn_seq(100, 4), root_frn(), "newdir", true)]);
+    assert_eq!(
+        path_set(&idx),
+        BTreeSet::from(["newdir".to_string(), r"newdir\new.txt".to_string()])
+    );
+    assert!(idx.has_orphans(), "ghost.txt waits under lost+found");
+    assert_whole(&idx);
+}
+
+/// A hard link in a folder that is removed before the link walk runs (the
+/// usual order: the link's HARD_LINK_CHANGE is queued, the folder's delete
+/// applies in the same batch) waits under lost+found, and the walk that
+/// follows removes it and leaves no orphan behind.
+#[test]
+fn hard_link_in_a_removed_folder_waits_for_its_walk() {
+    let mut idx = index_from_enum(&[
+        create(frn(10), root_frn(), "a", true),
+        create(frn(11), root_frn(), "b", true),
+        create(frn(100), frn(10), "x.txt", false),
+    ]);
+    let a = idx.head_of(frn(10)).unwrap();
+    let b = idx.head_of(frn(11)).unwrap();
+    idx.reconcile_links(
+        frn(100),
+        &[
+            LinkTarget {
+                parent: a,
+                name: WtfName::new(b"x.txt".to_vec(), false),
+            },
+            LinkTarget {
+                parent: b,
+                name: WtfName::new(b"x.txt".to_vec(), false),
+            },
+        ],
+    );
+    idx.apply_batch(&[delete(frn(11)), create(frn(12), root_frn(), "c", true)]);
+    assert_eq!(
+        path_set(&idx),
+        BTreeSet::from(["a", r"a\x.txt", "c"].map(String::from)),
+        "the link must not show under c, which took b's slot"
+    );
+    assert!(idx.has_orphans());
+    assert_whole(&idx);
+
+    idx.reconcile_links(
+        frn(100),
+        &[LinkTarget {
+            parent: a,
+            name: WtfName::new(b"x.txt".to_vec(), false),
+        }],
+    );
+    assert!(!idx.has_orphans(), "the walk empties lost+found again");
+    assert_whole(&idx);
 }

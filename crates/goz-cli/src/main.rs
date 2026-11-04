@@ -309,7 +309,7 @@ mod win {
                     if v.has_orphans {
                         let _ = writeln!(
                             out,
-                            "           orphans: entries whose parent never arrived sit under lost+found; queries pay a presentability walk"
+                            "           orphans: entries without a full path (a parent never arrived, or its folder was removed first) sit under lost+found; queries pay a presentability walk"
                         );
                     }
                     if v.names_waiting > 0 {

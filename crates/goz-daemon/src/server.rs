@@ -1548,4 +1548,85 @@ mod tests {
         assert!(!starts_with_ci("C:", r"C:\"));
         assert!(!starts_with_ci(r"D:\x", r"C:\"));
     }
+
+    fn file_record(frn: u64, parent: u64, name: &str) -> ParsedUsnRecord {
+        let mut rec = dir_record(frn, parent, name);
+        rec.attributes = 0;
+        rec
+    }
+
+    fn delete_record(frn: u64) -> ParsedUsnRecord {
+        let mut rec = file_record(frn, NTFS_ROOT_FRN.0, "");
+        rec.reason = goz_core::usn::record::USN_REASON_FILE_DELETE;
+        rec
+    }
+
+    fn scoped(q: &str, scope: &str) -> goz_core::proto::QueryRequest {
+        goz_core::proto::QueryRequest {
+            scope: Some(scope.to_string()),
+            ..query(q)
+        }
+    }
+
+    /// The scope cache keeps the entry of the last `-path` folder across
+    /// journal batches and compactions. Once that folder was removed, its slot
+    /// still held the old name id: after a compaction the id was past the end
+    /// of the name table and the next search of the folder panicked, or it
+    /// named the folder's own new copy, so the dead slot validated and the
+    /// search returned nothing.
+    #[test]
+    fn a_removed_scope_folder_is_resolved_again_after_a_compaction() {
+        // Panic shape: "proj" is the newest name, then every name but the
+        // volume's own dies.
+        let mut index = windows_index();
+        let mut batch: Vec<_> = (0..400)
+            .map(|i| file_record(1000 + i, NTFS_ROOT_FRN.0, &format!("{i:040}")))
+            .collect();
+        batch.push(dir_record(200, NTFS_ROOT_FRN.0, "proj"));
+        index.apply_batch(&batch);
+        let vol = volume(r"C:\", index, VolumePhase::Live);
+        let vols = set(std::slice::from_ref(&vol));
+        encode_query_binary(&vols, scoped("inside", r"C:\proj"));
+        assert!(vol.scope_cache.lock().is_some());
+        {
+            let mut index = vol.index.write();
+            let dels: Vec<_> = (0..400)
+                .map(|i| delete_record(1000 + i))
+                .chain([delete_record(200)])
+                .collect();
+            index.apply_batch(&dels);
+            let plan = index.plan_compaction().expect("garbage");
+            index.apply_compaction(plan);
+        }
+        let pages = results(&encode_query_binary(&vols, scoped("inside", r"C:\proj")));
+        assert_eq!(pages[0].total, 0, "the folder is gone");
+
+        // Wrong-result shape: proj is removed and made again in another
+        // slot, and the compaction gives the new "proj" the dead slot's id.
+        let mut index = windows_index(); // ids 0 "", 1 $LostFound, 2-3 the tree
+        let mut batch = vec![
+            file_record(150, NTFS_ROOT_FRN.0, "keep.txt"), // id 4
+            dir_record(200, NTFS_ROOT_FRN.0, "proj"),      // id 5
+        ];
+        batch.extend((0..400).map(|i| file_record(1000 + i, NTFS_ROOT_FRN.0, &format!("{i:040}"))));
+        index.apply_batch(&batch);
+        let vol = volume(r"C:\", index, VolumePhase::Live);
+        let vols = set(std::slice::from_ref(&vol));
+        encode_query_binary(&vols, scoped("inside", r"C:\proj"));
+        let cached = vol.scope_cache.lock().as_ref().unwrap().entry;
+        {
+            let mut index = vol.index.write();
+            let mut recs = vec![delete_record(200)];
+            recs.extend((0..400).map(|i| delete_record(1000 + i)));
+            recs.push(dir_record(300, NTFS_ROOT_FRN.0, "proj"));
+            recs.push(file_record(301, 300, "inside.txt"));
+            index.apply_batch(&recs);
+            assert_ne!(index.head_of(Frn(300)), Some(cached), "fixture: a new slot");
+            let plan = index.plan_compaction().expect("garbage");
+            index.apply_compaction(plan);
+            assert!(!scope_entry_valid(&index, cached, b"proj"));
+        }
+        let pages = results(&encode_query_binary(&vols, scoped("inside", r"C:\proj")));
+        assert_eq!(pages[0].total, 1, "the new proj's file is found");
+    }
 }
