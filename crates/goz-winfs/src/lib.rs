@@ -22,6 +22,8 @@ mod cancel_io;
 #[cfg(windows)]
 mod clock;
 #[cfg(windows)]
+mod device_notify;
+#[cfg(windows)]
 mod elevation;
 #[cfg(windows)]
 mod file_layout;
@@ -54,6 +56,8 @@ pub use error::WinError;
 pub use cancel_io::{ThreadIoHandle, cancel_synchronous_io, current_thread_io_handle};
 #[cfg(windows)]
 pub use clock::awake_time;
+#[cfg(windows)]
+pub use device_notify::{DeviceEvent, DeviceNotification};
 #[cfg(windows)]
 pub use time_zone::{TimeZone, first_day_of_week};
 #[cfg(windows)]
