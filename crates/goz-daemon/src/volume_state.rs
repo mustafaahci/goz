@@ -1,4 +1,4 @@
-//! Shared, thread-safe per-volume state.
+//! Shared, thread-safe per-volume state, and the registry of indexed volumes.
 //!
 //! The index lives behind a `parking_lot::RwLock`: the volume's tail thread
 //! takes the write lock for micro-batches of journal updates, while pipe-server
@@ -6,7 +6,10 @@
 //! `Send` but not `Sync`): it is moved into the tail thread, so `VolumeState`
 //! stays `Sync` and can be shared across the tokio runtime via `Arc`.
 
-use goz_core::index::VolumeIndex;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
 use goz_core::types::{EntryIdx, VolumePhase};
 use parking_lot::{Mutex, RwLock};
 
@@ -28,19 +31,40 @@ pub(crate) struct VolumeState {
     pub phase: RwLock<VolumePhase>,
     /// Whether the index's last build left sizes and dates unread (the
     /// FILE_LAYOUT pass stopped), so `-size`/`-dm` are unknown for some files.
-    /// Set at bootstrap and by every rescan.
+    /// Set by every build.
     pub metadata_pending: RwLock<bool>,
-    /// Maximum size of the volume's USN journal as of the index's last build
-    /// (bootstrap or rescan), `None` without a journal. Surfaced by `--status`
-    /// because the journal's size bounds how long a downtime can be replayed
-    /// instead of rescanned, and a journal that could not be grown was
-    /// invisible for months when only the log knew.
+    /// Maximum size of the volume's USN journal as of the index's last build,
+    /// `None` without a journal. Surfaced by `--status` because the journal's
+    /// size bounds how long a downtime can be replayed instead of rescanned,
+    /// and a journal that could not be grown was invisible for months when
+    /// only the log knew.
     pub journal_max_bytes: RwLock<Option<u64>>,
+    /// Whether an index has been built since the volume was found. A tail
+    /// started without a cursor reads it to tell a first build, which serves
+    /// the index even before the journal can be read, from a rebuild, which
+    /// waits for the journal.
+    pub indexed: AtomicBool,
     /// Memoized `-path` scope resolution (case-insensitive queries only).
     pub scope_cache: Mutex<Option<ScopeCache>>,
 }
 
 impl VolumeState {
+    /// A volume just found: an empty index, `Bootstrapping` until its tail
+    /// has built one. Served at once, so its results are flagged incomplete
+    /// rather than missing.
+    pub(crate) fn found(guid: String, mounts: Vec<String>) -> Self {
+        Self {
+            guid,
+            mounts,
+            index: RwLock::new(VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse())),
+            phase: RwLock::new(VolumePhase::Bootstrapping),
+            metadata_pending: RwLock::new(false),
+            journal_max_bytes: RwLock::new(None),
+            indexed: AtomicBool::new(false),
+            scope_cache: Mutex::new(None),
+        }
+    }
+
     /// The display prefix for paths on this volume (its first mount, e.g.
     /// `C:\`, or the GUID path if it has no drive letter).
     pub(crate) fn mount_prefix(&self) -> &str {
@@ -48,7 +72,87 @@ impl VolumeState {
     }
 }
 
-/// The set of indexed volumes. A plain `Arc<Vec<...>>` for v1 (the volume set
-/// only changes on hot-plug, which is post-v1); swap to `arc_swap::ArcSwap`
-/// when hot-plug lands.
-pub(crate) type VolumeSet = std::sync::Arc<Vec<std::sync::Arc<VolumeState>>>;
+/// The indexed volumes at one moment. A request works on one snapshot from
+/// start to end, so a volume found or removed meanwhile cannot change its
+/// answer halfway.
+pub(crate) type VolumeSet = Arc<Vec<Arc<VolumeState>>>;
+
+/// The indexed volumes as they change: the supervisor adds a volume when it
+/// is found and removes it when it is gone, and readers take a [`VolumeSet`]
+/// from [`VolumeRegistry::current`].
+///
+/// The lock guards only the swap, so a reader clones one `Arc` and no query
+/// runs under it. Adding appends and removing keeps the order of the rest, so
+/// two volumes never trade places between snapshots: a query read-locks the
+/// indexes of its volumes in snapshot order, and two queries taking them in
+/// opposite orders could deadlock behind a waiting tail writer.
+#[derive(Default)]
+pub(crate) struct VolumeRegistry(RwLock<VolumeSet>);
+
+impl VolumeRegistry {
+    /// The indexed volumes now.
+    pub(crate) fn current(&self) -> VolumeSet {
+        self.0.read().clone()
+    }
+
+    /// Indexes `volume` from the next snapshot on.
+    pub(crate) fn add(&self, volume: Arc<VolumeState>) {
+        let mut set = self.0.write();
+        let mut volumes = Vec::clone(&set);
+        volumes.push(volume);
+        *set = Arc::new(volumes);
+    }
+
+    /// Leaves the volume `guid` out of the next snapshot on.
+    pub(crate) fn remove(&self, guid: &str) {
+        let mut set = self.0.write();
+        let volumes = set.iter().filter(|v| v.guid != guid).cloned().collect();
+        *set = Arc::new(volumes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const C: &str = r"\\?\Volume{0000000c-0000-0000-0000-000000000000}\";
+    const D: &str = r"\\?\Volume{0000000d-0000-0000-0000-000000000000}\";
+    const E: &str = r"\\?\Volume{0000000e-0000-0000-0000-000000000000}\";
+
+    fn guids(set: &VolumeSet) -> Vec<&str> {
+        set.iter().map(|v| v.guid.as_str()).collect()
+    }
+
+    /// A volume is served the moment it is found, as a volume that is still
+    /// indexing: every result drawn from it is flagged incomplete until its
+    /// first build, and a tail started on it knows no index exists yet.
+    #[test]
+    fn a_found_volume_is_bootstrapping_until_its_first_build() {
+        let found = VolumeState::found(C.into(), vec![r"C:\".into()]);
+        assert_eq!(*found.phase.read(), VolumePhase::Bootstrapping);
+        assert!(!found.phase.read().is_complete());
+        assert!(!found.indexed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(found.mount_prefix(), r"C:\");
+    }
+
+    /// A snapshot taken before a change keeps answering as it was, and the
+    /// volumes that stay keep their order, which the page builder's lock
+    /// order relies on.
+    #[test]
+    fn snapshots_keep_their_volumes_and_the_order_survives_changes() {
+        let registry = VolumeRegistry::default();
+        for guid in [C, D, E] {
+            registry.add(Arc::new(VolumeState::found(guid.into(), Vec::new())));
+        }
+        let before = registry.current();
+
+        registry.remove(D);
+        assert_eq!(guids(&before), [C, D, E], "a taken snapshot never changes");
+        assert_eq!(guids(&registry.current()), [C, E]);
+
+        registry.add(Arc::new(VolumeState::found(D.into(), Vec::new())));
+        assert_eq!(guids(&registry.current()), [C, E, D]);
+        registry.remove("not indexed");
+        assert_eq!(guids(&registry.current()), [C, E, D]);
+    }
+}

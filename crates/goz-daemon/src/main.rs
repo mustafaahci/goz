@@ -167,7 +167,7 @@ fn run_scan(query: Option<String>) -> anyhow::Result<()> {
     }
 
     let started = Instant::now();
-    let scans = bootstrap::scan_all()?.ok;
+    let scans = bootstrap::scan_all()?;
     let total_entries: usize = scans
         .iter()
         .map(bootstrap::BootstrappedVolume::entries)

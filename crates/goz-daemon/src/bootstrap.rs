@@ -32,8 +32,7 @@ const JOURNAL_ALLOC_DELTA: u64 = 8 * 1024 * 1024;
 /// 1 MiB ioctl buffer: ~100 ENUM round-trips per million files.
 const IO_BUFFER_BYTES: usize = 1024 * 1024;
 
-/// A freshly bootstrapped volume: its index plus the retained volume handle
-/// and journal cursor the daemon needs to tail it live.
+/// A freshly bootstrapped volume, as `gozd scan` reports it.
 pub(crate) struct BootstrappedVolume {
     pub guid_path: String,
     pub mounts: Vec<String>,
@@ -41,14 +40,9 @@ pub(crate) struct BootstrappedVolume {
     /// ENUM pass duration; `Some` only when the FILE_LAYOUT pass stopped and
     /// the enumeration named the rest.
     pub enum_secs: Option<f64>,
-    /// The FILE_LAYOUT pass stopped part way, so the files ENUM named carry no
-    /// size or date.
-    pub metadata_pending: bool,
-    /// What the volume's journal setup got, which decides how it starts.
+    /// What the volume's journal setup got.
     pub journal: JournalSetup,
     pub index: VolumeIndex,
-    /// Kept open for the live tail (moved into the tail thread by the daemon).
-    pub handle: VolumeHandle,
 }
 
 impl BootstrappedVolume {
@@ -57,55 +51,39 @@ impl BootstrappedVolume {
     }
 }
 
-/// A volume that could not be bootstrapped, carried so the daemon can still
-/// represent it.
-///
-/// Skipping a failed volume silently is worse than reporting it Offline: every
-/// honesty signal (`--status`, `Hello.ready`, each page's `volumes_incomplete`)
-/// is computed by iterating the volume set, so a volume that was never inserted
-/// has no phase to be non-Live and is unreportable. A query scoped to it then
-/// returns zero hits with exit 0, indistinguishable from "no such file".
-pub(crate) struct FailedVolume {
-    pub guid_path: String,
-    pub mounts: Vec<String>,
-    pub reason: String,
-}
-
-/// Everything `scan_all` learned: the volumes it indexed, and the ones it could
-/// not. Both halves must reach the engine.
-pub(crate) struct Scan {
-    pub ok: Vec<BootstrappedVolume>,
-    pub failed: Vec<FailedVolume>,
-}
-
-/// Bootstraps every fixed NTFS volume. A volume that fails to bootstrap is
-/// reported and returned in `failed` rather than aborting the whole run, so one
-/// unreadable volume never hides the others' results and never disappears.
-pub(crate) fn scan_all() -> Result<Scan> {
+/// Enables the volume privileges, then lists every volume on the machine.
+pub(crate) fn list_volumes() -> Result<Vec<VolumeInfo>> {
     // The raw volume and journal reads need these privileges; if the process is
     // not elevated the open itself fails with a clear message, so a
     // privilege-enable failure here is only a warning.
     if let Err(e) = goz_winfs::enable_volume_privileges() {
         tracing::warn!(error = %e, "could not enable volume privileges; continuing");
     }
+    enumerate_volumes().context("enumerating volumes")
+}
 
-    let volumes = enumerate_volumes().context("enumerating volumes")?;
-    let targets: Vec<VolumeInfo> = volumes
-        .into_iter()
-        .filter(|v| v.is_fixed && v.is_ntfs)
-        .collect();
+/// Whether goz indexes `vol`: a fixed NTFS volume.
+pub(crate) fn indexable(vol: &VolumeInfo) -> bool {
+    vol.is_fixed && vol.is_ntfs
+}
+
+/// Bootstraps every fixed NTFS volume once, for `gozd scan`. A volume that
+/// fails is logged and left out rather than aborting the whole run.
+pub(crate) fn scan_all() -> Result<Vec<BootstrappedVolume>> {
+    let targets: Vec<VolumeInfo> = list_volumes()?.into_iter().filter(indexable).collect();
     if targets.is_empty() {
         bail!("no fixed NTFS volumes found");
     }
 
-    // One thread per volume. The MFT scans are independent, so a USB disk
-    // waking from spin-down or a second SSD no longer queues behind the
-    // largest volume (measured: the non-system volumes were 21% of a 36 s
-    // bootstrap, all of it now overlapped). Results are collected in
-    // enumeration order so the volume set is deterministic whichever thread
-    // finishes first. Two large partitions on one spinning disk would
-    // interleave their MFT reads; accepted, since such layouts are rare and
-    // the cost is bounded by the 1 MiB ioctl buffer per seek.
+    // One thread per volume, as the daemon's tails build them. The MFT scans
+    // are independent, so a USB disk waking from spin-down or a second SSD no
+    // longer queues behind the largest volume (measured: the non-system
+    // volumes were 21% of a 36 s bootstrap, all of it now overlapped).
+    // Results are collected in enumeration order so the report is
+    // deterministic whichever thread finishes first. Two large partitions on
+    // one spinning disk would interleave their MFT reads; accepted, since such
+    // layouts are rare and the cost is bounded by the 1 MiB ioctl buffer per
+    // seek.
     let results: Vec<Result<BootstrappedVolume>> = std::thread::scope(|s| {
         let threads: Vec<_> = targets
             .iter()
@@ -131,28 +109,20 @@ pub(crate) fn scan_all() -> Result<Scan> {
     });
 
     let mut ok = Vec::new();
-    let mut failed = Vec::new();
     for (vol, result) in targets.iter().zip(results) {
         match result {
             Ok(scan) => ok.push(scan),
-            Err(e) => {
-                tracing::error!(
-                    volume = %vol.guid_path,
-                    error = %format!("{e:#}"),
-                    "volume failed to bootstrap; it will be reported Failed and serve no results"
-                );
-                failed.push(FailedVolume {
-                    guid_path: vol.guid_path.clone(),
-                    mounts: vol.mounts.clone(),
-                    reason: format!("{e:#}"),
-                });
-            }
+            Err(e) => tracing::error!(
+                volume = %vol.guid_path,
+                error = %format!("{e:#}"),
+                "volume failed to bootstrap"
+            ),
         }
     }
     if ok.is_empty() {
         bail!("no volume could be bootstrapped (see the log for per-volume errors)");
     }
-    Ok(Scan { ok, failed })
+    Ok(ok)
 }
 
 /// Bootstraps a single volume: journal setup, then [`build_index`].
@@ -167,7 +137,7 @@ fn bootstrap_volume(vol: &VolumeInfo) -> Result<BootstrappedVolume> {
     // The journal is only needed for the live tail; a one-shot scan reads the
     // MFT directly, so an unavailable journal is not fatal here.
     let journal = ensure_journal(&handle, &vol.guid_path);
-    // First-time bootstrap passes no stop flag, so the rebuild can never abort.
+    // A one-shot scan passes no stop flag, so the build can never abort.
     let built = build_index(&handle, None)?.expect("build_index cannot abort without a stop flag");
 
     Ok(BootstrappedVolume {
@@ -175,10 +145,8 @@ fn bootstrap_volume(vol: &VolumeInfo) -> Result<BootstrappedVolume> {
         mounts: vol.mounts.clone(),
         layout_secs: built.layout_secs,
         enum_secs: built.enum_secs,
-        metadata_pending: built.metadata_pending,
         journal,
         index: built.index,
-        handle,
     })
 }
 
@@ -193,8 +161,8 @@ pub(crate) struct BuiltIndex {
 }
 
 /// Builds a fresh [`VolumeIndex`] for an already-open volume handle. Shared by
-/// first-time bootstrap and the live tail's rescan (after a USN journal
-/// wrap/deletion), which rebuilds the index on the handle it already owns.
+/// `gozd scan` and the live tail, whose first build and every rescan (after a
+/// USN journal wrap/deletion) run on the handle it already owns.
 /// Returns `None` when `stop` aborts the build. The journal is the caller's
 /// concern.
 ///

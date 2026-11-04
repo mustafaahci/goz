@@ -4,8 +4,10 @@
 //! is warm from boot for every user (admin or standard) with no per-session
 //! elevation. `uninstall` stops and removes it. `run` is the SCM entry point:
 //! Windows launches `gozd.exe run --service`, which hands the process to the
-//! service dispatcher and reports `StartPending` (with a heartbeat checkpoint,
-//! because bootstrap takes tens of seconds) → `Running` → `Stopped`.
+//! service dispatcher and reports `StartPending` (with a heartbeat checkpoint)
+//! → `Running` → `Stopped`. `Running` comes once the volumes are listed and the
+//! pipe is claimed, before any volume is indexed; results are flagged
+//! incomplete until each volume's first build is published.
 
 use std::ffi::OsString;
 use std::sync::mpsc;
@@ -241,8 +243,9 @@ fn run_service() -> Result<()> {
     // Stop signal: SCM control handler → async pipe server. `watch` retains the
     // last value, so a Stop that races ahead of the server is never lost.
     let (stop_tx, stop_rx) = watch::channel(false);
-    // Ready signal: engine thread → this thread once bootstrap finishes.
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<usize, String>>();
+    // Ready signal: engine thread → this thread once the pipe server is ready
+    // (see `server::run`), or why it never got there.
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
     // The status handle isn't available until `register` returns, but the
     // control handler (which fires only after startup) needs it. A OnceLock
@@ -273,7 +276,8 @@ fn run_service() -> Result<()> {
         .context("registering the service control handler")?;
     let _ = handle_cell.set(status_handle);
 
-    // Report StartPending right away; bootstrap can take tens of seconds.
+    // Report StartPending right away; listing the volumes can take a moment
+    // while a disk wakes up.
     status_handle.set_service_status(status_report(
         ServiceState::StartPending,
         ServiceControlAccept::empty(),
@@ -281,19 +285,15 @@ fn run_service() -> Result<()> {
         Duration::from_secs(4),
     ))?;
 
-    // Build the index on a dedicated thread, then serve until stopped. The SCM
+    // Start indexing and serve on a dedicated thread until stopped. The SCM
     // thread stays free to pump checkpoints and receive Stop.
     let engine_thread = std::thread::spawn(move || -> Result<()> {
-        let engine = match run::build_engine() {
-            Ok(engine) => engine,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e.to_string()));
-                return Err(e);
-            }
-        };
-        let _ = ready_tx.send(Ok(engine.total_entries));
-        let served = server::run(engine.volumes, stop_rx);
-        engine.supervisor.shutdown();
+        let served = serve(stop_rx, &ready_tx);
+        // Ends StartPending with the reason when the failure came first; once
+        // Running was reported, nothing reads this.
+        if let Err(e) = &served {
+            let _ = ready_tx.send(Err(format!("{e:#}")));
+        }
         served
     });
 
@@ -318,15 +318,14 @@ fn run_service() -> Result<()> {
     };
 
     match ready {
-        Ok(entries) => {
-            tracing::info!(entries, "index ready; service running");
+        Ok(()) => {
+            tracing::info!("service running; serving queries while the volumes index");
             status_handle.set_service_status(status_report(
                 ServiceState::Running,
                 ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
                 0,
                 Duration::default(),
             ))?;
-            run::settle_working_set();
         }
         Err(msg) => {
             tracing::error!(reason = %msg, "goz service failed to start");
@@ -343,6 +342,18 @@ fn run_service() -> Result<()> {
     tracing::info!(?exit_code, "goz service stopped");
     status_handle.set_service_status(stopped_report(exit_code))?;
     Ok(())
+}
+
+/// Starts the engine and serves until stopped, sending `Ok` on `ready` once
+/// the pipe server is ready to report `Running` (see [`server::run`]).
+fn serve(stop: watch::Receiver<bool>, ready: &mpsc::Sender<Result<(), String>>) -> Result<()> {
+    let engine = run::start_engine()?;
+    let ready = ready.clone();
+    let served = server::run(engine.volumes, stop, move || {
+        let _ = ready.send(Ok(()));
+    });
+    engine.supervisor.shutdown();
+    served
 }
 
 /// The exit code the service stops with once the engine thread has ended.

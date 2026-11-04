@@ -11,7 +11,9 @@ goz is four crates:
 
 ## Index coherence
 
-goz indexes fixed NTFS volumes; removable drives and non-NTFS filesystems (ReFS, exFAT, FAT32) are out of scope and are not tracked.
+goz indexes fixed NTFS volumes; removable drives and non-NTFS filesystems (ReFS, exFAT, FAT32) are out of scope and are not tracked. The set of indexed volumes follows the machine: every 30 seconds the daemon lists the volumes, starts indexing each fixed NTFS volume it does not index yet (an external disk attached, a disk that was not ready at boot, a BitLocker volume unlocked later), and drops each volume that is no longer listed.
+
+The daemon answers queries from the moment it starts. A volume is `bootstrapping` until its first build is published and, like `rescanning`, flags results incomplete; a volume that cannot be opened says why as `failed` and is retried on the same budget as a tail that exits.
 
 The index is a cache of the filesystem, and a cache that cannot prove it is coherent must rebuild itself. Every sync-loss path (journal wrap, a missed delete, a parse anomaly, an ID mismatch, reads that stop answering, even a sick disk that leaves a journal read pending forever, which a supervisor cancels, or a tail thread that exits outright, which the same supervisor revives on a bounded budget) ends in one of three states:
 

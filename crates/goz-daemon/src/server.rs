@@ -30,7 +30,7 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{Semaphore, watch};
 
 use crate::local_clock::MachineClock;
-use crate::volume_state::{VolumeSet, VolumeState};
+use crate::volume_state::{VolumeRegistry, VolumeSet, VolumeState};
 
 /// Cap on concurrently-served pipe connections. A silent/hostile local client
 /// cannot pin more than this many tasks + read buffers + pipe instances.
@@ -76,29 +76,45 @@ const CLAIM_RETRY_EVERY: Duration = Duration::from_secs(2);
 const ERROR_ACCESS_DENIED: i32 = 5;
 const ERROR_PIPE_BUSY: i32 = 231;
 
-/// Runs the pipe server until stopped. Blocks on a tokio runtime.
+/// Runs the pipe server until stopped. Blocks on a tokio runtime. Each request
+/// answers from the volumes indexed when it arrives.
+///
+/// `ready` runs once, as soon as the pipe is claimed, or as soon as the claim
+/// has to wait for another process to release the name. Service mode reports
+/// `Running` from it: the SCM delivers no control to a service that is still
+/// `StartPending`, so one held there while a squatter keeps the name could
+/// not be stopped. Waiting for the name itself is unchanged.
 ///
 /// Stops on either Ctrl+C (console mode) or `shutdown` flipping to `true` (the
 /// service-control handler's Stop/Shutdown path). Keep at least one
 /// `watch::Sender` alive for the duration in console mode: if every sender
 /// drops, `changed()` resolves and would end the loop prematurely.
-pub(crate) fn run(volumes: VolumeSet, shutdown: watch::Receiver<bool>) -> Result<()> {
+pub(crate) fn run(
+    volumes: Arc<VolumeRegistry>,
+    shutdown: watch::Receiver<bool>,
+    ready: impl FnOnce(),
+) -> Result<()> {
     let security = build_pipe_security().context("building pipe security descriptor")?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
-    rt.block_on(accept_loop(volumes, security, shutdown))
+    rt.block_on(accept_loop(volumes, security, shutdown, ready))
 }
 
 async fn accept_loop(
-    volumes: VolumeSet,
+    volumes: Arc<VolumeRegistry>,
     security: PipeSecurity,
     mut shutdown: watch::Receiver<bool>,
+    ready: impl FnOnce(),
 ) -> Result<()> {
-    let Some(mut server) = claim_first_instance(&security, &mut shutdown).await? else {
+    let mut ready = Some(ready);
+    let Some(mut server) = claim_first_instance(&security, &mut shutdown, &mut ready).await? else {
         return Ok(());
     };
+    if let Some(ready) = ready.take() {
+        ready();
+    }
     let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connect_failures = 0u64;
     let mut last_connect_warning: Option<Instant> = None;
@@ -188,12 +204,14 @@ fn create_instance(security: &PipeSecurity, first: bool) -> Result<NamedPipeServ
 /// Any local user can create [`PIPE_NAME`] while gozd builds its indexes (see
 /// `goz_winfs::pipe_trust`), and the first instance is then refused. Failing
 /// here would make the SCM restart the service and read every MFT again about
-/// once a minute for as long as the name is held, so the built index waits
-/// instead and the server starts once the name is free. Any other error is
-/// returned. `None` when a stop arrives first.
+/// once a minute for as long as the name is held, so the daemon waits instead,
+/// indexing meanwhile, and the server starts once the name is free. `ready`
+/// runs when the wait begins. Any other error is returned. `None` when a stop
+/// arrives first.
 async fn claim_first_instance(
     security: &PipeSecurity,
     shutdown: &mut watch::Receiver<bool>,
+    ready: &mut Option<impl FnOnce()>,
 ) -> Result<Option<NamedPipeServer>> {
     let mut waiting = false;
     loop {
@@ -212,6 +230,9 @@ async fn claim_first_instance(
                         "another process holds the pipe name; waiting for it"
                     );
                     waiting = true;
+                    if let Some(ready) = ready.take() {
+                        ready();
+                    }
                 }
             }
             Err(e) => return Err(e),
@@ -235,7 +256,10 @@ fn name_taken(e: &anyhow::Error) -> bool {
         .is_some_and(|code| code == ERROR_ACCESS_DENIED || code == ERROR_PIPE_BUSY)
 }
 
-async fn handle_connection(server: &mut NamedPipeServer, volumes: VolumeSet) -> Result<()> {
+async fn handle_connection(
+    server: &mut NamedPipeServer,
+    volumes: Arc<VolumeRegistry>,
+) -> Result<()> {
     let mut decoder = goz_core::proto::FrameDecoder::new(MAX_CLIENT_FRAME);
     let mut read_buf = vec![0u8; 16 * 1024];
     loop {
@@ -265,7 +289,7 @@ async fn handle_connection(server: &mut NamedPipeServer, volumes: VolumeSet) -> 
                 // QUERY_PAGE_BACKLOG pages are in flight, and encoding
                 // overlaps the pipe writes instead of preceding them.
                 Ok(Request::Query(q)) => {
-                    let vols = volumes.clone();
+                    let vols = volumes.current();
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(QUERY_PAGE_BACKLOG);
                     let encoder = tokio::task::spawn_blocking(move || {
                         // A failed send means the receiver is gone (client
@@ -291,7 +315,7 @@ async fn handle_connection(server: &mut NamedPipeServer, volumes: VolumeSet) -> 
                 // Hello / Status are trivial; encode inline as a tagged JSON frame.
                 Ok(req) => {
                     let mut out = Vec::new();
-                    encode_response_frame(&handle_request(&volumes, req), &mut out);
+                    encode_response_frame(&handle_request(&volumes.current(), req), &mut out);
                     out
                 }
                 Err(e) => {
@@ -878,6 +902,7 @@ mod tests {
     };
     use parking_lot::{Mutex, RwLock};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     fn dir_record(frn: u64, parent: u64, name: &str) -> ParsedUsnRecord {
         ParsedUsnRecord {
@@ -909,6 +934,7 @@ mod tests {
             phase: RwLock::new(phase),
             metadata_pending: RwLock::new(false),
             journal_max_bytes: RwLock::new(None),
+            indexed: AtomicBool::new(true),
             scope_cache: Mutex::new(None),
         })
     }
@@ -1056,6 +1082,32 @@ mod tests {
             result_paths(&vols, scoped("System32", r"C:\mnt\usb\Windows")),
             [r"C:\mnt\usb\Windows\System32"]
         );
+    }
+
+    /// A volume is served from the moment it is found, before its first build:
+    /// its empty index adds no hits, every page and the status say results may
+    /// be incomplete, and the handshake is not ready. The daemon used to open
+    /// the pipe only after every volume was built, so a client asking in the
+    /// first half minute was told the daemon was not running.
+    #[test]
+    fn a_volume_still_bootstrapping_is_served_flagged_incomplete() {
+        let found = Arc::new(VolumeState::found(
+            r"\\?\Volume{0000000d-0000-0000-0000-000000000000}\".into(),
+            vec![r"D:\".into()],
+        ));
+        let vols = set(&[live_volume(r"C:\"), found]);
+
+        let pages = results(&encode_query_binary(&vols, query("System32")));
+        assert_eq!(pages[0].total, 1, "the built volume still answers");
+        assert!(pages.iter().all(|p| p.volumes_incomplete));
+
+        let status = build_status(&vols);
+        assert!(status.volumes_incomplete);
+        assert_eq!(status.volumes[1].phase, VolumePhase::Bootstrapping);
+        let Response::Hello { ready, .. } = handle_request(&vols, hello_request(1, 1)) else {
+            panic!("must negotiate")
+        };
+        assert!(!ready);
     }
 
     /// A Snapshot volume must NOT taint results.
