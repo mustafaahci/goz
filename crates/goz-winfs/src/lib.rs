@@ -37,6 +37,7 @@ mod pipe_sd;
 mod pipe_trust;
 #[cfg(windows)]
 mod service;
+#[cfg(windows)]
 mod time_zone;
 #[cfg(windows)]
 mod volume;
