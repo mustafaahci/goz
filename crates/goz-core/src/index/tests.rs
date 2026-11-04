@@ -672,6 +672,24 @@ fn path_cycle_is_detected_not_looped() {
     assert_eq!(idx.path_of(a, &mut buf), PathStatus::CycleDetected);
 }
 
+/// The same corrupt link leaves `a` in the root's child chain while its
+/// parent link names `b`, so a walk that climbed by parent links went
+/// between `a` and `b` forever. Its climb is bounded by how far it went down.
+#[test]
+fn a_subtree_walk_ends_on_a_parent_cycle() {
+    let mut idx = index_from_enum(&[
+        create(frn(100), root_frn(), "a", true),
+        create(frn(101), frn(100), "b", true),
+        create(frn(102), root_frn(), "c", true),
+    ]);
+    let a = idx.head_of(frn(100)).unwrap();
+    let b = idx.head_of(frn(101)).unwrap();
+    idx.force_parent(a, b);
+    let walked: Vec<_> = idx.subtree_entries(idx.root()).take(100).collect();
+    assert!(walked.len() < 100, "the walk did not end: {walked:?}");
+    assert!(walked.contains(&a) && walked.contains(&b));
+}
+
 // -- model-based property test -------------------------------------------
 
 /// A reference filesystem the index must mirror.

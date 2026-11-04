@@ -1365,6 +1365,7 @@ impl VolumeIndex {
             entries: &self.entries,
             root,
             cur: self.entries.first_child(root),
+            depth: 1,
         }
     }
 
@@ -1442,6 +1443,8 @@ pub(crate) struct SubtreeWalk<'a> {
     entries: &'a EntryTable,
     root: EntryIdx,
     cur: EntryIdx,
+    /// Levels below `root` of `cur`, which bounds the climb back.
+    depth: usize,
 }
 
 impl Iterator for SubtreeWalk<'_> {
@@ -1456,6 +1459,7 @@ impl Iterator for SubtreeWalk<'_> {
         let down = self.entries.first_child(yielded);
         if down != NIL {
             self.cur = down;
+            self.depth += 1;
         } else {
             let mut at = yielded;
             loop {
@@ -1464,6 +1468,15 @@ impl Iterator for SubtreeWalk<'_> {
                     self.cur = sib;
                     break;
                 }
+                // A consistent tree climbs back to the root in as many steps
+                // as the walk went down. Needing more means a parent link and
+                // a child chain disagree, which only corrupt links give, and
+                // climbing on would loop here forever under the read lock.
+                if self.depth <= 1 {
+                    self.cur = NIL;
+                    break;
+                }
+                self.depth -= 1;
                 at = self.entries.parent(at);
                 if at == self.root || at == NIL {
                     self.cur = NIL;
