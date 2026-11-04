@@ -267,9 +267,8 @@ struct Posted {
 }
 
 /// How long a removal query waits for the supervisor to let go of its volume.
-/// Covers a pending start's drain and a tail's teardown
-/// ([`PENDING_DRAIN_WAIT`] plus [`TEARDOWN_WAIT`]) behind a listing wait; a
-/// healthy tail is let go of within a teardown poll.
+/// Covers its release ([`RELEASE_MAX`]) behind a listing wait; a healthy tail
+/// is let go of within a teardown poll.
 const RELEASE_WAIT: Duration = Duration::from_secs(12);
 
 /// How long a volume let go of for a removal stays out of discovery when
@@ -332,6 +331,18 @@ impl Signals {
             self.wake.wait_until(&mut state, until);
         }
         (!state.stopped).then(|| std::mem::take(&mut state.posted))
+    }
+
+    /// Whether shutdown has begun.
+    fn stopping(&self) -> bool {
+        self.state.lock().stopped
+    }
+
+    /// Takes back removals not acted on because shutdown began, so
+    /// [`Self::tails_stopped`] answers their queries once every volume is let
+    /// go of, as it answers a query posted during shutdown.
+    fn hand_back(&self, rest: impl IntoIterator<Item = Posted>) {
+        self.state.lock().posted.extend(rest);
     }
 
     /// Says every tail has stopped, so every volume is let go of: the
@@ -502,8 +513,16 @@ impl Fleet {
         let current = self.volumes.current();
         let indexed: Vec<&str> = current.iter().map(|v| v.guid.as_str()).collect();
         let changes = diff_volumes(&indexed, listed);
+        // Once shutdown has begun, stop_all stops every tail, so a volume left
+        // waits for it, and a volume found now would only be stopped.
         for guid in changes.gone {
+            if self.signals.stopping() {
+                return;
+            }
             self.remove(guid);
+        }
+        if self.signals.stopping() {
+            return;
         }
         for vol in changes.found {
             let guid = vol.guid_path.as_str();
@@ -545,6 +564,29 @@ impl Fleet {
         let (tails, notifications) = gone.into_parts(Instant::now() + PENDING_DRAIN_WAIT);
         stop_tails(tails);
         notifications
+    }
+
+    /// Acts on the removals `posted`, answering each query once its volume is
+    /// let go of, and returns whether the volumes should be listed now. `None`
+    /// once shutdown has begun: the removals left go back to [`Signals`], so
+    /// shutdown lets go of one volume at most before [`Self::stop_all`]
+    /// stops every tail (see [`SUPERVISOR_JOIN_WAIT`]).
+    fn act_on(&mut self, posted: Vec<Posted>) -> Option<bool> {
+        let mut relist = false;
+        let mut posted = posted.into_iter();
+        while let Some(p) = posted.next() {
+            if self.signals.stopping() {
+                self.signals.hand_back(std::iter::once(p).chain(posted));
+                return None;
+            }
+            relist |= self.on_removal(p.removal);
+            // Answered only now, with the volume let go of: the removal
+            // fails while any handle on it is open.
+            if let Some(done) = p.done {
+                let _ = done.send(());
+            }
+        }
+        (!self.signals.stopping()).then_some(relist)
     }
 
     /// Acts on a removal event of a volume, posted by its notification (see
@@ -789,11 +831,21 @@ const TEARDOWN_WAIT: Duration = Duration::from_secs(5);
 /// cannot stretch teardown past what [`SUPERVISOR_JOIN_WAIT`] covers.
 const PENDING_DRAIN_WAIT: Duration = Duration::from_secs(3);
 
+/// The longest letting go of a volume takes, and so [`Fleet::stop_all`] for
+/// all of them: a pending start's drain, then its tails' teardown, whose last
+/// poll can end a [`TEARDOWN_POLL`] past its deadline.
+const RELEASE_MAX: Duration = PENDING_DRAIN_WAIT
+    .saturating_add(TEARDOWN_WAIT)
+    .saturating_add(TEARDOWN_POLL);
+
 /// Total time [`Supervisor::shutdown`] waits for the supervision thread
-/// itself. It must comfortably exceed the thread's legitimate teardown worst
-/// case: a scan waiting out [`LISTING_WAIT`], then [`TEARDOWN_WAIT`] plus
-/// [`PENDING_DRAIN_WAIT`]. A test pins the coupling.
-const SUPERVISOR_JOIN_WAIT: Duration = Duration::from_secs(15);
+/// itself. The thread sees the stop between steps (see [`Fleet::act_on`]),
+/// so its legitimate worst case is the step under way, a listing wait or one
+/// release, then [`Fleet::stop_all`]: two [`RELEASE_MAX`], here with 3.5 s to
+/// spare, 20 s in all. A test pins the coupling.
+const SUPERVISOR_JOIN_WAIT: Duration = RELEASE_MAX
+    .saturating_mul(2)
+    .saturating_add(Duration::from_millis(3_500));
 
 /// The supervisor thread body: run the scan loop, then stop every tail. The
 /// scan loop is unwind-guarded because the tails were moved in here: a panic
@@ -863,15 +915,9 @@ fn scan_loop(fleet: &mut Fleet, signals: &Signals) {
         let Some(posted) = signals.wait(next_scan) else {
             return;
         };
-        let mut relist = false;
-        for Posted { removal, done } in posted {
-            relist |= fleet.on_removal(removal);
-            // Answered only now, with the volume let go of: the removal
-            // fails while any handle on it is open.
-            if let Some(done) = done {
-                let _ = done.send(());
-            }
-        }
+        let Some(relist) = fleet.act_on(posted) else {
+            return;
+        };
         if relist {
             // A volume found now must get its first poll a full scan
             // interval after its start, the grace `poll_revival` assumes.
@@ -1767,22 +1813,83 @@ mod tests {
         // the stall threshold, or the refund window reopens.
         assert!(BEAT_FRESH >= SCAN_INTERVAL);
         assert!(BEAT_FRESH < BEAT_STALL);
-        // Shutdown must outwait the supervisor's own legitimate worst case,
-        // a scan waiting for its listing, then draining pending starts and
-        // stopping its tails, with slack; anything tighter would abandon a
-        // supervisor that was merely busy.
-        assert!(
-            SUPERVISOR_JOIN_WAIT
-                >= LISTING_WAIT + TEARDOWN_WAIT + PENDING_DRAIN_WAIT + TEARDOWN_WAIT
-        );
         // A scan waits for its listing far less than a scan interval, so a
         // blocked listing cannot stretch the scans that rescue other tails.
         assert!(LISTING_WAIT * 10 <= SCAN_INTERVAL);
-        // A removal query outwaits letting go of its volume behind a listing
-        // wait, or the removal would go ahead with the handle still open.
-        assert!(RELEASE_WAIT >= LISTING_WAIT + PENDING_DRAIN_WAIT + TEARDOWN_WAIT);
         // A zero budget would turn every retirement into instant give-up and
         // make revival dead code.
         const { assert!(MAX_REVIVES > 0) };
+    }
+
+    /// Shutdown outwaits the supervision thread's worst legitimate teardown
+    /// with seconds to spare: the step under way when the stop comes, a
+    /// listing wait or one volume's release, then every other volume's.
+    /// Anything tighter abandons a supervisor that was only busy, and logs it
+    /// as wedged. A removal query outwaits its release behind a listing wait,
+    /// or the removal would go ahead with the handle still open.
+    #[test]
+    fn shutdown_outwaits_one_release_then_stop_all() {
+        assert!(RELEASE_MAX >= PENDING_DRAIN_WAIT + TEARDOWN_WAIT + TEARDOWN_POLL);
+        let worst = LISTING_WAIT.max(RELEASE_MAX) + RELEASE_MAX;
+        assert!(
+            SUPERVISOR_JOIN_WAIT >= worst + Duration::from_secs(2),
+            "{SUPERVISOR_JOIN_WAIT:?} against a worst case of {worst:?}"
+        );
+        assert!(RELEASE_WAIT >= LISTING_WAIT + RELEASE_MAX);
+    }
+
+    /// Once shutdown has begun, no volume is let go of on its own, so the
+    /// teardown stays one release and a stop_all however many removals or
+    /// gone volumes arrive at once. The queries left are answered only once
+    /// every tail has stopped, when the removal can no longer fail.
+    #[test]
+    fn a_stop_leaves_every_volume_still_to_let_go_of_to_stop_all() {
+        let (mut fleet, volumes) = fleet();
+        fleet.reconcile(
+            &[
+                listed(C, true, true),
+                listed(D, true, true),
+                listed(PLUGGED, true, true),
+            ],
+            Instant::now(),
+        );
+        let (tx, answer) = mpsc::sync_channel(1);
+        let asked = vec![Posted {
+            removal: removal(PLUGGED, DeviceEvent::QueryRemove),
+            done: Some(tx),
+        }];
+        assert_eq!(fleet.act_on(asked), Some(false));
+        assert_eq!(answer.try_recv(), Ok(()), "answered once let go of");
+        assert_eq!(indexed(&volumes), [C, D]);
+
+        let signals = fleet.signals.clone();
+        signals.state.lock().stopped = true;
+        fleet.reconcile(&[], Instant::now());
+        assert_eq!(
+            indexed(&volumes),
+            [C, D],
+            "a listing during shutdown drops none"
+        );
+        let (c_tx, c_answer) = mpsc::sync_channel(1);
+        let (d_tx, d_answer) = mpsc::sync_channel(1);
+        let asked = vec![
+            Posted {
+                removal: removal(C, DeviceEvent::QueryRemove),
+                done: Some(c_tx),
+            },
+            Posted {
+                removal: removal(D, DeviceEvent::QueryRemove),
+                done: Some(d_tx),
+            },
+        ];
+        assert_eq!(fleet.act_on(asked), None);
+        assert_eq!(indexed(&volumes), [C, D], "nor does a removal");
+        assert_eq!(fleet.supervised.len(), 2);
+        assert_eq!(c_answer.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        fleet.stop_all();
+        for answer in [c_answer, d_answer] {
+            assert_eq!(answer.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        }
     }
 }
