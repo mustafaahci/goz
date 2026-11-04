@@ -3,14 +3,13 @@
 //! JSON requests, and tagged responses whose results pages carry a binary body.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::windows::io::AsHandle;
 use std::time::{Duration, Instant};
 
-use goz_core::proto::{
-    FrameDecoder, MAX_SERVER_FRAME, PIPE_NAME, QueryResults, Request, Response,
-    decode_response_frame, encode_request,
-};
+use goz_core::proto::{PIPE_NAME, QueryResults, Request, Response, encode_request};
+
+use crate::reply::{PipeIo, Replies};
 
 /// Opening the pipe with an anonymous impersonation level (`SECURITY_ANONYMOUS`,
 /// value 0, so only the SQOS-present bit is set) prevents a rogue server that
@@ -18,13 +17,6 @@ use goz_core::proto::{
 /// authenticate the server: see [`Client::connect`], which verifies the pipe's
 /// owner is the elevated daemon before any request is sent.
 const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
-
-/// How long to wait for the daemon's reply before giving up (a wedged-but-alive
-/// daemon must not hang the client forever).
-const READ_DEADLINE: Duration = Duration::from_secs(30);
-
-/// Poll interval while waiting for a reply (see [`Client::request`]).
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug)]
 pub(crate) enum ClientError {
@@ -39,6 +31,7 @@ pub(crate) enum ClientError {
 
 pub(crate) struct Client {
     pipe: File,
+    replies: Replies,
 }
 
 impl Client {
@@ -104,16 +97,18 @@ impl Client {
             }
         }
 
-        Ok(Self { pipe })
+        Ok(Self {
+            pipe,
+            replies: Replies::new(),
+        })
     }
 
     /// Sends one request and reads the framed response.
     ///
     /// A `Results` response may span multiple frames (the daemon pages large
     /// result sets, setting `more` on all but the last); these are accumulated
-    /// transparently into a single [`Response::Results`]. The read deadline is
-    /// enforced by polling `PeekNamedPipe` rather than issuing a blocking read,
-    /// so a wedged-but-alive daemon cannot hang the client past [`READ_DEADLINE`].
+    /// transparently into a single [`Response::Results`]. Each wait gives up
+    /// once the daemon has been silent for the deadline [`Replies`] keeps.
     pub(crate) fn request(&mut self, req: &Request) -> Result<Response, ClientError> {
         let mut out = Vec::new();
         encode_request(req, &mut out);
@@ -121,57 +116,49 @@ impl Client {
             .write_all(&out)
             .map_err(|e| ClientError::Protocol(e.to_string()))?;
 
-        let mut decoder = FrameDecoder::new(MAX_SERVER_FRAME);
-        // Heap buffer, larger than the old 64 KiB: a broad query streams hundreds
-        // of MB, so fewer, bigger reads cut syscall overhead. Heap (not stack) so
-        // the size can grow without risking the main thread's 1 MiB stack.
-        let mut buf = vec![0u8; 256 * 1024];
-        let deadline = Instant::now() + READ_DEADLINE;
         let mut merged: Option<QueryResults> = None;
         loop {
-            match decoder.next_frame() {
-                Ok(Some(frame)) => {
-                    let resp = decode_response_frame(&frame)
-                        .map_err(|e| ClientError::Protocol(e.to_string()))?;
-                    match resp {
-                        Response::Results(page) => {
-                            let more = page.more;
-                            match &mut merged {
-                                None => merged = Some(page),
-                                Some(acc) => acc.items.extend(page.items),
-                            }
-                            if !more {
-                                let mut done = merged.take().expect("at least one Results page");
-                                done.more = false;
-                                return Ok(Response::Results(done));
-                            }
-                            continue;
-                        }
-                        other => return Ok(other),
+            let reply = self
+                .replies
+                .next(&mut Pipe(&self.pipe))
+                .map_err(|e| ClientError::Protocol(e.to_string()))?;
+            match reply {
+                Response::Results(page) => {
+                    let more = page.more;
+                    match &mut merged {
+                        None => merged = Some(page),
+                        Some(acc) => acc.items.extend(page.items),
+                    }
+                    if !more {
+                        let mut done = merged.take().expect("at least one Results page");
+                        done.more = false;
+                        return Ok(Response::Results(done));
                     }
                 }
-                Ok(None) => {}
-                Err(e) => return Err(ClientError::Protocol(e.to_string())),
+                other => return Ok(other),
             }
-            if Instant::now() > deadline {
-                return Err(ClientError::Protocol("daemon did not reply in time".into()));
-            }
-            // Poll for available bytes instead of a blocking ReadFile, so the
-            // deadline above is actually enforceable against a stuck daemon.
-            let avail = goz_winfs::pipe_bytes_available(self.pipe.as_handle())
-                .map_err(|_| ClientError::Protocol("daemon closed the connection".into()))?;
-            if avail == 0 {
-                std::thread::sleep(POLL_INTERVAL);
-                continue;
-            }
-            let n = self
-                .pipe
-                .read(&mut buf)
-                .map_err(|e| ClientError::Protocol(e.to_string()))?;
-            if n == 0 {
-                return Err(ClientError::Protocol("daemon closed the connection".into()));
-            }
-            decoder.feed(&buf[..n]);
         }
+    }
+}
+
+/// The daemon's pipe, polled with `PeekNamedPipe` so that no read blocks
+/// past the deadline.
+struct Pipe<'a>(&'a File);
+
+impl PipeIo for Pipe<'_> {
+    fn available(&mut self) -> io::Result<u32> {
+        goz_winfs::pipe_bytes_available(self.0.as_handle()).map_err(io::Error::other)
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn pause(&mut self, time: Duration) {
+        std::thread::sleep(time);
     }
 }

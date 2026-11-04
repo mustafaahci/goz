@@ -10,9 +10,9 @@
 //!
 //! Exit codes (es-compatible where they overlap): 0 ok · 4 missing switch
 //! parameter / bad query · 5 export-file create failure / output write failure ·
-//! 6 unknown switch · 7 protocol failure (malformed daemon reply, reply
-//! timeout, or pipe open error) · 8 daemon unreachable · 9 pipe server not
-//! trusted.
+//! 6 unknown switch · 7 protocol failure (malformed daemon reply, 30 s of
+//! silence from the daemon, or pipe open error) · 8 daemon unreachable · 9
+//! pipe server not trusted.
 
 // Thread-caching allocator: decoding a broad result set allocates a String per
 // path (millions of them), which the Windows default heap serializes.
@@ -24,6 +24,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod client;
 #[cfg(windows)]
 mod not_running;
+#[cfg(any(windows, test))]
+mod reply;
 #[cfg(any(windows, test))]
 mod status;
 
