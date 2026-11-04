@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use goz_core::types::VolumePhase;
 use parking_lot::{Condvar, Mutex};
 
-use crate::pulse::{Pulse, now_unix};
+use crate::pulse::{Pulse, awake_secs};
 use crate::tail::{self, TailHandle};
 
 /// Pause between supervision scans.
@@ -53,11 +53,12 @@ const BUSY_STALL: Duration = Duration::from_secs(30 * 60);
 /// dies every scan is given up on within minutes.
 const MAX_REVIVES: u32 = 3;
 
-/// How long a revived tail must beat CONTINUOUSLY before its failure history
-/// is forgotten. Continuous beating, not incarnation age: a revived tail can
-/// spend longer than this in its initial rebuild alone, and refunding on age
-/// would let a volume that dies right after every rebuild revive forever,
-/// one full MFT rebuild per cycle, the exact storm the budget exists to stop.
+/// How long a revived tail must beat CONTINUOUSLY, in time awake, before its
+/// failure history is forgotten. Continuous beating, not incarnation age: a
+/// revived tail can spend longer than this in its initial rebuild alone, and
+/// refunding on age would let a volume that dies right after every rebuild
+/// revive forever, one full MFT rebuild per cycle, the exact storm the budget
+/// exists to stop.
 const HEALTHY_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// How stale an observed beat may be and still count toward the refund. A
@@ -127,15 +128,9 @@ fn assess(pulse: Pulse, now: u64, revive_attempts: u32, proven_healthy: bool) ->
 /// unreachable, the exact churn the budget exists to stop. This is the one
 /// place the supervisor reads the phase, and it reads it for what the phase
 /// means (is the volume served?), never to decide stall handling.
-fn accrue_health(
-    prev: Option<Instant>,
-    pulse: Pulse,
-    live: bool,
-    now_secs: u64,
-    now: Instant,
-) -> Option<Instant> {
+fn accrue_health(prev: Option<u64>, pulse: Pulse, live: bool, now: u64) -> Option<u64> {
     match pulse {
-        Pulse::Beat(at) if live && now_secs.saturating_sub(at) < BEAT_FRESH.as_secs() => {
+        Pulse::Beat(at) if live && now.saturating_sub(at) < BEAT_FRESH.as_secs() => {
             Some(prev.unwrap_or(now))
         }
         _ => None,
@@ -274,11 +269,11 @@ struct Supervised {
     tail: TailHandle,
     /// Revivals since the budget was last refunded.
     revive_attempts: u32,
-    /// When the current unbroken run of healthy observations (a fresh
-    /// `Beat` with the phase `Live`, see [`accrue_health`]) began; cleared
-    /// by anything else and by a revival. This, not the incarnation's age,
-    /// is what earns a budget refund.
-    beating_since: Option<Instant>,
+    /// When, in [`awake_secs`], the current unbroken run of healthy
+    /// observations (a fresh `Beat` with the phase `Live`, see
+    /// [`accrue_health`]) began; cleared by anything else and by a revival.
+    /// This, not the incarnation's age, is what earns a budget refund.
+    beating_since: Option<u64>,
     /// A revival in flight on its worker thread, polled each scan. `Some`
     /// suppresses further actions on this tail until the worker reports.
     pending: Option<PendingRevival>,
@@ -419,7 +414,7 @@ fn scan_loop(supervised: &mut Vec<Supervised>, stop: &StopFlag) {
                 return;
             }
         }
-        let now = now_unix();
+        let now = awake_secs();
         let mut i = 0;
         while i < supervised.len() {
             if supervised[i].scan(now) {
@@ -504,12 +499,11 @@ impl Supervised {
         // exactly the one atomic load the old watchdog cost.
         if self.revive_attempts > 0 {
             let live = matches!(*self.tail.state.phase.read(), VolumePhase::Live);
-            self.beating_since =
-                accrue_health(self.beating_since, pulse, live, now, Instant::now());
+            self.beating_since = accrue_health(self.beating_since, pulse, live, now);
         }
         let proven_healthy = self
             .beating_since
-            .is_some_and(|at| at.elapsed() >= HEALTHY_AFTER);
+            .is_some_and(|since| now.saturating_sub(since) >= HEALTHY_AFTER.as_secs());
         match assess(pulse, now, self.revive_attempts, proven_healthy) {
             Action::Nothing => true,
             Action::ResetBudget => {
@@ -714,7 +708,8 @@ fn cancel_stuck_io(tail: &TailHandle, stalled_secs: u64) {
 mod tests {
     use super::*;
 
-    const NOW: u64 = 1_752_800_000;
+    /// A day awake, in [`awake_secs`].
+    const NOW: u64 = 86_400;
     fn beat_ago(secs: u64) -> Pulse {
         Pulse::Beat(NOW - secs)
     }
@@ -786,31 +781,32 @@ mod tests {
     /// forever, one full MFT rebuild per cycle.
     #[test]
     fn health_accrues_only_on_fresh_live_beats() {
-        let t0 = Instant::now();
         // A fresh live beat starts the run and a later one preserves the
         // anchor.
-        let started = accrue_health(None, beat_ago(0), true, NOW, t0);
-        assert_eq!(started, Some(t0));
+        let started = accrue_health(None, beat_ago(0), true, NOW);
+        assert_eq!(started, Some(NOW));
+        let later = NOW + SCAN_INTERVAL.as_secs();
         assert_eq!(
-            accrue_health(started, beat_ago(0), true, NOW, Instant::now()),
-            Some(t0)
+            accrue_health(started, Pulse::Beat(later), true, later),
+            Some(NOW)
         );
         // The same beat with the volume not Live breaks the run.
-        assert_eq!(accrue_health(started, beat_ago(0), false, NOW, t0), None);
+        assert_eq!(accrue_health(started, beat_ago(0), false, NOW), None);
         // A stale beat breaks it even while Live: six healthy minutes then
         // a wedge under the stall threshold must not mature into a refund,
         // so the frozen stamp cannot carry the run.
         let stale = BEAT_FRESH.as_secs();
-        assert_eq!(accrue_health(started, beat_ago(stale), true, NOW, t0), None);
+        assert_eq!(accrue_health(started, beat_ago(stale), true, NOW), None);
         // Busy and Retired break it regardless of phase.
-        assert_eq!(accrue_health(started, busy_for(0), true, NOW, t0), None);
-        assert_eq!(accrue_health(started, Pulse::Retired, true, NOW, t0), None);
+        assert_eq!(accrue_health(started, busy_for(0), true, NOW), None);
+        assert_eq!(accrue_health(started, Pulse::Retired, true, NOW), None);
     }
 
-    /// A clock that jumps backwards (NTP step) must read as "not stalled",
-    /// never as a huge stall that shoots a healthy tail.
+    /// A scan reads the clock once, before it loads any pulse, so a tail that
+    /// stamps during the scan is ahead of `now`. That must read as "not
+    /// stalled", never as a huge stall that shoots a healthy tail.
     #[test]
-    fn a_backwards_clock_never_cancels() {
+    fn a_stamp_newer_than_now_never_cancels() {
         assert_eq!(
             assess(Pulse::Beat(NOW + 600), NOW, 0, false),
             Action::Nothing

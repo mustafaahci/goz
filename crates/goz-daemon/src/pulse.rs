@@ -10,9 +10,9 @@
 //! [`Drop`] guard, so every exit path, including a panic unwind and any
 //! `return` added later, retires the pulse.
 //!
-//! State and timestamp share one `u64` (tag in the top two bits, unix seconds
-//! below) so a reader always sees a consistent pair; two separate atomics
-//! could tear between a supervisor's loads.
+//! State and timestamp share one `u64` (tag in the top two bits, seconds of
+//! [`awake_secs`] below) so a reader always sees a consistent pair; two
+//! separate atomics could tear between a supervisor's loads.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,10 +25,10 @@ const TAG_RETIRED: u64 = 2;
 /// One decoded pulse observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Pulse {
-    /// The tail loop is turning; unix seconds of its last stamp.
+    /// The tail loop is turning; [`awake_secs`] of its last stamp.
     Beat(u64),
     /// The tail is inside a legitimately long, non-stamping operation (a full
-    /// MFT rebuild); unix seconds of when it entered.
+    /// MFT rebuild); [`awake_secs`] of when it entered.
     Busy(u64),
     /// The tail thread returned. Not stuck, and not coming back on its own.
     Retired,
@@ -46,12 +46,13 @@ pub(crate) struct TailPulse(AtomicU64);
 impl TailPulse {
     /// A fresh pulse, beating as of now (the tail is about to start).
     pub(crate) fn new() -> Self {
-        Self(AtomicU64::new(pack(TAG_BEAT, now_unix())))
+        Self(AtomicU64::new(pack(TAG_BEAT, awake_secs())))
     }
 
     /// Stamps liveness. Called once per tail-loop turn.
     pub(crate) fn beat(&self) {
-        self.0.store(pack(TAG_BEAT, now_unix()), Ordering::Relaxed);
+        self.0
+            .store(pack(TAG_BEAT, awake_secs()), Ordering::Relaxed);
     }
 
     /// The current observation.
@@ -70,7 +71,8 @@ impl TailPulse {
     /// moment it finishes. Scopes must not nest (the inner drop would end the
     /// outer scope early); the tail has exactly one, around `rescan`.
     pub(crate) fn busy_scope(&self) -> BusyGuard<'_> {
-        self.0.store(pack(TAG_BUSY, now_unix()), Ordering::Relaxed);
+        self.0
+            .store(pack(TAG_BUSY, awake_secs()), Ordering::Relaxed);
         BusyGuard(self)
     }
 
@@ -105,11 +107,12 @@ fn pack(tag: u64, secs: u64) -> u64 {
     (tag << TAG_SHIFT) | (secs & SECS_MASK)
 }
 
-pub(crate) fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Seconds the machine has been awake: the clock of every stamp and every
+/// stall verdict. On a wall clock, a laptop that sleeps through a rescan, or a
+/// clock stepped forward, reads as a stalled tail whose healthy I/O the
+/// supervisor then cancels, and a clock stepped back hides a real wedge.
+pub(crate) fn awake_secs() -> u64 {
+    goz_winfs::awake_time().as_secs()
 }
 
 #[cfg(test)]
@@ -119,11 +122,35 @@ mod tests {
     #[test]
     fn new_pulse_beats_now() {
         let p = TailPulse::new();
-        let before = now_unix();
+        let before = awake_secs();
         match p.load() {
             Pulse::Beat(at) => assert!(at <= before && before - at <= 1),
             other => panic!("fresh pulse must beat, got {other:?}"),
         }
+    }
+
+    /// Beat and busy stamps read the awake clock, so a sleep or a clock step
+    /// between two stamps is not counted as silence.
+    #[test]
+    fn stamps_count_time_awake_not_wall_time() {
+        let p = TailPulse::new();
+        let awake = goz_winfs::awake_time().as_secs();
+        let Pulse::Beat(at) = p.load() else {
+            panic!("fresh pulse must beat");
+        };
+        assert!(
+            at <= awake && awake - at <= 1,
+            "beat at {at}, awake {awake}"
+        );
+        let _busy = p.busy_scope();
+        let awake = goz_winfs::awake_time().as_secs();
+        let Pulse::Busy(since) = p.load() else {
+            panic!("pulse must be busy inside a busy scope");
+        };
+        assert!(
+            since <= awake && awake - since <= 1,
+            "busy since {since}, awake {awake}"
+        );
     }
 
     #[test]
