@@ -3,8 +3,9 @@
 //! Parses arguments with the es.exe-compatible rules from
 //! `goz-core::escompat`, talks to the running daemon over `\\.\pipe\goz-v1`,
 //! and writes results as an es-compatible CSV (`-export-csv`), JSON (`--json`),
-//! or a plain path list (default). The help and version switches print to
-//! stdout without contacting the daemon.
+//! or a plain path list (default), or only their number
+//! (`-get-result-count`). The help and version switches print to stdout
+//! without contacting the daemon.
 //!
 //! Exit codes (es-compatible where they overlap): 0 ok · 4 missing switch
 //! parameter / bad query · 5 export-file create failure / output write failure ·
@@ -71,7 +72,7 @@ mod win {
     use goz_core::escompat::{EsPlan, Exit, VERSION_LINE};
     use goz_core::output::{CsvOptions, CsvRow, filetime_to_unix_ms, write_csv};
     use goz_core::proto::{PROTO_VERSION, QueryRequest, QueryResults, Request, Response};
-    use goz_core::types::EsColumn;
+    use goz_core::types::{EsColumn, SortSpec};
     use std::io::Write;
     use std::process::ExitCode;
 
@@ -151,16 +152,26 @@ mod win {
             );
         }
 
+        if plan.result_count {
+            return result_count(&plan, results.total, export_file);
+        }
         emit(&plan, &results, export_file)
     }
 
     fn build_query(plan: &EsPlan) -> QueryRequest {
+        // A count fetches no rows, in name order as es resets it to, which
+        // the daemon can answer from the distinct names alone.
+        let (sort, limit) = if plan.result_count {
+            (SortSpec::default(), Some(0))
+        } else {
+            (plan.sort, plan.limit)
+        };
         QueryRequest {
             query: plan.query.clone(),
             scope: plan.scope.as_ref().map(|s| absolutize(s)),
-            sort: plan.sort,
+            sort,
             offset: 0,
-            limit: plan.limit,
+            limit,
             // Always fetch metadata; output decides what to show.
             want_size: true,
             want_mtime: true,
@@ -238,6 +249,28 @@ mod win {
             && e.kind() != std::io::ErrorKind::BrokenPipe
         {
             eprintln!("goz: writing results failed: {e}");
+            return Err(Exit::WriteFailed.into());
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// `-get-result-count`: the number alone, on stdout or, as es writes it,
+    /// in the export file after its byte order mark.
+    fn result_count(
+        plan: &EsPlan,
+        total: u64,
+        export_file: Option<std::fs::File>,
+    ) -> Result<ExitCode, ExitCode> {
+        let Some(mut file) = export_file else {
+            return Ok(super::print(&format!("{total}\n")));
+        };
+        let mut bytes = Vec::new();
+        if plan.bom {
+            bytes.extend_from_slice(b"\xEF\xBB\xBF");
+        }
+        bytes.extend_from_slice(format!("{total}\r\n").as_bytes());
+        if let Err(e) = file.write_all(&bytes) {
+            eprintln!("goz: writing export CSV failed: {e}");
             return Err(Exit::WriteFailed.into());
         }
         Ok(ExitCode::SUCCESS)

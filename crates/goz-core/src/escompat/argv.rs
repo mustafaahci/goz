@@ -97,6 +97,10 @@ pub struct EsPlan {
     pub match_case: bool,
     /// Native `--json`: emit results as JSON instead of CSV/plain text.
     pub json: bool,
+    /// `-get-result-count`: print only the number of results. As in es, no
+    /// rows are fetched, and neither `-n` nor the sort changes the number.
+    /// Wins over `json`.
+    pub result_count: bool,
     /// Native `--status`: report daemon/index status instead of searching.
     pub status: bool,
     /// Native `--server-version`: print the daemon's version instead of
@@ -124,6 +128,7 @@ impl Default for EsPlan {
             double_quote: true,
             match_case: false,
             json: false,
+            result_count: false,
             status: false,
             server_version: false,
             insecure_no_server_check: false,
@@ -205,6 +210,8 @@ pub(super) enum SwitchAction {
     MatchCase,
     /// `--json`: emit results as JSON.
     Json,
+    /// `-get-result-count`: print only the number of results.
+    ResultCount,
     /// `--status`: report the daemon's state instead of searching.
     Status,
     /// `--server-version`: print the daemon's version instead of searching.
@@ -235,6 +242,7 @@ impl SwitchAction {
             | SwitchAction::NoDoubleQuote
             | SwitchAction::MatchCase
             | SwitchAction::Json
+            | SwitchAction::ResultCount
             | SwitchAction::Status
             | SwitchAction::ServerVersion
             | SwitchAction::InsecureNoServerCheck
@@ -370,6 +378,12 @@ pub(super) const SWITCHES: &[Switch] = &[
         group: Group::Output,
         quick: true,
         help: "Print the results as JSON",
+    },
+    Switch {
+        spelling: names(&["get-result-count"], &[], SwitchAction::ResultCount),
+        group: Group::Output,
+        quick: false,
+        help: "Print only the number of results",
     },
     Switch {
         spelling: names(&[], &["status"], SwitchAction::Status),
@@ -581,6 +595,7 @@ fn apply_switch(
         SwitchAction::NoDoubleQuote => plan.double_quote = false,
         SwitchAction::MatchCase => plan.match_case = true,
         SwitchAction::Json => plan.json = true,
+        SwitchAction::ResultCount => plan.result_count = true,
         SwitchAction::Status => plan.status = true,
         SwitchAction::ServerVersion => plan.server_version = true,
         SwitchAction::InsecureNoServerCheck => plan.insecure_no_server_check = true,
@@ -741,11 +756,23 @@ mod tests {
                 double_quote: true,
                 match_case: false,
                 json: false,
+                result_count: false,
                 status: false,
                 server_version: false,
                 insecure_no_server_check: false,
             }
         );
+    }
+
+    #[test]
+    fn get_result_count_asks_for_the_number_only() {
+        for spelling in ["-get-result-count", "-getresultcount", "/get-result-count"] {
+            let parsed = plan(&["report", spelling, "-n", "5"]);
+            assert!(parsed.result_count, "{spelling}");
+            assert_eq!(parsed.query, "report");
+        }
+        assert!(!plan(&["report"]).result_count);
+        assert_eq!(fatal(&["--get-result-count"]).exit_code, 6);
     }
 
     #[test]
