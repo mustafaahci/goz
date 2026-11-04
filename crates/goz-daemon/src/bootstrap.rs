@@ -313,6 +313,31 @@ fn journal_target_bytes(volume_bytes: Option<u64>) -> u64 {
         .clamp(JOURNAL_MIN_SIZE, JOURNAL_MAX_SIZE)
 }
 
+/// Whether a failed `FSCTL_CREATE_USN_JOURNAL` means the volume will never take
+/// a journal: it is read-only, its filesystem has no journals, or it rejects
+/// the request itself. Only that makes a [`JournalSetup::Refused`] Snapshot,
+/// which nothing retries and which reports itself complete. Any other failure
+/// (a full or waking disk, a failed or timed-out I/O, low kernel resources, a
+/// deletion another tool started) is [`JournalSetup::Unavailable`]: the volume
+/// reports Offline, and a rescan creates the journal once it can, asking at
+/// most every few minutes. A volume that refuses for an unlisted reason
+/// therefore warns until it is fixed rather than going stale without a word.
+fn create_refused(code: u32) -> bool {
+    const ERROR_INVALID_FUNCTION: u32 = 1;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_WRITE_PROTECT: u32 = 19;
+    const ERROR_NOT_SUPPORTED: u32 = 50;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    matches!(
+        code,
+        ERROR_INVALID_FUNCTION
+            | ERROR_ACCESS_DENIED
+            | ERROR_WRITE_PROTECT
+            | ERROR_NOT_SUPPORTED
+            | ERROR_INVALID_PARAMETER
+    )
+}
+
 /// What [`ensure_journal`] got for a volume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JournalSetup {
@@ -441,12 +466,19 @@ fn setup_journal(
                         JournalSetup::Unavailable
                     }
                 },
+                Err(e) if create_refused(e.code) => {
+                    tracing::warn!(
+                        error = %e,
+                        "no USN journal and the volume refused one; live updates unavailable"
+                    );
+                    JournalSetup::Refused
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "no USN journal and could not create one; live updates unavailable"
+                        "could not create a USN journal yet; live updates unavailable until it can be"
                     );
-                    JournalSetup::Refused
+                    JournalSetup::Unavailable
                 }
             }
         }
@@ -542,6 +574,39 @@ mod tests {
             setup(vec![Ok(NotActive)], Err(err(ERROR_WRITE_PROTECT))),
             (JournalSetup::Refused, 1)
         );
+    }
+
+    /// A create that fails only for now must not make a Snapshot, which nothing
+    /// retries and which reports itself complete while changes go missing.
+    /// Only a volume that rejects journals for good is refused, so a passing
+    /// failure nobody listed (a timed-out I/O, low kernel resources, a busy
+    /// device) is unavailable too.
+    #[test]
+    fn a_create_that_fails_for_now_is_unavailable_not_refused() {
+        use JournalQuery::NotActive;
+        for code in [
+            ERROR_NOT_READY,
+            112,
+            121,
+            170,
+            995,
+            1117,
+            1450,
+            goz_winfs::ERROR_JOURNAL_DELETE_IN_PROGRESS,
+        ] {
+            assert_eq!(
+                setup(vec![Ok(NotActive)], Err(err(code))),
+                (JournalSetup::Unavailable, 1),
+                "create error {code}"
+            );
+        }
+        for code in [1, ERROR_ACCESS_DENIED, ERROR_WRITE_PROTECT, 50, 87] {
+            assert_eq!(
+                setup(vec![Ok(NotActive)], Err(err(code))),
+                (JournalSetup::Refused, 1),
+                "create error {code}"
+            );
+        }
     }
 
     #[test]
