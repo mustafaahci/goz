@@ -66,7 +66,7 @@ pub(crate) fn build_engine() -> Result<Engine> {
             guid: bv.guid_path.clone(),
             mounts: bv.mounts.clone(),
             index: RwLock::new(bv.index),
-            phase: RwLock::new(bootstrap_phase(&bv.journal)),
+            phase: RwLock::new(bv.journal.built_phase()),
             // True only when the FILE_LAYOUT pass stopped and ENUM named the
             // rest without sizes or dates.
             metadata_pending: RwLock::new(bv.metadata_pending),
@@ -154,17 +154,6 @@ pub(crate) fn build_engine() -> Result<Engine> {
     })
 }
 
-/// The phase a bootstrapped volume reports until its tail says otherwise. Only
-/// a volume that refused a journal is a Snapshot; one whose journal could not
-/// be read yet is not tracking, and its tail rebuilds the index once it can.
-fn bootstrap_phase(journal: &JournalSetup) -> VolumePhase {
-    match journal {
-        JournalSetup::Active(_) => VolumePhase::Live,
-        JournalSetup::Unavailable => VolumePhase::Offline,
-        JournalSetup::Refused => VolumePhase::Snapshot,
-    }
-}
-
 /// Best-effort post-bootstrap memory settling, shared by console + service
 /// modes. Never fatal: logs and continues.
 ///
@@ -232,30 +221,4 @@ pub(crate) fn run_console() -> Result<()> {
 
     engine.supervisor.shutdown();
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_refused_journal_makes_a_snapshot() {
-        let info = goz_winfs::JournalInfo {
-            journal_id: 7,
-            first_usn: 0,
-            next_usn: 4096,
-            lowest_valid_usn: 0,
-            max_usn: i64::MAX,
-            maximum_size: 64 << 20,
-        };
-        assert_eq!(
-            bootstrap_phase(&JournalSetup::Active(info)),
-            VolumePhase::Live
-        );
-        assert_eq!(
-            bootstrap_phase(&JournalSetup::Refused),
-            VolumePhase::Snapshot
-        );
-        assert!(!bootstrap_phase(&JournalSetup::Unavailable).is_complete());
-    }
 }

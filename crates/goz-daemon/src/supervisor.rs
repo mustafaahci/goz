@@ -10,11 +10,14 @@
 //! - **busy** (a full MFT rebuild) is legitimate silence and is left alone,
 //!   up to a far larger bound of its own, because a rebuild blocks in the
 //!   same kind of syscall and can wedge the same way;
-//! - **retired** means the thread exited (journal permanently lost, rescan
-//!   budget spent, or a panic) and is revived on a bounded budget: the
-//!   volume is reopened by GUID and a fresh tail spawned whose first act is
-//!   a full rescan. A tail that keeps dying gets one `error!` and is dropped
-//!   from supervision rather than alarmed about forever.
+//! - **retired** means the thread exited (a failed rebuild, rescan budget
+//!   spent, or a panic) and is revived on a bounded budget: the volume is
+//!   reopened by GUID and a fresh tail spawned whose first act is a full
+//!   rescan. A tail that keeps dying gets one `error!` and is dropped from
+//!   supervision rather than alarmed about forever. A tail that retired
+//!   because its volume refused a new journal left a Snapshot, which has
+//!   nothing to tail and nothing to recover, so it is released without a
+//!   revival.
 //!
 //! The supervisor owns the [`TailHandle`]s outright: it is the only place
 //! that can replace one (revival) and the natural place to stop them all, so
@@ -83,14 +86,28 @@ enum Action {
     Revive,
     /// The thread exited and its budget is spent: stop supervising it.
     GiveUp,
+    /// The thread exited and left its volume a Snapshot: nothing failed and
+    /// there is nothing to tail, so stop supervising it without a revival.
+    Release,
 }
 
 /// Decides what to do about one tail. `proven_healthy` is whether the
 /// current incarnation has beaten continuously for [`HEALTHY_AFTER`]; it
 /// only matters alongside `revive_attempts > 0` (an original has no history
-/// to refund).
-fn assess(pulse: Pulse, now: u64, revive_attempts: u32, proven_healthy: bool) -> Action {
+/// to refund). `snapshot` is whether the volume is a Snapshot; it only
+/// matters for a retired tail.
+fn assess(
+    pulse: Pulse,
+    now: u64,
+    revive_attempts: u32,
+    proven_healthy: bool,
+    snapshot: bool,
+) -> Action {
     match pulse {
+        // The volume refused a journal: a revival would read the whole MFT
+        // again only to be refused again, and giving up would log an error
+        // for a volume that is fine.
+        Pulse::Retired if snapshot => Action::Release,
         Pulse::Retired => {
             if revive_attempts >= MAX_REVIVES {
                 Action::GiveUp
@@ -125,9 +142,9 @@ fn assess(pulse: Pulse, now: u64, revive_attempts: u32, proven_healthy: bool) ->
 /// nothing (the read-retry path beats once per backoff turn forever), and a
 /// stale beat is a loop that has stopped turning; counting either would
 /// refund the budget of a volume delivering zero service and make give-up
-/// unreachable, the exact churn the budget exists to stop. This is the one
-/// place the supervisor reads the phase, and it reads it for what the phase
-/// means (is the volume served?), never to decide stall handling.
+/// unreachable, the exact churn the budget exists to stop. Like the snapshot
+/// check in `Supervised::scan`, this reads the phase for what it means (is
+/// the volume served?), never to decide stall handling.
 fn accrue_health(prev: Option<u64>, pulse: Pulse, live: bool, now: u64) -> Option<u64> {
     match pulse {
         Pulse::Beat(at) if live && now.saturating_sub(at) < BEAT_FRESH.as_secs() => {
@@ -420,10 +437,11 @@ fn scan_loop(supervised: &mut Vec<Supervised>, stop: &StopFlag) {
             if supervised[i].scan(now) {
                 i += 1;
             } else {
-                // Given up on: its thread already retired, so this join is
-                // immediate. Dropping the entry releases the pulse and the
-                // duplicated thread handle, which the old watchdog held (and
-                // alarmed through) for the life of the process.
+                // Given up on, or released as a snapshot: its thread already
+                // retired, so this join is immediate. Dropping the entry
+                // releases the pulse and the duplicated thread handle, which
+                // the old watchdog held (and alarmed through) for the life of
+                // the process.
                 supervised.swap_remove(i).tail.shutdown();
             }
         }
@@ -491,6 +509,10 @@ impl Supervised {
             return true;
         }
         let pulse = self.tail.pulse.load();
+        // Read only for a retired tail, so a running one still costs one
+        // atomic load per scan.
+        let snapshot = pulse == Pulse::Retired
+            && matches!(*self.tail.state.phase.read(), VolumePhase::Snapshot);
         // Track the unbroken run of healthy observations this incarnation
         // has shown. Sampled at scan granularity, which can only
         // under-count health, never fake it. The anchor is only ever
@@ -504,7 +526,7 @@ impl Supervised {
         let proven_healthy = self
             .beating_since
             .is_some_and(|since| now.saturating_sub(since) >= HEALTHY_AFTER.as_secs());
-        match assess(pulse, now, self.revive_attempts, proven_healthy) {
+        match assess(pulse, now, self.revive_attempts, proven_healthy, snapshot) {
             Action::Nothing => true,
             Action::ResetBudget => {
                 tracing::debug!(
@@ -527,6 +549,14 @@ impl Supervised {
                 self.give_up();
                 false
             }
+            Action::Release => {
+                // The tail logged why it stopped; this is no failure.
+                tracing::debug!(
+                    volume = %self.tail.mount,
+                    "tail stopped on a snapshot volume; nothing to revive"
+                );
+                false
+            }
         }
     }
 
@@ -539,8 +569,9 @@ impl Supervised {
     fn launch_revival(&mut self) {
         self.revive_attempts += 1;
         self.beating_since = None;
-        // Every deliberate exit sets Failed or Offline itself, so a phase
-        // still claiming to track here is the panic signature. Correct it
+        // Every deliberate exit sets Failed, Offline or Snapshot itself (a
+        // Snapshot is released, not revived), so a phase still claiming to
+        // track here is the panic signature. Correct it
         // before the revival window opens: a revival blocked on sick
         // hardware must not extend a false Live indefinitely.
         {
@@ -724,34 +755,59 @@ mod tests {
     #[test]
     fn assess_decides_by_pulse_state() {
         // A fresh beat is left alone.
-        assert_eq!(assess(beat_ago(0), NOW, 0, false), Action::Nothing);
+        assert_eq!(assess(beat_ago(0), NOW, 0, false, false), Action::Nothing);
         // A beat inside the stall window is left alone even at the edge.
         let edge = BEAT_STALL.as_secs() - 1;
-        assert_eq!(assess(beat_ago(edge), NOW, 0, false), Action::Nothing);
+        assert_eq!(
+            assess(beat_ago(edge), NOW, 0, false, false),
+            Action::Nothing
+        );
         // Past the window: presumed wedged, cancel.
         let past = BEAT_STALL.as_secs();
         assert_eq!(
-            assess(beat_ago(past), NOW, 0, false),
+            assess(beat_ago(past), NOW, 0, false, false),
             Action::CancelIo { stalled_secs: past }
         );
         // Busy is exempt where a beat would already have been shot...
-        assert_eq!(assess(busy_for(past), NOW, 0, false), Action::Nothing);
+        assert_eq!(
+            assess(busy_for(past), NOW, 0, false, false),
+            Action::Nothing
+        );
         // ...but not forever: a wedged rebuild is still a wedge.
         let long = BUSY_STALL.as_secs();
         assert_eq!(
-            assess(busy_for(long), NOW, 0, false),
+            assess(busy_for(long), NOW, 0, false, false),
             Action::CancelIo { stalled_secs: long }
         );
         // Retired is never a cancel target, however long ago it happened:
         // it is revived while budget lasts and given up on after.
-        assert_eq!(assess(Pulse::Retired, NOW, 0, false), Action::Revive);
+        assert_eq!(assess(Pulse::Retired, NOW, 0, false, false), Action::Revive);
         assert_eq!(
-            assess(Pulse::Retired, NOW, MAX_REVIVES - 1, false),
+            assess(Pulse::Retired, NOW, MAX_REVIVES - 1, false, false),
             Action::Revive
         );
         assert_eq!(
-            assess(Pulse::Retired, NOW, MAX_REVIVES, false),
+            assess(Pulse::Retired, NOW, MAX_REVIVES, false, false),
             Action::GiveUp
+        );
+    }
+
+    /// A tail that retired on a snapshot volume (a rescan found the volume
+    /// refuses a journal) is released, with budget left or spent: a revival
+    /// would rebuild the index only to be refused again, and giving up would
+    /// leave an error for a volume that is fine. A running tail is judged by
+    /// its pulse alone.
+    #[test]
+    fn a_retired_snapshot_is_released_not_revived() {
+        assert_eq!(assess(Pulse::Retired, NOW, 0, false, true), Action::Release);
+        assert_eq!(
+            assess(Pulse::Retired, NOW, MAX_REVIVES, false, true),
+            Action::Release
+        );
+        let past = BEAT_STALL.as_secs();
+        assert_eq!(
+            assess(beat_ago(past), NOW, 0, false, true),
+            Action::CancelIo { stalled_secs: past }
         );
     }
 
@@ -761,14 +817,17 @@ mod tests {
     /// revival proves nothing.
     #[test]
     fn budget_refund_requires_a_proven_healthy_beat() {
-        assert_eq!(assess(beat_ago(0), NOW, 1, true), Action::ResetBudget);
-        assert_eq!(assess(beat_ago(0), NOW, 0, true), Action::Nothing);
-        assert_eq!(assess(beat_ago(0), NOW, 1, false), Action::Nothing);
-        assert_eq!(assess(busy_for(0), NOW, 1, true), Action::Nothing);
+        assert_eq!(
+            assess(beat_ago(0), NOW, 1, true, false),
+            Action::ResetBudget
+        );
+        assert_eq!(assess(beat_ago(0), NOW, 0, true, false), Action::Nothing);
+        assert_eq!(assess(beat_ago(0), NOW, 1, false, false), Action::Nothing);
+        assert_eq!(assess(busy_for(0), NOW, 1, true, false), Action::Nothing);
         // A stalled revived tail is a wedge first; the refund never masks it.
         let past = BEAT_STALL.as_secs();
         assert_eq!(
-            assess(beat_ago(past), NOW, 1, true),
+            assess(beat_ago(past), NOW, 1, true, false),
             Action::CancelIo { stalled_secs: past }
         );
     }
@@ -808,11 +867,11 @@ mod tests {
     #[test]
     fn a_stamp_newer_than_now_never_cancels() {
         assert_eq!(
-            assess(Pulse::Beat(NOW + 600), NOW, 0, false),
+            assess(Pulse::Beat(NOW + 600), NOW, 0, false, false),
             Action::Nothing
         );
         assert_eq!(
-            assess(Pulse::Busy(NOW + 600), NOW, 0, false),
+            assess(Pulse::Busy(NOW + 600), NOW, 0, false, false),
             Action::Nothing
         );
     }

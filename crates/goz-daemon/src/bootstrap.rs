@@ -13,6 +13,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
 use goz_core::layout::{RECOMMENDED_LAYOUT_FLAGS, walk_layout_buffer};
+use goz_core::types::VolumePhase;
 use goz_core::usn::walk_enum_buffer;
 use goz_winfs::{
     JournalInfo, JournalQuery, VolumeHandle, VolumeInfo, WinError, create_usn_journal,
@@ -332,6 +333,18 @@ impl JournalSetup {
             JournalSetup::Refused | JournalSetup::Unavailable => None,
         }
     }
+
+    /// The phase a volume reports once its index is built with this journal,
+    /// at bootstrap and after a rescan alike. Only a refused journal makes a
+    /// Snapshot; one that could not be read yet leaves the volume not
+    /// tracking, and a tail rebuilds the index once it can read the journal.
+    pub(crate) fn built_phase(self) -> VolumePhase {
+        match self {
+            JournalSetup::Active(_) => VolumePhase::Live,
+            JournalSetup::Refused => VolumePhase::Snapshot,
+            JournalSetup::Unavailable => VolumePhase::Offline,
+        }
+    }
 }
 
 /// Sets up the volume's USN journal and says what it got.
@@ -529,6 +542,16 @@ mod tests {
             setup(vec![Ok(NotActive)], Err(err(ERROR_WRITE_PROTECT))),
             (JournalSetup::Refused, 1)
         );
+    }
+
+    #[test]
+    fn only_a_refused_journal_makes_a_snapshot() {
+        assert_eq!(
+            JournalSetup::Active(info(GIB)).built_phase(),
+            VolumePhase::Live
+        );
+        assert_eq!(JournalSetup::Refused.built_phase(), VolumePhase::Snapshot);
+        assert!(!JournalSetup::Unavailable.built_phase().is_complete());
     }
 
     #[test]

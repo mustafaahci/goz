@@ -93,10 +93,11 @@ pub(crate) struct TailHandle {
     /// Volume this tail serves, for supervisor log lines.
     pub(crate) mount: String,
     /// The tail's self-reported liveness: beating, busy in a rebuild, or
-    /// retired. The supervisor's stall and retirement decisions read only
-    /// this, never `state.phase`, which is user-facing honesty state; the
-    /// phase is consulted for exactly one thing, gating the revival budget
-    /// refund (see the supervisor's `accrue_health`).
+    /// retired. The supervisor's stall decisions read only this, never
+    /// `state.phase`, which is user-facing honesty state; the phase is
+    /// consulted only for what it says about the volume: whether it is served
+    /// (the supervisor's `accrue_health`) and whether a retired tail left a
+    /// snapshot, which needs no revival.
     pub(crate) pulse: Arc<TailPulse>,
     /// Shared volume state, kept so the supervisor can revive a retired tail
     /// (reopen by GUID, respawn) and correct the phase when it gives up.
@@ -621,9 +622,9 @@ fn enrich_stats(
 
 /// Rescan with a storm guard: rebuilds the index, capping consecutive attempts
 /// so a persistently broken journal cannot loop forever. Returns the fresh
-/// cursor to resume from, or `None` to stop the tail (rebuild failed, no journal
-/// after rebuild, or the cap was hit; the volume is left Failed in the first
-/// and last cases).
+/// cursor to resume from, or `None` to stop the tail (rebuild failed, the volume
+/// refused a new journal, or the cap was hit; the volume is left Failed in the
+/// first and last cases and a Snapshot in the second).
 fn bounded_rescan(
     state: &VolumeState,
     handle: &VolumeHandle,
@@ -649,7 +650,9 @@ fn bounded_rescan(
 /// or parse anomaly). Re-enumerates the MFT on the handle the tail already owns,
 /// swaps the fresh index in under the write lock, invalidates the scope cache
 /// (its `EntryIdx`s belonged to the old index), and re-acquires a journal
-/// cursor. Queries keep serving (flagged incomplete) during the rebuild.
+/// cursor. Queries keep serving (flagged incomplete) during the rebuild. A
+/// volume that refuses a new journal is left a Snapshot, as at bootstrap, and
+/// the tail stops.
 fn rescan(
     state: &VolumeState,
     handle: &VolumeHandle,
@@ -665,13 +668,12 @@ fn rescan(
     // recreated DURING the rebuild invalidates this cursor, the first read
     // from it fails, and the ordinary error arms trigger another rescan. A
     // stale cursor is loud, a late cursor is silent.
-    let cursor = wait_for_journal(
+    let journal = wait_for_journal(
         state,
         || bootstrap::ensure_journal(handle, &state.guid),
         pulse,
         stop,
-    )?
-    .cursor();
+    )?;
 
     tracing::warn!(volume = %state.mount_prefix(), ?reason, "rebuilding index");
     // The rebuild re-enumerates the whole MFT without stamping the pulse.
@@ -693,28 +695,31 @@ fn rescan(
         }
     };
 
-    install(state, built, cursor);
+    let cursor = install(state, built, journal);
 
-    match cursor {
-        Some(c) => {
-            *state.phase.write() = VolumePhase::Live;
-            tracing::info!(
-                volume = %state.mount_prefix(),
-                entries = state.index.read().len(),
-                "rescan complete; tailing resumed"
-            );
-            Some(c)
-        }
-        None => {
-            // Rebuilt and correct, but the volume refused a new journal (an
-            // unavailable one was waited out above): fresh as of now but will
-            // not receive live updates. Report Offline so Status/query
-            // responses flag the volume incomplete instead of falsely Live.
-            *state.phase.write() = VolumePhase::Offline;
-            tracing::warn!(volume = %state.mount_prefix(), "rescan rebuilt index but no journal is available; live updates paused");
-            None
-        }
+    match journal {
+        JournalSetup::Active(_) => tracing::info!(
+            volume = %state.mount_prefix(),
+            entries = state.index.read().len(),
+            "rescan complete; tailing resumed"
+        ),
+        // Snapshot, not Offline, as at bootstrap: the index is complete as of
+        // now and no journal will ever update it. The tail stops, and the
+        // supervisor sees the Snapshot phase and does not revive it. Offline
+        // flagged every query incomplete for good once its revivals, each a
+        // full rebuild refused again, ran out.
+        JournalSetup::Refused => tracing::info!(
+            volume = %state.mount_prefix(),
+            "the volume refused a new USN journal; its index is a snapshot and cannot track changes"
+        ),
+        // `wait_for_journal` waits this out, so it is not reached. If it ever
+        // is, the volume is Offline and the supervisor revives the tail.
+        JournalSetup::Unavailable => tracing::warn!(
+            volume = %state.mount_prefix(),
+            "rescan rebuilt index but no journal is available; live updates paused"
+        ),
     }
+    cursor
 }
 
 /// Asks for the volume's journal until it is usable or refused.
@@ -768,18 +773,28 @@ fn wait_for_journal(
 }
 
 /// Publishes a rebuilt index with the flags that describe it, under the index
-/// write lock and before the phase returns to Live.
-fn install(state: &VolumeState, built: bootstrap::BuiltIndex, journal: Option<JournalInfo>) {
-    let mut index = state.index.write();
-    *index = built.index;
-    *state.metadata_pending.write() = built.metadata_pending;
-    *state.journal_max_bytes.write() = journal.map(|c| c.maximum_size);
-    // Invalidate the scope cache while the index write lock is held: its
-    // EntryIdx values belong to the old generation. Clearing it here (rather
-    // than after the lock drops) guarantees a reader never sees the new,
-    // possibly smaller index alongside a stale EntryIdx, which would index
-    // out of bounds in VolumeIndex::path_of during scope validation.
-    *state.scope_cache.lock() = None;
+/// write lock, then the phase its journal gives it. Returns the cursor to tail
+/// from, `None` when there is no journal to tail.
+fn install(
+    state: &VolumeState,
+    built: bootstrap::BuiltIndex,
+    journal: JournalSetup,
+) -> Option<JournalInfo> {
+    {
+        let mut index = state.index.write();
+        *index = built.index;
+        *state.metadata_pending.write() = built.metadata_pending;
+        *state.journal_max_bytes.write() = journal.cursor().map(|c| c.maximum_size);
+        // Invalidate the scope cache while the index write lock is held: its
+        // EntryIdx values belong to the old generation. Clearing it here
+        // (rather than after the lock drops) guarantees a reader never sees
+        // the new, possibly smaller index alongside a stale EntryIdx, which
+        // would index out of bounds in VolumeIndex::path_of during scope
+        // validation.
+        *state.scope_cache.lock() = None;
+    }
+    *state.phase.write() = journal.built_phase();
+    journal.cursor()
 }
 
 /// Sleeps up to `total`, waking early if `stop` flips. Plain `sleep` here
@@ -1006,15 +1021,39 @@ mod tests {
     #[test]
     fn a_rebuilt_index_brings_its_own_flags() {
         let state = volume(VolumePhase::Rescanning);
-        let journal = journal();
-        install(&state, built(false), Some(journal));
+        install(&state, built(false), JournalSetup::Active(journal()));
         assert!(!*state.metadata_pending.read());
         assert_eq!(*state.journal_max_bytes.read(), Some(64 << 20));
         assert!(state.scope_cache.lock().is_none());
 
-        install(&state, built(true), None);
+        install(&state, built(true), JournalSetup::Refused);
         assert!(*state.metadata_pending.read());
         assert_eq!(*state.journal_max_bytes.read(), None);
+    }
+
+    /// A rescan the volume refuses a new journal for leaves a Snapshot, as
+    /// bootstrap does, so its stopped tail flags no query incomplete and the
+    /// supervisor does not revive it. A journal goes Live with its cursor.
+    #[test]
+    fn a_rescan_refused_a_journal_leaves_a_snapshot() {
+        let state = volume(VolumePhase::Rescanning);
+        assert_eq!(install(&state, built(false), JournalSetup::Refused), None);
+        assert_eq!(*state.phase.read(), VolumePhase::Snapshot);
+        assert!(state.phase.read().is_complete());
+
+        let state = volume(VolumePhase::Rescanning);
+        assert_eq!(
+            install(&state, built(false), JournalSetup::Unavailable),
+            None
+        );
+        assert_eq!(*state.phase.read(), VolumePhase::Offline);
+
+        let state = volume(VolumePhase::Rescanning);
+        assert_eq!(
+            install(&state, built(false), JournalSetup::Active(journal())),
+            Some(journal())
+        );
+        assert_eq!(*state.phase.read(), VolumePhase::Live);
     }
 
     /// The converse direction is deliberately NOT asserted: the mask may name
