@@ -129,8 +129,9 @@ impl TailHandle {
 /// Spawns the tail thread for one volume. `handle` is moved into the thread
 /// (it is not shared). `cursor: None` means the caller has no trustworthy
 /// starting point (a supervisor reviving a tail whose predecessor exited, so
-/// the volume went untailed for a while) and the thread's first act is a full
-/// rescan, which rebuilds the index and acquires a fresh cursor.
+/// the volume went untailed for a while, or a bootstrap that could not read the
+/// journal) and the thread's first act is a full rescan, which rebuilds the
+/// index and acquires a fresh cursor.
 pub(crate) fn spawn(
     state: Arc<VolumeState>,
     handle: VolumeHandle,
@@ -201,8 +202,9 @@ fn tail_loop(
     // draw an unbounded join from the supervisor's give-up or revive path.
     let handle = &handle;
     let mut rescans: u32 = 0;
-    // A revived tail starts with no cursor: changes kept landing while the
-    // volume had no tail, so nothing proves the index is in sync. Rebuild it
+    // A tail without a cursor (revived, or started while the journal could not
+    // be read) cannot prove the index is in sync: changes kept landing while
+    // nothing read them. Rebuild it
     // and pick up a fresh cursor before tailing a single record. Deliberately
     // NOT routed through `bounded_rescan`: this rebuild is revival's price,
     // not a journal fault, and charging it would leave every revived
@@ -212,7 +214,7 @@ fn tail_loop(
     // budget instead.
     let cursor = match cursor {
         Some(c) => c,
-        None => match rescan(state, handle, pulse, RescanReason::TailRevived, stop) {
+        None => match rescan(state, handle, pulse, RescanReason::NoCursor, stop) {
             Some(c) => c,
             None => return,
         },
@@ -648,7 +650,7 @@ fn rescan(
     reason: RescanReason,
     stop: &AtomicBool,
 ) -> Option<JournalInfo> {
-    tracing::warn!(volume = %state.mount_prefix(), ?reason, "journal lost; rebuilding index");
+    tracing::warn!(volume = %state.mount_prefix(), ?reason, "rebuilding index");
     // The rebuild re-enumerates the whole MFT without stamping the pulse.
     // `Busy` tells the supervisor this silence is legitimate; the guard
     // restores a fresh beat on every way out of this function.
@@ -663,7 +665,7 @@ fn rescan(
     // recreated DURING the rebuild invalidates this cursor, the first read
     // from it fails, and the ordinary error arms trigger another rescan. A
     // stale cursor is loud, a late cursor is silent.
-    let cursor = bootstrap::ensure_journal(handle, &state.guid);
+    let cursor = bootstrap::ensure_journal(handle, &state.guid).cursor();
 
     // Pass the stop flag so a shutdown arriving mid-rebuild aborts promptly
     // instead of blocking `TailHandle::shutdown`'s join for the full MFT scan.

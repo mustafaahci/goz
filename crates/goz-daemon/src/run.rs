@@ -10,6 +10,7 @@ use goz_core::types::VolumePhase;
 use parking_lot::RwLock;
 use tokio::sync::watch;
 
+use crate::bootstrap::JournalSetup;
 use crate::supervisor::Supervisor;
 use crate::tail::{self, TailHandle};
 use crate::volume_state::{VolumeSet, VolumeState};
@@ -65,39 +66,35 @@ pub(crate) fn build_engine() -> Result<Engine> {
             guid: bv.guid_path.clone(),
             mounts: bv.mounts.clone(),
             index: RwLock::new(bv.index),
-            phase: RwLock::new(VolumePhase::Live),
+            phase: RwLock::new(bootstrap_phase(&bv.journal)),
             // True only when the FILE_LAYOUT pass stopped and ENUM named the
             // rest without sizes or dates.
             metadata_pending: RwLock::new(bv.metadata_pending),
-            journal_max_bytes: bv.cursor.map(|c| c.maximum_size),
+            journal_max_bytes: bv.journal.cursor().map(|c| c.maximum_size),
             scope_cache: parking_lot::Mutex::new(None),
         });
 
-        match bv.cursor {
-            Some(cursor) => {
+        let cursor = match bv.journal {
+            JournalSetup::Active(cursor) => {
                 tracing::info!(
                     volume = %state.mount_prefix(),
                     entries = state.index.read().len(),
                     "tailing journal"
                 );
-                match tail::spawn(state.clone(), bv.handle, Some(cursor)) {
-                    Ok(h) => tails.push(h),
-                    Err(e) => {
-                        // Thread creation or its handle duplication failed
-                        // (resource pressure); either way no tail is running.
-                        // Degrade just this volume to Offline instead of
-                        // aborting the whole engine bootstrap; status will
-                        // flag it incomplete.
-                        tracing::error!(
-                            volume = %state.mount_prefix(),
-                            error = %e,
-                            "failed to spawn tail thread; volume indexed but will not receive live updates"
-                        );
-                        *state.phase.write() = VolumePhase::Offline;
-                    }
-                }
+                Some(cursor)
             }
-            None => {
+            // Offline, not Snapshot: the index was built while nothing could
+            // read the journal, so changes made since may be missing. The tail
+            // starts without a cursor, which makes it rebuild the index once it
+            // can read the journal, and the volume goes Live from there.
+            JournalSetup::Unavailable => {
+                tracing::warn!(
+                    volume = %state.mount_prefix(),
+                    "USN journal unavailable; the tail will rebuild the index once it can read the journal"
+                );
+                None
+            }
+            JournalSetup::Refused => {
                 tracing::info!(
                     volume = %state.mount_prefix(),
                     "no USN journal; volume is indexed but its index is a snapshot and cannot track changes"
@@ -109,8 +106,24 @@ pub(crate) fn build_engine() -> Result<Engine> {
                 // used to land here on every machine; that was a broken
                 // `FSCTL_CREATE_USN_JOURNAL` code, not the filesystem
                 // refusing, and they now get a journal like any other volume.)
-                *state.phase.write() = VolumePhase::Snapshot;
                 // `bv.handle` drops here (CloseHandle); no tail for this volume.
+                states.push(state);
+                continue;
+            }
+        };
+        match tail::spawn(state.clone(), bv.handle, cursor) {
+            Ok(h) => tails.push(h),
+            Err(e) => {
+                // Thread creation or its handle duplication failed (resource
+                // pressure); either way no tail is running. Degrade just this
+                // volume to Offline instead of aborting the whole engine
+                // bootstrap; status will flag it incomplete.
+                tracing::error!(
+                    volume = %state.mount_prefix(),
+                    error = %e,
+                    "failed to spawn tail thread; volume indexed but will not receive live updates"
+                );
+                *state.phase.write() = VolumePhase::Offline;
             }
         }
         states.push(state);
@@ -139,6 +152,17 @@ pub(crate) fn build_engine() -> Result<Engine> {
         total_entries,
         elapsed: started.elapsed(),
     })
+}
+
+/// The phase a bootstrapped volume reports until its tail says otherwise. Only
+/// a volume that refused a journal is a Snapshot; one whose journal could not
+/// be read yet is not tracking, and its tail rebuilds the index once it can.
+fn bootstrap_phase(journal: &JournalSetup) -> VolumePhase {
+    match journal {
+        JournalSetup::Active(_) => VolumePhase::Live,
+        JournalSetup::Unavailable => VolumePhase::Offline,
+        JournalSetup::Refused => VolumePhase::Snapshot,
+    }
 }
 
 /// Best-effort post-bootstrap memory settling, shared by console + service
@@ -208,4 +232,30 @@ pub(crate) fn run_console() -> Result<()> {
 
     engine.supervisor.shutdown();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_refused_journal_makes_a_snapshot() {
+        let info = goz_winfs::JournalInfo {
+            journal_id: 7,
+            first_usn: 0,
+            next_usn: 4096,
+            lowest_valid_usn: 0,
+            max_usn: i64::MAX,
+            maximum_size: 64 << 20,
+        };
+        assert_eq!(
+            bootstrap_phase(&JournalSetup::Active(info)),
+            VolumePhase::Live
+        );
+        assert_eq!(
+            bootstrap_phase(&JournalSetup::Refused),
+            VolumePhase::Snapshot
+        );
+        assert!(!bootstrap_phase(&JournalSetup::Unavailable).is_complete());
+    }
 }

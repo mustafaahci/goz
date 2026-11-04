@@ -184,12 +184,17 @@ fn run_scan(query: Option<String>) -> anyhow::Result<()> {
         if let Some(enum_secs) = s.enum_secs {
             println!("  enum          {enum_secs:.2}s (the file_layout pass stopped)");
         }
-        match &s.cursor {
-            Some(c) => println!(
+        match &s.journal {
+            bootstrap::JournalSetup::Active(c) => println!(
                 "  journal       id={:#x} next_usn={}",
                 c.journal_id, c.next_usn
             ),
-            None => println!("  journal       (none: live updates unavailable)"),
+            bootstrap::JournalSetup::Unavailable => {
+                println!("  journal       (unavailable right now: live updates unavailable)")
+            }
+            bootstrap::JournalSetup::Refused => {
+                println!("  journal       (refused: the index is a snapshot)")
+            }
         }
     }
     println!(

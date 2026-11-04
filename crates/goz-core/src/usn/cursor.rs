@@ -57,7 +57,7 @@ pub enum Resync {
 
 /// Why a full rescan was decided. [`validate_cursor`] produces only
 /// `JournalIdChanged` / `CursorPurged` / `RestampDiscontinuity`; `ParserAnomaly`,
-/// `EntryDeletedError`, `TailRevived`, and `ReadsKeptFailing` are mapped by the
+/// `EntryDeletedError`, `NoCursor`, and `ReadsKeptFailing` are mapped by the
 /// daemon from runtime conditions. `JournalNotActive`,
 /// `JournalDeleteInProgress`, and `VolumeReattached` are reserved for causes
 /// the daemon does not yet map. All live here so every rescan cause shares one
@@ -86,10 +86,10 @@ pub enum RescanReason {
     /// A corrupt buffer or cycle was detected while parsing/applying; we
     /// cannot prove what was missed (daemon-mapped).
     ParserAnomaly,
-    /// The volume's tail thread exited and its supervisor revived it; the
-    /// volume went untailed in between, so nothing proves the index is still
-    /// in sync (daemon-mapped).
-    TailRevived,
+    /// The tail started without a journal cursor, so nothing proves the index
+    /// is in sync: its supervisor revived it after the previous tail exited,
+    /// or bootstrap could not read the journal (daemon-mapped).
+    NoCursor,
     /// Journal reads kept failing past the daemon's escalation window with
     /// codes no arm maps (observed live: `ERROR_INVALID_PARAMETER` against a
     /// cursor whose journal was deleted mid-read); whatever the cause, a
