@@ -33,5 +33,9 @@ harness = false
 name = "compact"
 harness = false
 
+[[bench]]
+name = "sort"
+harness = false
+
 [lints]
 workspace = true

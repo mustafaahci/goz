@@ -10,6 +10,7 @@
 //! `FolderPaths`), plus its own name.
 
 use super::dates::DateFilter;
+use super::folder_rank::FolderRanks;
 use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange};
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
@@ -246,9 +247,10 @@ fn term_admits(term: &[u8], prefix: &[u8]) -> bool {
 struct Candidate {
     idx: EntryIdx,
     /// The key the page's sort asks for, filled by [`order`]: the name's rank
-    /// key for a name sort, the parent directory's rank for a path sort (see
-    /// [`rank_parents`]), the size for a size sort, the order-preserving image
-    /// of the mtime for a date sort. Candidates used to carry kind, size, date, an
+    /// key for a name sort, the parent folder's rank and the name's rank
+    /// packed together for a path sort (see [`path_keys`]), the size for a
+    /// size sort, the order-preserving image of the mtime for a date sort.
+    /// Candidates used to carry kind, size, date, an
     /// optional path and a `fold(parent) + NUL + fold(name)` key string each,
     /// ~300 MB under the index lock for a 100-row page of a broad path sort.
     key: u64,
@@ -351,13 +353,10 @@ fn page_refs(
         let (start, end) = page_bounds(total as usize, offset, limit);
         return (total, name_level_refs(index, matched, sort.dir, start, end));
     }
-    let Scan {
-        mut candidates,
-        mut dir_paths,
-    } = scan(index, parsed, &compiled, scope);
+    let mut candidates = scan(index, parsed, &compiled, scope);
     let total = candidates.len() as u64;
     let (start, end) = page_bounds(candidates.len(), offset, limit);
-    order(index, &mut candidates, &mut dir_paths, sort, end);
+    order(index, &mut candidates, sort, end);
     let refs = candidates[start..end]
         .iter()
         .map(|c| HitRef {
@@ -600,26 +599,15 @@ fn name_level_refs(
 /// the folder.
 const SUBTREE_WALK_MAX: usize = 200_000;
 
-/// The match set of a query: every candidate that passed all predicates, in
-/// scan order, plus the parent-path memo the scan built. Ordering and page
-/// building share the memo so no parent chain is walked twice.
-struct Scan {
-    candidates: Vec<Candidate>,
-    dir_paths: FxHashMap<EntryIdx, Option<Vec<u8>>>,
-}
-
-/// Collects every match of `parsed` under `scope`.
+/// Collects every match of `parsed` under `scope`, in scan order.
 fn scan(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
     compiled: &CompiledQuery,
     scope: Option<EntryIdx>,
-) -> Scan {
+) -> Vec<Candidate> {
     if !compiled.volume_admits {
-        return Scan {
-            candidates: Vec::new(),
-            dir_paths: FxHashMap::default(),
-        };
+        return Vec::new();
     }
     // Built only when a full path has something left to decide.
     let mut folders = compiled
@@ -627,9 +615,8 @@ fn scan(
         .then(|| FolderPaths::new(index, &compiled.prefix, !parsed.match_case));
     let mut scope_memo: FxHashMap<EntryIdx, bool> = FxHashMap::default();
     // Each parent directory's reconstructed path, or None when it has none (its
-    // ancestry ends in lost+found, or hit the hop cap). ONE memo, shared by the
-    // candidate filter and the page builder: both need exactly this walk, and
-    // doing it twice cost a rare query ~13% for nothing.
+    // ancestry ends in lost+found, or hit the hop cap), for the presentability
+    // check in `evaluate`.
     let mut dir_paths: FxHashMap<EntryIdx, Option<Vec<u8>>> = FxHashMap::default();
     let mut candidates: Vec<Candidate> = Vec::new();
     // Per-candidate scratch buffers, allocated once and reused across the scan
@@ -758,10 +745,7 @@ fn scan(
         }
     }
 
-    Scan {
-        candidates,
-        dir_paths,
-    }
+    candidates
 }
 
 /// `[start, end)` of the requested page within `n` matches.
@@ -777,13 +761,7 @@ fn page_bounds(n: usize, offset: u32, limit: Option<u32>) -> (usize, usize) {
 /// Orders `candidates` so that `[..end]` holds the first `end` matches under
 /// `sort`, in order (see [`order_top`]). A path sort first ranks each distinct
 /// parent directory; no candidate carries a key string.
-fn order(
-    index: &VolumeIndex,
-    candidates: &mut [Candidate],
-    dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
-    sort: SortSpec,
-    end: usize,
-) {
+fn order(index: &VolumeIndex, candidates: &mut [Candidate], sort: SortSpec, end: usize) {
     match sort.key {
         // Two integers per comparison instead of two folded names: see
         // `NameStore::rank_key`. Names still waiting outside the order get a
@@ -793,7 +771,7 @@ fn order(
                 c.key = index.name_rank_key(index.name_id(c.idx));
             }
         }
-        SortKey::Path => rank_parents(index, candidates, dir_paths),
+        SortKey::Path => path_keys(index, candidates),
         SortKey::Size => {
             for c in candidates.iter_mut() {
                 c.key = index.entry(c.idx).size().unwrap_or(0);
@@ -814,49 +792,32 @@ fn mtime_key(mtime: Option<i64>) -> u64 {
     (mtime.unwrap_or(i64::MIN) as u64) ^ (1 << 63)
 }
 
-/// Gives each candidate the rank of its parent directory in folded-path order,
-/// so a path sort compares `(parent rank, folded name, idx)` and builds no key
-/// per candidate. One folded path is built per DISTINCT parent (siblings share
-/// it, and a broad result set has far fewer directories than files), and
-/// parents with equal folded paths share a rank, so the order equals the old
-/// per-candidate `fold(parent) + NUL + fold(name)` key order exactly: es's
-/// `(parent path, name)` tuple order. A parent that is not presentable (under
-/// lost+found, or a cycle) ranks last; its candidates are dropped at page time
-/// anyway.
-fn rank_parents(
-    index: &VolumeIndex,
-    candidates: &mut [Candidate],
-    dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
-) {
-    use rayon::slice::ParallelSliceMut;
-    let mut folded: FxHashMap<EntryIdx, Option<Vec<u8>>> = FxHashMap::default();
-    for c in candidates.iter() {
-        let parent = index.entry(c.idx).parent();
-        folded
-            .entry(parent)
-            .or_insert_with(|| parent_path(index, parent, dir_paths).as_deref().map(fold));
-    }
-    let mut dirs: Vec<(EntryIdx, Option<Vec<u8>>)> = folded.into_iter().collect();
-    // Presentable parents first, in folded-path order. The idx tiebreak only
-    // makes the sort deterministic; equal paths get one rank below.
-    dirs.par_sort_unstable_by(|a, b| {
-        a.1.is_none()
-            .cmp(&b.1.is_none())
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    let mut ranks: FxHashMap<EntryIdx, u32> =
-        FxHashMap::with_capacity_and_hasher(dirs.len(), Default::default());
-    let mut rank = 0u32;
-    for (i, (dir, path)) in dirs.iter().enumerate() {
-        if i > 0 && dirs[i - 1].1 != *path {
-            rank += 1;
-        }
-        ranks.insert(*dir, if path.is_some() { rank } else { u32::MAX });
-    }
+/// Keys a path sort with the parent folder's rank in the high half and the
+/// name's rank key in the low half, so the comparator orders by `(folded
+/// parent path, folded name, idx)`, es's `(parent path, name)` order, with
+/// integers alone and no path built. [`FolderRanks`] ranks each distinct
+/// parent by walking the tree; folders with equal folded paths share a rank,
+/// and one with no full path (under lost+found, in a cycle, or too deep)
+/// ranks last, its candidates dropped at page time anyway.
+///
+/// A rank key outgrows `u32` only past two billion names, and clamping it
+/// keeps the order: clamped keys tie, and the comparator breaks a tie on the
+/// folded name, which orders as the rank keys do.
+fn path_keys(index: &VolumeIndex, candidates: &mut [Candidate]) {
+    use rayon::prelude::*;
+    let mut folders = FolderRanks::new(index);
     for c in candidates.iter_mut() {
-        c.key = u64::from(ranks[&index.entry(c.idx).parent()]);
+        c.key = u64::from(folders.node(index, index.entry(c.idx).parent()));
     }
+    let ranks = folders.ranks(index);
+    // Reads only, so a broad match set splits across cores.
+    candidates
+        .par_iter_mut()
+        .with_min_len(1 << 14)
+        .for_each(|c| {
+            let name = index.name_rank_key(index.name_id(c.idx));
+            c.key = (u64::from(ranks[c.key as usize]) << 32) | name.min(u64::from(u32::MAX));
+        });
 }
 
 /// Builds the page's hits with their volume-relative paths.
@@ -2686,6 +2647,250 @@ mod tests {
             got.sort();
             prop_assert_eq!(out.total as usize, got.len());
             prop_assert_eq!(got, want, "query {:?} under {}", query, prefix);
+        }
+    }
+
+    // -- path order ---------------------------------------------------------
+
+    /// How a path sort keyed candidates before folder ranks: every distinct
+    /// parent's folded path built and sorted, equal paths sharing a rank, a
+    /// parent with no full path last. The reference [`path_keys`] must match.
+    fn path_keys_by_built_paths(index: &VolumeIndex, candidates: &mut [Candidate]) {
+        let mut memo = FxHashMap::default();
+        let mut folded: FxHashMap<EntryIdx, Option<Vec<u8>>> = FxHashMap::default();
+        for c in candidates.iter() {
+            let parent = index.entry(c.idx).parent();
+            folded
+                .entry(parent)
+                .or_insert_with(|| parent_path(index, parent, &mut memo).as_deref().map(fold));
+        }
+        let mut dirs: Vec<(EntryIdx, Option<Vec<u8>>)> = folded.into_iter().collect();
+        dirs.sort_unstable_by(|a, b| {
+            a.1.is_none()
+                .cmp(&b.1.is_none())
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut ranks: FxHashMap<EntryIdx, u32> = FxHashMap::default();
+        let mut rank = 0u32;
+        for (i, (dir, path)) in dirs.iter().enumerate() {
+            if i > 0 && dirs[i - 1].1 != *path {
+                rank += 1;
+            }
+            ranks.insert(*dir, if path.is_some() { rank } else { u32::MAX });
+        }
+        for c in candidates.iter_mut() {
+            c.key = u64::from(ranks[&index.entry(c.idx).parent()]);
+        }
+    }
+
+    /// The first difference between the path-sorted pages `page_refs` returns
+    /// and the ones the built-path keys give, over both directions and a few
+    /// slices, or `None` when every page agrees.
+    fn path_pages_differ(index: &VolumeIndex, parsed: &ParsedQuery) -> Option<String> {
+        let compiled = CompiledQuery::new(parsed, r"C:\");
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            let sort = SortSpec {
+                key: SortKey::Path,
+                dir,
+            };
+            for (offset, limit) in [(0, None), (0, Some(1)), (1, Some(3)), (2, None)] {
+                let mut old = scan(index, parsed, &compiled, None);
+                let (start, end) = page_bounds(old.len(), offset, limit);
+                path_keys_by_built_paths(index, &mut old);
+                order_top(index, &mut old, sort, end);
+                let old: Vec<EntryIdx> = old[start..end].iter().map(|c| c.idx).collect();
+                let (_, refs) = page_refs(index, r"C:\", parsed, None, sort, offset, limit, true);
+                let new: Vec<EntryIdx> = refs.iter().map(|r| r.idx).collect();
+                if new != old {
+                    return Some(format!(
+                        "{dir:?} offset {offset} limit {limit:?}: {new:?} != {old:?}"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Path-sorted hit paths of `query`.
+    fn path_sorted(idx: &VolumeIndex, query: &str) -> Vec<String> {
+        let parsed = parse_query(query).unwrap();
+        let sort = SortSpec::default_for(SortKey::Path);
+        let out = run_query(idx, r"C:\", &parsed, None, sort, 0, None);
+        out.hits
+            .iter()
+            .map(|h| crate::wtf8::to_string_lossy(&h.path))
+            .collect()
+    }
+
+    /// A space and `[` sort below `\` and `_` and `~` above it, so a folder's
+    /// own subfolders land between its siblings: a walk that descends right
+    /// after each folder puts `a\x` second.
+    #[test]
+    fn path_sort_places_a_subtree_after_siblings_that_extend_its_name() {
+        let root = NTFS_ROOT_FRN;
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        for (i, dir) in ["a~", "a_b", "a", "a[", "a b"].iter().enumerate() {
+            let d = frn(100 + i as u64);
+            idx.insert_enum(&enum_rec(d, root, dir, true));
+            idx.insert_enum(&enum_rec(frn(200 + i as u64), d, "f", false));
+        }
+        idx.insert_enum(&enum_rec(frn(300), frn(102), "x", true));
+        idx.insert_enum(&enum_rec(frn(301), frn(300), "f", false));
+        let expected = [r"a\f", r"a b\f", r"a[\f", r"a\x\f", r"a_b\f", r"a~\f"];
+        assert_eq!(path_sorted(&idx, "f"), expected, "no name order");
+        idx.optimize_storage();
+        assert_eq!(path_sorted(&idx, "f"), expected, "with the name order");
+        assert_eq!(path_pages_differ(&idx, &parse_query("").unwrap()), None);
+    }
+
+    /// Folders whose names fold alike (`B` and `b` in a case-sensitive
+    /// folder) have one folded path, so their files interleave by name and
+    /// their subfolders merge into one order.
+    #[test]
+    fn path_sort_merges_folders_whose_names_fold_alike() {
+        let root = NTFS_ROOT_FRN;
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        for r in [
+            enum_rec(frn(100), root, "B", true),
+            enum_rec(frn(101), root, "b", true),
+            enum_rec(frn(102), frn(100), "y", true),
+            enum_rec(frn(103), frn(101), "x", true),
+            enum_rec(frn(104), frn(100), "m.txt", false),
+            enum_rec(frn(105), frn(101), "k.txt", false),
+            enum_rec(frn(106), frn(100), "z.txt", false),
+            enum_rec(frn(107), frn(102), "f.txt", false),
+            enum_rec(frn(108), frn(103), "f.txt", false),
+        ] {
+            idx.insert_enum(&r);
+        }
+        idx.optimize_storage();
+        assert_eq!(
+            path_sorted(&idx, "txt"),
+            [
+                r"b\k.txt",
+                r"B\m.txt",
+                r"B\z.txt",
+                r"b\x\f.txt",
+                r"B\y\f.txt"
+            ]
+        );
+        assert_eq!(path_pages_differ(&idx, &parse_query("").unwrap()), None);
+    }
+
+    /// Past the depth where `path_of` gives up a folder has no full path, so
+    /// its files rank after every other, `b\f.txt` included, as they did when
+    /// paths were built. A chain of `a` folders holds `f.txt` at every depth;
+    /// counting the root as one, the folder at depth `MAX_PATH_HOPS` is the
+    /// last with a path.
+    #[test]
+    fn path_sort_ranks_folders_past_the_hop_cap_last() {
+        use crate::index::PathStatus;
+        use crate::index::volume::MAX_PATH_HOPS;
+        let root = NTFS_ROOT_FRN;
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        idx.insert_enum(&enum_rec(frn(100), root, "b", true));
+        idx.insert_enum(&enum_rec(frn(101), frn(100), "f.txt", false));
+        let chain = MAX_PATH_HOPS as u64 + 3;
+        let mut parent = root;
+        for i in 0..chain {
+            let d = frn(10_000 + i);
+            idx.insert_enum(&enum_rec(d, parent, "a", true));
+            idx.insert_enum(&enum_rec(frn(20_000 + i), d, "f.txt", false));
+            parent = d;
+        }
+        idx.optimize_storage();
+        assert!(!idx.has_orphans());
+        let file = |f| idx.head_of(frn(f)).unwrap();
+        let status = |e: EntryIdx| idx.path_of(idx.entry(e).parent(), &mut Vec::new());
+        // The chain's files with a path by depth, then `b`'s, then the rest.
+        let with_path = MAX_PATH_HOPS as u64 - 1;
+        let mut want: Vec<EntryIdx> = (0..with_path).map(|i| file(20_000 + i)).collect();
+        want.push(file(101));
+        want.extend((with_path..chain).map(|i| file(20_000 + i)));
+        assert_eq!(status(file(20_000 + with_path - 1)), PathStatus::Ok);
+        assert_eq!(status(file(20_000 + with_path)), PathStatus::CycleDetected);
+        let parsed = parse_query("f.txt").unwrap();
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            let sort = SortSpec {
+                key: SortKey::Path,
+                dir,
+            };
+            let (_, refs) = page_refs(&idx, r"C:\", &parsed, None, sort, 0, None, true);
+            let got: Vec<EntryIdx> = refs.iter().map(|r| r.idx).collect();
+            assert_eq!(got, want, "{dir:?}");
+            want.reverse();
+        }
+    }
+
+    /// Name parts that fold alike (`A` and `a`, NFC and NFD `é`), sort below
+    /// `\` (space, `[`, `.`, `0`) or above it (`_`, `~`, letters), and repeat.
+    const PARTS: &[&str] = &[
+        "a", "A", "b", " ", "[", "_", "~", ".", "0", "é", "e\u{301}", "É",
+    ];
+
+    /// A volume from `entries`: kind 0..=3 is a folder, 4..=8 a file, 9 a file
+    /// whose folder is unknown (an orphan). The name order is built after
+    /// `order_at` entries, at the end, or never, so names join it late or not
+    /// at all; `cycle` reparents one folder, under its own subtree when the
+    /// pick lands there.
+    fn random_volume(
+        entries: &[(u8, prop::sample::Index, Vec<usize>)],
+        order_at: prop::sample::Index,
+        cycle: Option<(prop::sample::Index, prop::sample::Index)>,
+    ) -> VolumeIndex {
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let mut dirs = vec![NTFS_ROOT_FRN];
+        let order_at = order_at.index(entries.len() + 2);
+        for (i, (kind, parent, parts)) in entries.iter().enumerate() {
+            if i == order_at {
+                idx.optimize_storage();
+            }
+            let name: String = parts.iter().map(|&p| PARTS[p]).collect();
+            let f = frn(10_000 + i as u64);
+            let parent = match kind {
+                9 => frn(99_999),
+                _ => dirs[parent.index(dirs.len())],
+            };
+            idx.insert_enum(&enum_rec(f, parent, &name, *kind < 4));
+            if *kind < 4 {
+                dirs.push(f);
+            }
+        }
+        if order_at == entries.len() {
+            idx.optimize_storage();
+        }
+        if let Some((a, b)) = cycle
+            && dirs.len() > 1
+        {
+            let pick = |i: prop::sample::Index| idx.head_of(dirs[1 + i.index(dirs.len() - 1)]);
+            let (a, b) = (pick(a).unwrap(), pick(b).unwrap());
+            idx.force_parent(a, b);
+        }
+        idx
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Folder ranks order a path sort exactly as building and sorting
+        /// every parent's folded path did, on random trees whose names fold
+        /// together, extend one another across `\`, join the name order late,
+        /// or sit under lost+found or in a cycle.
+        #[test]
+        fn path_order_matches_sorting_built_paths(
+            entries in prop::collection::vec(
+                (0u8..10, any::<prop::sample::Index>(), prop::collection::vec(0..PARTS.len(), 1..4)),
+                1..60,
+            ),
+            order_at in any::<prop::sample::Index>(),
+            cycle in prop::option::weighted(0.2, (any::<prop::sample::Index>(), any::<prop::sample::Index>())),
+            // Path terms and a path wildcard run the per-folder path test too.
+            query in prop::sample::select(vec!["", "a", "é", "A case:", r"a\", r"\b", r"*a\*"]),
+        ) {
+            let idx = random_volume(&entries, order_at, cycle);
+            let parsed = parse_query(query).unwrap();
+            prop_assert_eq!(path_pages_differ(&idx, &parsed), None);
         }
     }
 }

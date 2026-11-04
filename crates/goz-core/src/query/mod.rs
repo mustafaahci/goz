@@ -8,6 +8,7 @@
 
 pub mod dates;
 pub mod engine;
+mod folder_rank;
 pub mod parse;
 
 /// Case folding lives at the crate root (`crate::fold`) so the index can build
