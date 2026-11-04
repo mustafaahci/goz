@@ -342,6 +342,10 @@ fn page_refs(
     allow_name_level: bool,
 ) -> (u64, Vec<HitRef>) {
     let compiled = CompiledQuery::new(parsed, mount_prefix);
+    // A scope at the root admits every entry with a path, as no scope does,
+    // so it goes: kept, it would bar the name-level path, and `-path C:\ e`
+    // ran three times slower than `e`.
+    let scope = scope.filter(|&s| s != index.root());
     if allow_name_level
         && sort.key == SortKey::Name
         && is_name_level(index, parsed, &compiled, scope)
@@ -1926,6 +1930,82 @@ mod tests {
             .map(|h| crate::wtf8::to_string_lossy(&h.path))
             .collect();
         assert_eq!(paths, vec!["docs\\sub\\Report.PDF"]); // descendants only, not "docs\sub" itself
+    }
+
+    /// `page_refs` drops a scope at the root because it admits the same
+    /// entries as no scope, orphans left out either way: on the subtree walk
+    /// a small scope takes, and on the ancestry check per entry that a scope
+    /// too large to walk takes. One fixture has a folder whose record put it
+    /// under its own subfolder, a cycle cut off from the root that the
+    /// orphan check alone does not see.
+    #[test]
+    fn a_root_scope_admits_what_no_scope_does() {
+        let mut sample = sample_index();
+        sample.optimize_storage();
+        let orphaned = index_with_orphans();
+        assert!(orphaned.has_orphans());
+        let mut moved_under_itself = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        for r in [
+            enum_rec(frn(100), NTFS_ROOT_FRN, "a", true),
+            enum_rec(frn(101), frn(100), "b", true),
+            enum_rec(frn(102), frn(101), "xfile.txt", false),
+            enum_rec(frn(103), NTFS_ROOT_FRN, "xother.txt", false),
+            enum_rec(frn(100), frn(101), "a", true),
+        ] {
+            moved_under_itself.insert_enum(&r);
+        }
+        let mut admitted = 0;
+        for idx in [&sample, &orphaned, &moved_under_itself] {
+            let root = Some(idx.root());
+            for q in [
+                "",
+                "log",
+                "e",
+                "x",
+                "*.pdf",
+                "ghost",
+                "file:",
+                "size:>100",
+                r"docs\",
+            ] {
+                let parsed = parse_query(q).unwrap();
+                let compiled = CompiledQuery::new(&parsed, r"C:\");
+                let walked = |scope| {
+                    let mut found: Vec<EntryIdx> = scan(idx, &parsed, &compiled, scope)
+                        .iter()
+                        .map(|c| c.idx)
+                        .collect();
+                    found.sort_unstable();
+                    found
+                };
+                assert_eq!(walked(root), walked(None), "{q:?}");
+                let admits = |e, scope| {
+                    let mut folders = compiled
+                        .tests_paths(&parsed)
+                        .then(|| FolderPaths::new(idx, &compiled.prefix, true));
+                    evaluate(
+                        idx,
+                        &parsed,
+                        &compiled,
+                        e,
+                        scope,
+                        &mut FxHashMap::default(),
+                        &mut FxHashMap::default(),
+                        &mut folders,
+                        false,
+                        &mut CodePointBuf::new(),
+                        &mut Vec::new(),
+                    )
+                    .is_some()
+                };
+                for e in idx.live_entries().filter(|&e| !idx.is_synthetic(e)) {
+                    let unscoped = admits(e, None);
+                    assert_eq!(admits(e, root), unscoped, "{q:?} {e:?}");
+                    admitted += usize::from(unscoped);
+                }
+            }
+        }
+        assert!(admitted > 0);
     }
 
     /// A folder whose record put it under its own subfolder forms a cycle
