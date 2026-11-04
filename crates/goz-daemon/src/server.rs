@@ -596,13 +596,17 @@ enum VolScope {
 }
 
 /// Resolves which volumes (and per-volume unresolved scope) a query targets.
+/// A scope belongs to the volume with the longest mount prefix it starts with,
+/// so a volume mounted in a folder of another (`C:\mnt\usb\`) gets the scopes
+/// under that folder wherever it sits in the volume set.
 fn targets(volumes: &VolumeSet, scope: &Option<String>) -> Vec<(Arc<VolumeState>, VolScope)> {
     match scope {
         None => volumes.iter().map(|v| (v.clone(), VolScope::All)).collect(),
         Some(path) => {
             let Some(vol) = volumes
                 .iter()
-                .find(|v| starts_with_ci(path, v.mount_prefix()))
+                .filter(|v| starts_with_ci(path, v.mount_prefix()))
+                .max_by_key(|v| v.mount_prefix().len())
             else {
                 return Vec::new();
             };
@@ -1026,6 +1030,31 @@ mod tests {
         assert!(
             targets(&vols, &Some(r"Z:\nope".to_string())).is_empty(),
             "an unindexed drive yields no targets"
+        );
+    }
+
+    /// A volume mounted in a folder of another gets the scopes under that
+    /// folder, also when it comes after the volume it sits in, as a volume
+    /// found later does. The first matching prefix sent them to the outer
+    /// volume, whose index holds only the mount folder, never its contents.
+    #[test]
+    fn a_scope_goes_to_the_volume_mounted_deepest() {
+        let mounted = live_volume(r"C:\mnt\usb\");
+        let vols = set(&[live_volume(r"C:\"), mounted.clone()]);
+
+        let picked = targets(&vols, &Some(r"c:\MNT\usb\Windows\".to_string()));
+        assert_eq!(picked.len(), 1);
+        assert!(Arc::ptr_eq(&picked[0].0, &mounted));
+        let VolScope::Rel(rel) = &picked[0].1 else {
+            panic!("a -path scope must produce Rel")
+        };
+        assert_eq!(rel, b"Windows");
+
+        let outer = targets(&vols, &Some(r"C:\mnt\other".to_string()));
+        assert_eq!(outer[0].0.mount_prefix(), r"C:\");
+        assert_eq!(
+            result_paths(&vols, scoped("System32", r"C:\mnt\usb\Windows")),
+            [r"C:\mnt\usb\Windows\System32"]
         );
     }
 
