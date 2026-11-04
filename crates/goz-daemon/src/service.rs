@@ -5,11 +5,13 @@
 //! elevation. `uninstall` stops and removes it. `run` is the SCM entry point:
 //! Windows launches `gozd.exe run --service`, which hands the process to the
 //! service dispatcher and reports `StartPending` (with a heartbeat checkpoint)
-//! → `Running` → `Stopped`. `Running` comes once the volumes are listed and the
-//! pipe is claimed, before any volume is indexed; results are flagged
-//! incomplete until each volume's first build is published.
+//! → `Running` → `StopPending` (with one too) → `Stopped`. `Running` comes
+//! once the volumes are listed and the pipe is claimed, before any volume is
+//! indexed; results are flagged incomplete until each volume's first build is
+//! published.
 
 use std::ffi::OsString;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -34,6 +36,13 @@ const DISPLAY_NAME: &str = "goz file index";
 const DESCRIPTION: &str =
     "Indexes NTFS volumes (MFT + USN journal) for instant file search in arsivle.";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+/// How often a start or a stop under way reports a fresh checkpoint.
+const PENDING_HEARTBEAT: Duration = Duration::from_secs(2);
+
+/// The wait hint of every pending report: two heartbeats, so one late report
+/// never reads as a hang.
+const PENDING_WAIT_HINT: Duration = Duration::from_secs(4);
 
 // Win32 error codes we treat as non-fatal for idempotent install/uninstall.
 const ERROR_SERVICE_EXISTS: i32 = 1073;
@@ -253,16 +262,21 @@ fn run_service() -> Result<()> {
     let handle_cell: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
     let handler_cell = handle_cell.clone();
 
+    // Set by the Stop control, and by the engine once its pipe server ends
+    // for any reason; from then on this thread reports StopPending until the
+    // engine thread ends. The checkpoint is shared so it only ever grows.
+    let stopping = Arc::new(AtomicBool::new(false));
+    let checkpoint = Arc::new(AtomicU32::new(0));
+    let handler_stopping = stopping.clone();
+    let handler_checkpoint = checkpoint.clone();
+    let engine_stopping = stopping.clone();
+
     let event_handler = move |control: ServiceControl| -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
+                handler_stopping.store(true, Ordering::Release);
                 if let Some(handle) = handler_cell.get() {
-                    let _ = handle.set_service_status(status_report(
-                        ServiceState::StopPending,
-                        ServiceControlAccept::empty(),
-                        1,
-                        Duration::from_secs(10),
-                    ));
+                    let _ = handle.set_service_status(stop_pending(&handler_checkpoint));
                 }
                 let _ = stop_tx.send(true);
                 ServiceControlHandlerResult::NoError
@@ -282,15 +296,15 @@ fn run_service() -> Result<()> {
         ServiceState::StartPending,
         ServiceControlAccept::empty(),
         1,
-        Duration::from_secs(4),
+        PENDING_WAIT_HINT,
     ))?;
 
     // Start indexing and serve on a dedicated thread until stopped. The SCM
     // thread stays free to pump checkpoints and receive Stop.
     let engine_thread = std::thread::spawn(move || -> Result<()> {
-        let served = serve(stop_rx, &ready_tx);
+        let served = serve(stop_rx, &ready_tx, &engine_stopping);
         // Ends StartPending with the reason when the failure came first; once
-        // Running was reported, nothing reads this.
+        // Running was reported, the stop wait reads past it.
         if let Err(e) = &served {
             let _ = ready_tx.send(Err(format!("{e:#}")));
         }
@@ -298,17 +312,17 @@ fn run_service() -> Result<()> {
     });
 
     // Heartbeat StartPending until the engine reports ready (or fails).
-    let mut checkpoint = 1u32;
+    let mut start_checkpoint = 1u32;
     let ready = loop {
-        match ready_rx.recv_timeout(Duration::from_secs(2)) {
+        match ready_rx.recv_timeout(PENDING_HEARTBEAT) {
             Ok(result) => break result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                checkpoint += 1;
+                start_checkpoint += 1;
                 status_handle.set_service_status(status_report(
                     ServiceState::StartPending,
                     ServiceControlAccept::empty(),
-                    checkpoint,
-                    Duration::from_secs(4),
+                    start_checkpoint,
+                    PENDING_WAIT_HINT,
                 ))?;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -336,8 +350,14 @@ fn run_service() -> Result<()> {
         }
     }
 
-    // Block until the engine thread returns: after the Stop control flips
-    // `stop_tx`, or when the pipe server fails or the thread panics.
+    // Wait for the engine thread, which ends after the Stop control flips
+    // `stop_tx`, or when the pipe server fails or the thread panics. Its
+    // teardown can take the supervisor's whole bounded wait, so the stop
+    // reports a fresh checkpoint every heartbeat rather than one wait hint
+    // for all of it.
+    wait_for_engine(&ready_rx, &stopping, PENDING_HEARTBEAT, || {
+        let _ = status_handle.set_service_status(stop_pending(&checkpoint));
+    });
     let exit_code = service_exit_code(engine_thread.join());
     tracing::info!(?exit_code, "goz service stopped");
     status_handle.set_service_status(stopped_report(exit_code))?;
@@ -345,15 +365,53 @@ fn run_service() -> Result<()> {
 }
 
 /// Starts the engine and serves until stopped, sending `Ok` on `ready` once
-/// the pipe server is ready to report `Running` (see [`server::run`]).
-fn serve(stop: watch::Receiver<bool>, ready: &mpsc::Sender<Result<(), String>>) -> Result<()> {
+/// the pipe server is ready to report `Running` (see [`server::run`]), and
+/// setting `stopping` once it ends, before the teardown.
+fn serve(
+    stop: watch::Receiver<bool>,
+    ready: &mpsc::Sender<Result<(), String>>,
+    stopping: &AtomicBool,
+) -> Result<()> {
     let engine = run::start_engine()?;
     let ready = ready.clone();
     let served = server::run(engine.volumes, stop, move || {
         let _ = ready.send(Ok(()));
     });
+    stopping.store(true, Ordering::Release);
     engine.supervisor.shutdown();
     served
+}
+
+/// Waits until the engine thread ends, which disconnects `ended`, calling
+/// `report` every `heartbeat` while `stopping` is set.
+fn wait_for_engine<T>(
+    ended: &mpsc::Receiver<T>,
+    stopping: &AtomicBool,
+    heartbeat: Duration,
+    mut report: impl FnMut(),
+) {
+    loop {
+        match ended.recv_timeout(heartbeat) {
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            // A failure sent after Running changes nothing here: the flag
+            // says whether the teardown runs.
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                if stopping.load(Ordering::Acquire) {
+                    report();
+                }
+            }
+        }
+    }
+}
+
+/// A `StopPending` report carrying the next value of `checkpoint`.
+fn stop_pending(checkpoint: &AtomicU32) -> ServiceStatus {
+    status_report(
+        ServiceState::StopPending,
+        ServiceControlAccept::empty(),
+        checkpoint.fetch_add(1, Ordering::Relaxed) + 1,
+        PENDING_WAIT_HINT,
+    )
 }
 
 /// The exit code the service stops with once the engine thread has ended.
@@ -451,8 +509,55 @@ impl std::io::Write for FileWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::service_exit_code;
-    use windows_service::service::ServiceExitCode;
+    use super::{
+        PENDING_HEARTBEAT, PENDING_WAIT_HINT, service_exit_code, stop_pending, wait_for_engine,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+    use windows_service::service::{ServiceControlAccept, ServiceExitCode, ServiceState};
+
+    /// Waiting for the engine reports nothing while it serves, then a fresh
+    /// checkpoint every heartbeat from the stop until the engine ends, so a
+    /// teardown longer than one wait hint still shows progress.
+    #[test]
+    fn a_stop_reports_progress_until_the_engine_ends() {
+        let heartbeat = Duration::from_millis(20);
+        let (tx, ended) = mpsc::channel::<()>();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let engine_stopping = stopping.clone();
+        let engine = std::thread::spawn(move || {
+            std::thread::sleep(heartbeat * 5);
+            engine_stopping.store(true, Ordering::Release);
+            std::thread::sleep(heartbeat * 10);
+            drop(tx);
+        });
+        let mut reports = 0;
+        wait_for_engine(&ended, &stopping, heartbeat, || {
+            assert!(stopping.load(Ordering::Acquire), "a report before the stop");
+            reports += 1;
+        });
+        engine.join().unwrap();
+        assert!(
+            reports >= 3,
+            "{reports} reports over ten heartbeats of teardown"
+        );
+    }
+
+    /// Every stop report is due well inside the wait hint the last one gave,
+    /// and its checkpoint grows, whichever thread sends it.
+    #[test]
+    fn stop_reports_grow_their_checkpoint_inside_the_wait_hint() {
+        assert!(PENDING_WAIT_HINT >= PENDING_HEARTBEAT * 2);
+        let checkpoint = AtomicU32::new(0);
+        let first = stop_pending(&checkpoint);
+        let second = stop_pending(&checkpoint);
+        assert_eq!(first.current_state, ServiceState::StopPending);
+        assert_eq!(first.controls_accepted, ServiceControlAccept::empty());
+        assert_eq!(first.wait_hint, PENDING_WAIT_HINT);
+        assert!(first.checkpoint > 0);
+        assert!(second.checkpoint > first.checkpoint);
+    }
 
     /// A requested stop exits 0; a failed pipe server or a panicked engine
     /// thread exits non-zero, which is what makes the SCM restart the service.
