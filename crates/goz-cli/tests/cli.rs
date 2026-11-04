@@ -7,7 +7,7 @@
 //! Only cases that need no running daemon live here. Anything past
 //! `Client::connect` depends on whether `\\.\pipe\goz-v1` happens to be live on
 //! the machine running the suite, which would pass on CI and flake on a
-//! developer box with `gozd` running. The three cases below all fail before the
+//! developer box with `gozd` running. The cases below all end before the
 //! first connect attempt, so they are hermetic on any OS.
 
 use std::process::{Command, Output};
@@ -23,6 +23,10 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// es exit code 6. Parsing rejects the switch before any daemon contact.
 #[test]
 fn unknown_switch_exits_6() {
@@ -33,6 +37,45 @@ fn unknown_switch_exits_6() {
         "stderr: {}",
         stderr(&out)
     );
+    assert!(
+        stderr(&out).contains("run goz --help"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// The help switches print to stdout and exit 0 without a daemon: where
+/// none runs, as on CI, any daemon round trip would exit 8 instead.
+#[test]
+fn help_prints_to_stdout_and_exits_0() {
+    for (arg, screen) in [
+        ("-h", "Common switches"),
+        ("-?", "Common switches"),
+        ("/?", "Common switches"),
+        ("-help", "Exit codes"),
+        ("--help", "Exit codes"),
+    ] {
+        let out = goz([arg]);
+        assert_eq!(out.status.code(), Some(0), "{arg}: {}", stderr(&out));
+        assert!(stderr(&out).is_empty(), "{arg}: {}", stderr(&out));
+        let text = stdout(&out);
+        assert!(text.contains("Usage: goz"), "{arg}: {text}");
+        assert!(text.contains(screen), "{arg}: {text}");
+    }
+}
+
+/// The version switches print goz's own version and exit 0 without a daemon.
+#[test]
+fn version_prints_to_stdout_and_exits_0() {
+    for arg in ["-v", "-version", "--version"] {
+        let out = goz([arg]);
+        assert_eq!(out.status.code(), Some(0), "{arg}: {}", stderr(&out));
+        assert_eq!(
+            stdout(&out),
+            format!("goz {}\n", env!("CARGO_PKG_VERSION")),
+            "{arg}"
+        );
+    }
 }
 
 /// es exit code 4. `-path` consumes a following value; there is none here.

@@ -3,7 +3,8 @@
 //! Parses arguments with the es.exe-compatible rules from
 //! `goz-core::escompat`, talks to the running daemon over `\\.\pipe\goz-v1`,
 //! and writes results as an es-compatible CSV (`-export-csv`), JSON (`--json`),
-//! or a plain path list (default).
+//! or a plain path list (default). The help and version switches print to
+//! stdout without contacting the daemon.
 //!
 //! Exit codes (es-compatible where they overlap): 0 ok · 4 missing switch
 //! parameter / bad query · 5 export-file create failure / output write failure ·
@@ -20,25 +21,43 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(windows)]
 mod client;
 
-use goz_core::escompat::parse_argv;
+use goz_core::escompat::{Command, Exit, VERSION_LINE, help, parse_argv};
+use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let plan = match parse_argv(&args) {
-        Ok(p) => p,
+    match parse_argv(&args) {
+        Ok(Command::Run(plan)) => execute(plan),
+        Ok(Command::Help(screen)) => print(&help(screen)),
+        Ok(Command::Version) => print(&format!("{VERSION_LINE}\n")),
         Err(fatal) => {
             eprintln!("goz: {}", fatal.message);
-            return ExitCode::from(fatal.exit_code);
+            if fatal.exit_code == Exit::UnknownSwitch.code() {
+                eprintln!("goz: run goz --help for every switch");
+            }
+            ExitCode::from(fatal.exit_code)
         }
-    };
-    execute(plan)
+    }
+}
+
+/// Writes `text` to stdout. A reader closing early (`goz --help | more`) is a
+/// clean stop; a genuine write failure reports exit 5.
+fn print(text: &str) -> ExitCode {
+    let mut out = std::io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            eprintln!("goz: writing to stdout failed: {e}");
+            Exit::WriteFailed.into()
+        }
+        _ => Exit::Success.into(),
+    }
 }
 
 #[cfg(not(windows))]
 fn execute(_plan: goz_core::escompat::EsPlan) -> ExitCode {
     eprintln!("goz: this client requires Windows (it talks to the gozd daemon)");
-    ExitCode::from(8)
+    Exit::NotRunning.into()
 }
 
 #[cfg(windows)]
@@ -47,12 +66,17 @@ use win::execute;
 #[cfg(windows)]
 mod win {
     use super::client::{Client, ClientError};
-    use goz_core::escompat::EsPlan;
+    use goz_core::escompat::{EsPlan, Exit, VERSION_LINE};
     use goz_core::output::{CsvOptions, CsvRow, filetime_to_unix_ms, write_csv};
-    use goz_core::proto::{QueryRequest, QueryResults, Request, Response};
+    use goz_core::proto::{PROTO_VERSION, QueryRequest, QueryResults, Request, Response};
     use goz_core::types::EsColumn;
     use std::io::Write;
     use std::process::ExitCode;
+
+    /// es's line for a missing Everything, kept verbatim for consumers that
+    /// grep stderr.
+    const ES_NOT_RUNNING: &str =
+        "Error 8: Everything IPC window not found. Please make sure Everything is running.";
 
     pub(crate) fn execute(plan: EsPlan) -> ExitCode {
         match run(plan) {
@@ -69,7 +93,7 @@ mod win {
                 Ok(f) => Some(f),
                 Err(e) => {
                     eprintln!("goz: cannot create {path}: {e}");
-                    return Err(ExitCode::from(5));
+                    return Err(Exit::WriteFailed.into());
                 }
             },
             None => None,
@@ -79,11 +103,9 @@ mod win {
             Ok(c) => c,
             Err(ClientError::Unreachable) => {
                 // es-verbatim line for consumers that grep stderr, plus our hint.
-                eprintln!(
-                    "Error 8: Everything IPC window not found. Please make sure Everything is running."
-                );
+                eprintln!("{ES_NOT_RUNNING}");
                 eprintln!("goz: the gozd daemon is not running (start it with `gozd run`).");
-                return Err(ExitCode::from(8));
+                return Err(Exit::NotRunning.into());
             }
             Err(ClientError::Untrusted) => {
                 eprintln!(
@@ -92,14 +114,17 @@ mod win {
                 eprintln!(
                     "goz: refusing to send the query. If this is expected, pass --insecure-no-server-check."
                 );
-                return Err(ExitCode::from(9));
+                return Err(Exit::Untrusted.into());
             }
             Err(ClientError::Protocol(m)) => {
                 eprintln!("goz: {m}");
-                return Err(ExitCode::from(7));
+                return Err(Exit::Protocol.into());
             }
         };
 
+        if plan.server_version {
+            return server_version(&mut connection);
+        }
         if plan.status {
             return status(&mut connection);
         }
@@ -109,26 +134,13 @@ mod win {
             Ok(Response::Results(r)) => r,
             Ok(Response::Error { message, .. }) => {
                 eprintln!("goz: {message}");
-                return Err(ExitCode::from(4));
+                return Err(Exit::BadParam.into());
             }
             Ok(_) => {
                 eprintln!("goz: unexpected reply from daemon");
-                return Err(ExitCode::from(7));
+                return Err(Exit::Protocol.into());
             }
-            Err(ClientError::Protocol(m)) => {
-                eprintln!("goz: {m}");
-                return Err(ExitCode::from(7));
-            }
-            Err(ClientError::Unreachable) => {
-                eprintln!(
-                    "Error 8: Everything IPC window not found. Please make sure Everything is running."
-                );
-                return Err(ExitCode::from(8));
-            }
-            Err(ClientError::Untrusted) => {
-                eprintln!("goz: pipe server not trusted");
-                return Err(ExitCode::from(9));
-            }
+            Err(error) => return Err(request_failed(error)),
         };
 
         if results.volumes_incomplete {
@@ -183,7 +195,7 @@ mod win {
             let bytes = render_csv(plan, results);
             if let Err(e) = file.write_all(&bytes) {
                 eprintln!("goz: writing export CSV failed: {e}");
-                return Err(ExitCode::from(5));
+                return Err(Exit::WriteFailed.into());
             }
             return Ok(ExitCode::SUCCESS);
         }
@@ -199,7 +211,7 @@ mod win {
                 }
                 Err(e) => {
                     eprintln!("goz: JSON encoding failed: {e}");
-                    return Err(ExitCode::from(7));
+                    return Err(Exit::Protocol.into());
                 }
             }
             return Ok(ExitCode::SUCCESS);
@@ -217,14 +229,14 @@ mod win {
                     return Ok(ExitCode::SUCCESS);
                 }
                 eprintln!("goz: writing results failed: {e}");
-                return Err(ExitCode::from(5));
+                return Err(Exit::WriteFailed.into());
             }
         }
         if let Err(e) = out.flush()
             && e.kind() != std::io::ErrorKind::BrokenPipe
         {
             eprintln!("goz: writing results failed: {e}");
-            return Err(ExitCode::from(5));
+            return Err(Exit::WriteFailed.into());
         }
         Ok(ExitCode::SUCCESS)
     }
@@ -385,21 +397,54 @@ mod win {
             }
             Ok(_) => {
                 eprintln!("goz: unexpected reply to status");
-                Err(ExitCode::from(7))
+                Err(Exit::Protocol.into())
             }
-            Err(ClientError::Protocol(m)) => {
+            Err(error) => Err(request_failed(error)),
+        }
+    }
+
+    /// `--server-version`: asks gozd for its version with a `Hello` and
+    /// prints the name and version it answers with, such as `gozd 0.4.4`.
+    fn server_version(connection: &mut Client) -> Result<ExitCode, ExitCode> {
+        let hello = Request::Hello {
+            proto_min: PROTO_VERSION,
+            proto_max: PROTO_VERSION,
+            client: VERSION_LINE.to_owned(),
+        };
+        match connection.request(&hello) {
+            Ok(Response::Hello { server, .. }) => {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let _ = writeln!(out, "{server}");
+                Ok(ExitCode::SUCCESS)
+            }
+            // A daemon that speaks another protocol refuses the Hello.
+            Ok(Response::Error { message, .. }) => {
+                eprintln!("goz: {message}");
+                Err(Exit::Protocol.into())
+            }
+            Ok(_) => {
+                eprintln!("goz: unexpected reply to hello");
+                Err(Exit::Protocol.into())
+            }
+            Err(error) => Err(request_failed(error)),
+        }
+    }
+
+    /// Reports a request that got no usable reply, and its exit code.
+    fn request_failed(error: ClientError) -> ExitCode {
+        match error {
+            ClientError::Protocol(m) => {
                 eprintln!("goz: {m}");
-                Err(ExitCode::from(7))
+                Exit::Protocol.into()
             }
-            Err(ClientError::Unreachable) => {
-                eprintln!(
-                    "Error 8: Everything IPC window not found. Please make sure Everything is running."
-                );
-                Err(ExitCode::from(8))
+            ClientError::Unreachable => {
+                eprintln!("{ES_NOT_RUNNING}");
+                Exit::NotRunning.into()
             }
-            Err(ClientError::Untrusted) => {
+            ClientError::Untrusted => {
                 eprintln!("goz: pipe server not trusted");
-                Err(ExitCode::from(9))
+                Exit::Untrusted.into()
             }
         }
     }
