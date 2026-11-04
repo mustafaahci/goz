@@ -636,9 +636,19 @@ fn path_cycle_is_detected_not_looped() {
 struct Model {
     // frn -> (parent frn, name, is_dir)
     entries: HashMap<u64, (u64, String, bool)>,
+    /// Sequence number of a record's latest tenant, when not 1.
+    seq: HashMap<u64, u16>,
 }
 
 impl Model {
+    /// The FRN of the entry with record number `f`, or of the root.
+    fn frn_of(&self, f: u64) -> Frn {
+        if f == root_frn().0 {
+            root_frn()
+        } else {
+            frn_seq(f, self.seq.get(&f).copied().unwrap_or(1))
+        }
+    }
     fn dirs(&self) -> Vec<u64> {
         let mut v: Vec<u64> = self
             .entries
@@ -703,6 +713,14 @@ enum RawAction {
     Delete {
         target_sel: usize,
     },
+    /// A leaf is deleted and NTFS gives its record to a new file, and the
+    /// journal shows neither: the index learns of the file from a hard-link
+    /// change and the link walk that follows.
+    Retenant {
+        target_sel: usize,
+        parent_sel: usize,
+        name_sel: u16,
+    },
 }
 
 /// Unique-per-entry name so distinct entries never share a path; the `sel`
@@ -731,6 +749,38 @@ fn raw_action_strategy() -> impl Strategy<Value = RawAction> {
     ]
 }
 
+/// [`raw_action_strategy`] plus re-tenanted records, which only the op tape
+/// models: the bootstrap race replays a journal that misses nothing.
+fn tape_action_strategy() -> impl Strategy<Value = RawAction> {
+    prop_oneof![
+        3 => raw_action_strategy(),
+        1 => (any::<u16>(), any::<u16>(), any::<u16>()).prop_map(|(t, p, n)| {
+            RawAction::Retenant {
+                target_sel: t as usize,
+                parent_sel: p as usize,
+                name_sel: n,
+            }
+        }),
+    ]
+}
+
+/// The tail's link walk, read from the model: each dirty FRN's one name,
+/// under its folder's entry. An FRN the model no longer has is skipped, as
+/// the tail skips a file that is gone.
+fn walk_links(idx: &mut VolumeIndex, model: &Model, frns: &[Frn]) {
+    for &f in frns {
+        let rec = f.record_number();
+        let Some((parent, name, _)) = model.entries.get(&rec) else {
+            continue;
+        };
+        if model.frn_of(rec) != f {
+            continue;
+        }
+        let parent = idx.head_of(model.frn_of(*parent)).expect("folder indexed");
+        idx.reconcile_links(f, &[link(parent, name)]);
+    }
+}
+
 /// Mutates the model for one action and returns the corresponding USN record
 /// (or `None` when the action is not currently valid, e.g. delete with no
 /// leaves).
@@ -751,7 +801,12 @@ fn step_model(
             *next_frn += 1;
             let name = model_name(*name_sel, f);
             model.entries.insert(f, (parent, name.clone(), *is_dir));
-            Some(create(frn(f), frn_or_root(parent), &name, *is_dir))
+            Some(create(
+                model.frn_of(f),
+                model.frn_of(parent),
+                &name,
+                *is_dir,
+            ))
         }
         RawAction::Rename {
             target_sel,
@@ -777,7 +832,12 @@ fn step_model(
             let e = model.entries.get_mut(&target).unwrap();
             e.0 = new_parent;
             e.1 = name.clone();
-            Some(rename(frn(target), frn_or_root(new_parent), &name, is_dir))
+            Some(rename(
+                model.frn_of(target),
+                model.frn_of(new_parent),
+                &name,
+                is_dir,
+            ))
         }
         RawAction::Delete { target_sel } => {
             let leaves: Vec<u64> = model
@@ -790,7 +850,35 @@ fn step_model(
             }
             let target = leaves[target_sel % leaves.len()];
             model.entries.remove(&target);
-            Some(delete(frn(target)))
+            Some(delete(model.frn_of(target)))
+        }
+        RawAction::Retenant {
+            target_sel,
+            parent_sel,
+            name_sel,
+        } => {
+            let leaves: Vec<u64> = model
+                .all()
+                .into_iter()
+                .filter(|f| !model.has_children(*f))
+                .collect();
+            if leaves.is_empty() {
+                return None;
+            }
+            let target = leaves[target_sel % leaves.len()];
+            model.entries.remove(&target);
+            *model.seq.entry(target).or_insert(1) += 1;
+            let dirs = model.dirs();
+            let parent = dirs[parent_sel % dirs.len()];
+            let name = model_name(*name_sel, target);
+            model.entries.insert(target, (parent, name.clone(), false));
+            Some(record(
+                model.frn_of(target),
+                model.frn_of(parent),
+                &name,
+                false,
+                USN_REASON_HARD_LINK_CHANGE,
+            ))
         }
     }
 }
@@ -811,16 +899,18 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(120))]
 
     /// The index mirrors a model filesystem across arbitrary create/rename/
-    /// delete tapes, including O(1) directory renames, orphan resolution, and
-    /// idempotent replays (each record applied twice).
+    /// delete tapes, including O(1) directory renames, orphan resolution,
+    /// records re-tenanted behind the journal's back, and idempotent replays
+    /// (each record and its link walk applied twice).
     #[test]
-    fn model_op_tape_convergence(actions in prop::collection::vec(raw_action_strategy(), 0..80)) {
+    fn model_op_tape_convergence(actions in prop::collection::vec(tape_action_strategy(), 0..80)) {
         let mut model = Model::default();
         let mut idx = new_index();
         let mut next_frn: u64 = 1000;
         for action in &actions {
             if let Some(rec) = step_model(&mut model, &mut next_frn, action) {
-                idx.apply_batch(std::slice::from_ref(&rec));
+                let outcome = idx.apply_batch(std::slice::from_ref(&rec));
+                walk_links(&mut idx, &model, &outcome.needs_link_reconcile);
                 prop_assert_eq!(path_set(&idx), model.path_set());
                 prop_assert!(idx.dir_index_matches_rebuild(), "dir index drifted after apply");
                 prop_assert!(idx.name_chains_match_rebuild(), "name chains drifted after apply");
@@ -828,7 +918,8 @@ proptest! {
                 prop_assert!(idx.parents_are_live(), "a live entry's parent died after apply");
                 prop_assert!(idx.name_order_matches_rebuild(), "name order drifted after apply");
                 prop_assert!(idx.name_refcounts_match_chains(), "refcounts drifted after apply");
-                idx.apply_batch(std::slice::from_ref(&rec)); // idempotent replay
+                let outcome = idx.apply_batch(std::slice::from_ref(&rec)); // idempotent replay
+                walk_links(&mut idx, &model, &outcome.needs_link_reconcile);
                 prop_assert_eq!(path_set(&idx), model.path_set());
                 prop_assert!(idx.dir_index_matches_rebuild(), "dir index drifted after replay");
                 prop_assert!(idx.name_chains_match_rebuild(), "name chains drifted after replay");
@@ -1247,5 +1338,154 @@ fn hard_link_in_a_removed_folder_waits_for_its_walk() {
         }],
     );
     assert!(!idx.has_orphans(), "the walk empties lost+found again");
+    assert_whole(&idx);
+}
+
+// -- re-tenanted records -------------------------------------------------
+
+/// `path_of` status of the entry `f` heads, or `None` when no entry has it.
+fn path_status(idx: &VolumeIndex, f: Frn) -> Option<PathStatus> {
+    let head = idx.head_of(f)?;
+    Some(idx.path_of(head, &mut Vec::new()))
+}
+
+/// A link walk can name a file whose record the index still gives to a
+/// previous tenant, after a missed delete of the tenant and a missed create of
+/// the file. The reconcile built the file's chain over the record's map entry
+/// and left the tenant live: its names kept matching, its folder kept its
+/// children, and no FRN led to it, so its own delete was one of an unknown
+/// file and it stayed until the next rescan.
+#[test]
+fn a_link_reconcile_reclaims_the_records_previous_tenant() {
+    let gone = frn_seq(100, 3);
+    let tenant = frn_seq(100, 4);
+    let mut idx = index_from_enum(&[
+        create(gone, root_frn(), "olddir", true),
+        create(frn(200), gone, "child.txt", false),
+    ]);
+    let root = idx.root();
+
+    idx.reconcile_links(tenant, &[link(root, "tenant.txt")]);
+
+    assert_eq!(path_set(&idx), BTreeSet::from(["tenant.txt".to_string()]));
+    assert_eq!(idx.stats().stale_slots, 1);
+    assert_eq!(
+        path_status(&idx, frn(200)),
+        Some(PathStatus::InLostFound),
+        "the reclaimed folder's child waits under lost+found"
+    );
+    assert_whole(&idx);
+}
+
+/// The same reuse, reached through FILE_LAYOUT enrichment of a file with no
+/// entry yet, whose record still holds a previous tenant.
+#[test]
+fn enrich_reclaims_the_records_previous_tenant() {
+    let gone = frn_seq(100, 3);
+    let tenant = frn_seq(100, 4);
+    let mut idx = index_from_enum(&[create(gone, root_frn(), "gone.tmp", false)]);
+
+    idx.enrich(&LayoutFile {
+        frn: tenant,
+        attributes: 0x20,
+        size: Some(10),
+        mtime_ft: Some(555),
+        names: vec![crate::layout::LayoutName {
+            parent_frn: root_frn(),
+            name: b"tenant.txt".to_vec(),
+            name_lossy: false,
+            dos_only: false,
+        }],
+    });
+    // The journal replay from the cursor captured before the build.
+    let outcome = idx.apply_batch(&[
+        delete(gone),
+        create(tenant, root_frn(), "tenant.txt", false),
+    ]);
+
+    assert_eq!(path_set(&idx), BTreeSet::from(["tenant.txt".to_string()]));
+    assert_eq!(
+        outcome.anomalies,
+        vec![Anomaly::DeleteOfUnknown { frn: gone }],
+        "the tenant was already reclaimed"
+    );
+    assert_whole(&idx);
+}
+
+/// A link walk resolves a link's folder by path, and a missed delete can leave
+/// that path on the very tenant the reconcile reclaims. The link used to go
+/// under the freed slot, which the link itself then took: its own parent.
+#[test]
+fn a_link_under_the_reclaimed_tenant_goes_to_lost_found() {
+    let gone = frn_seq(100, 3);
+    let tenant = frn_seq(100, 4);
+    let mut idx = index_from_enum(&[create(gone, root_frn(), "olddir", true)]);
+    let olddir = idx.head_of(gone).unwrap();
+
+    idx.reconcile_links(tenant, &[link(olddir, "x.txt")]);
+
+    assert_eq!(path_status(&idx, tenant), Some(PathStatus::InLostFound));
+    assert!(path_set(&idx).is_empty(), "{:?}", path_set(&idx));
+    assert_whole(&idx);
+}
+
+/// Corrupt data can name an entry's own record's previous tenant as its
+/// parent. `upsert_link` resolved that parent and then reclaimed it, so the
+/// entry went under the slot it freed: its own slot (a parent cycle) for a
+/// tenant with one name, a dead slot for one with two. The entry goes under
+/// lost+found until a record gives it a real parent.
+#[test]
+fn a_parent_that_is_its_own_records_previous_tenant_goes_to_lost_found() {
+    for names in [&["a"][..], &["a", "b"]] {
+        let old = frn_seq(1003, 1);
+        let new = frn_seq(1003, 2);
+        let mut idx = new_index();
+        idx.apply_batch(&[create(old, root_frn(), names[0], false)]);
+        let root = idx.root();
+        let links: Vec<_> = names.iter().map(|n| link(root, n)).collect();
+        idx.reconcile_links(old, &links);
+
+        idx.apply_batch(&[create(new, old, "c", false)]);
+        assert_whole(&idx);
+        assert_eq!(
+            path_status(&idx, new),
+            Some(PathStatus::InLostFound),
+            "{names:?}"
+        );
+        assert!(path_set(&idx).is_empty(), "{names:?}: {:?}", path_set(&idx));
+
+        idx.apply_batch(&[rename(new, root_frn(), "c", false)]);
+        assert_eq!(path_set(&idx), BTreeSet::from(["c".to_string()]));
+        assert!(!idx.has_orphans());
+        assert_whole(&idx);
+    }
+}
+
+/// The same corrupt parent in a FILE_LAYOUT name. Each of the file's names
+/// resolved it, and resolving it once the file held the record reclaimed the
+/// file itself, so its name was chained to the placeholder that took the
+/// record and no FRN led to the file.
+#[test]
+fn a_layout_name_under_its_own_records_previous_tenant_goes_to_lost_found() {
+    let gone = frn_seq(100, 3);
+    let tenant = frn_seq(100, 4);
+    let mut idx = index_from_enum(&[create(gone, root_frn(), "olddir", true)]);
+
+    idx.enrich(&LayoutFile {
+        frn: tenant,
+        attributes: 0x20,
+        size: Some(10),
+        mtime_ft: Some(555),
+        names: vec![crate::layout::LayoutName {
+            parent_frn: gone,
+            name: b"x.txt".to_vec(),
+            name_lossy: false,
+            dos_only: false,
+        }],
+    });
+
+    assert_eq!(path_status(&idx, tenant), Some(PathStatus::InLostFound));
+    assert_eq!(idx.entry(idx.head_of(tenant).unwrap()).size(), Some(10));
+    assert!(path_set(&idx).is_empty(), "{:?}", path_set(&idx));
     assert_whole(&idx);
 }

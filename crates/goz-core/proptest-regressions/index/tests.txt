@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f0fabe19bbfcec076f68219aac06df48a691cd010dea61077f0f719d54074f92 # shrinks to actions = [Create { parent_sel: 0, name_sel: 0, is_dir: false }, Create { parent_sel: 0, name_sel: 0, is_dir: false }, Retenant { target_sel: 0, parent_sel: 0, name_sel: 1 }]

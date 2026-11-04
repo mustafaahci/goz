@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use goz_core::index::{LinkTarget, WtfName};
+use goz_core::index::{LinkTarget, VolumeIndex, WtfName};
 use goz_core::query::resolve_scope;
 use goz_core::types::{Frn, VolumePhase};
 use goz_core::usn::record::{
@@ -483,10 +483,11 @@ fn compact_index(state: &VolumeState) {
 ///
 /// Mirrors [`enrich_stats`]'s lock discipline, and for the same reason: the
 /// Win32 walk is a blocking file open and must never run under the index write
-/// lock that every query contends on. Only the apply takes the lock.
+/// lock that every query contends on. Only resolving the links' folders and
+/// the apply take the lock, see [`apply_link_walks`].
 ///
 /// An FRN whose walk fails is SKIPPED, never reconciled to an empty set:
-/// `reconcile_links` treats empty as a delete, so a transient lock would
+/// `reconcile_links` treats empty as a delete, so a failed walk would
 /// otherwise erase a live file from the index.
 fn reconcile_links(
     state: &VolumeState,
@@ -498,7 +499,7 @@ fn reconcile_links(
     if frns.is_empty() {
         return;
     }
-    let mut resolved: Vec<(Frn, Vec<LinkTarget>)> = Vec::new();
+    let mut walked: Vec<(Frn, Vec<Vec<u16>>)> = Vec::new();
     let mut dropped = 0u64;
 
     for &frn in frns {
@@ -524,48 +525,52 @@ fn reconcile_links(
             }
         };
 
-        // Resolve each link's parent directory under one short read lock.
-        let index = state.index.read();
-        let mut targets = Vec::with_capacity(links.len());
-        let mut unresolved = false;
-        for wide in &links {
-            let mut bytes = Vec::new();
-            let lossy = !goz_core::wtf8::from_utf16(wide, &mut bytes);
-            let (dir, name) = split_parent(&bytes);
-            match resolve_scope(&index, dir, false) {
-                Some(parent) => targets.push(LinkTarget {
-                    parent,
-                    name: WtfName::new(name.to_vec(), lossy),
-                }),
-                // A parent we have not indexed yet: reconciling to a partial set
-                // would delete the links we could not resolve.
-                None => {
-                    unresolved = true;
-                    break;
-                }
-            }
-        }
-        drop(index);
-
-        if unresolved || targets.is_empty() {
-            dropped += 1;
-            continue;
-        }
-        resolved.push((frn, targets));
+        walked.push((frn, links));
     }
 
-    if dropped > 0 {
-        // Not silent: a reconcile we could not perform means names on this
-        // volume may be stale until the next rescan, and `--status` says so.
-        state.index.write().note_link_reconciles_dropped(dropped);
-    }
-    if resolved.is_empty() {
+    if walked.is_empty() && dropped == 0 {
         return;
     }
     let mut index = state.index.write();
-    for (frn, targets) in &resolved {
-        index.reconcile_links(*frn, targets);
+    dropped += apply_link_walks(&mut index, &walked);
+    if dropped > 0 {
+        // Not silent: a reconcile we could not perform means names on this
+        // volume may be stale until the next rescan, and `--status` says so.
+        index.note_link_reconciles_dropped(dropped);
     }
+}
+
+/// Reconciles each walked FRN to its link set, resolving the links' folders
+/// by path just before that FRN's own reconcile. One reconcile can reclaim a
+/// record's previous tenant, and a folder resolved before it ran could be that
+/// tenant, freed and handed to another entry by the time a later reconcile
+/// used it. Returns how many FRNs were skipped because a folder is not
+/// indexed: reconciling to a partial set would delete the links it could not
+/// resolve.
+fn apply_link_walks(index: &mut VolumeIndex, walked: &[(Frn, Vec<Vec<u16>>)]) -> u64 {
+    let mut dropped = 0u64;
+    'walks: for (frn, links) in walked {
+        let mut targets = Vec::with_capacity(links.len());
+        for wide in links {
+            let mut bytes = Vec::new();
+            let lossy = !goz_core::wtf8::from_utf16(wide, &mut bytes);
+            let (dir, name) = split_parent(&bytes);
+            let Some(parent) = resolve_scope(index, dir, false) else {
+                dropped += 1;
+                continue 'walks;
+            };
+            targets.push(LinkTarget {
+                parent,
+                name: WtfName::new(name.to_vec(), lossy),
+            });
+        }
+        if targets.is_empty() {
+            dropped += 1;
+            continue;
+        }
+        index.reconcile_links(*frn, &targets);
+    }
+    dropped
 }
 
 /// Splits a volume-relative path into (parent dir, file name) at the last
@@ -830,7 +835,7 @@ fn mark_failed(state: &VolumeState, reason: RescanReason, detail: &str) {
 mod tests {
     use super::{
         DEGRADE_AFTER, ESCALATE_AFTER, JOURNAL_WAIT_MAX, REASON_MASK, RETRY_BACKOFF_MAX,
-        RETRY_BACKOFF_MIN, install, wait_for_journal,
+        RETRY_BACKOFF_MIN, apply_link_walks, install, wait_for_journal,
     };
     use crate::bootstrap::{BuiltIndex, JournalSetup};
     use crate::pulse::TailPulse;
@@ -1014,6 +1019,54 @@ mod tests {
             &stop,
         );
         assert_eq!(got, None);
+    }
+
+    /// A file or folder created under `parent`, as the journal reports it.
+    fn created(frn: Frn, parent: Frn, name: &str, is_dir: bool) -> ParsedUsnRecord {
+        ParsedUsnRecord {
+            frn,
+            parent_frn: parent,
+            reason: goz_core::usn::record::USN_REASON_FILE_CREATE,
+            attributes: if is_dir {
+                goz_core::usn::record::FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                0
+            },
+            name: name.as_bytes().to_vec(),
+            ..record_with(0)
+        }
+    }
+
+    /// A reconcile can reclaim a record's previous tenant, which may be a
+    /// folder another walk in the same batch names by path: here a folder `d`
+    /// whose delete was missed, beside the `d` that replaced it. Each FRN's
+    /// folders are resolved just before its own reconcile, so the later file
+    /// lands in the `d` that is there, not in whatever took the freed slot.
+    #[test]
+    fn a_link_walk_resolves_its_folders_after_the_reconciles_before_it() {
+        let root = NTFS_ROOT_FRN;
+        let frn = |record: u64, seq: u64| Frn((seq << 48) | record);
+        let (d_old, d_new) = (frn(100, 3), frn(300, 1));
+        let (f1, f2) = (frn(100, 4), frn(400, 1));
+        let mut index = VolumeIndex::new(root, FrnMap::sparse());
+        index.apply_batch(&[
+            created(d_old, root, "d", true),
+            created(d_new, root, "d", true),
+            created(f2, d_new, "x.txt", false),
+        ]);
+        let wide = |p: &str| p.encode_utf16().collect::<Vec<u16>>();
+
+        let dropped = apply_link_walks(
+            &mut index,
+            &[(f1, vec![wide(r"\f1.txt")]), (f2, vec![wide(r"\d\x.txt")])],
+        );
+
+        assert_eq!(dropped, 0);
+        let f2_entry = index.entry(index.head_of(f2).expect("f2 is indexed"));
+        assert_eq!(index.entry(f2_entry.parent()).frn(), d_new);
+        let mut path = Vec::new();
+        index.path_of(index.head_of(f2).unwrap(), &mut path);
+        assert_eq!(path, br"d\x.txt");
     }
 
     /// A rescan publishes the flags of the index it built, not the ones its

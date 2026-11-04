@@ -334,14 +334,14 @@ impl VolumeIndex {
         // because a rename landed between the ENUM and LAYOUT passes. Tombstone
         // + realloc here would orphan those children under a reused slot.
         if self.head_of(file.frn).is_none() {
-            // No entry of this FRN exists yet (nothing to orphan): build the
-            // chain from LAYOUT.
+            // No entry of this FRN exists yet (nothing to orphan), though a
+            // previous tenant of its record may: build the chain from LAYOUT.
             let desired: Vec<LinkTarget> = file
                 .names
                 .iter()
                 .filter(|n| !n.dos_only)
                 .map(|n| LinkTarget {
-                    parent: self.resolve_or_placeholder_parent(n.parent_frn),
+                    parent: self.resolve_link_parent(file.frn, n.parent_frn),
                     name: WtfName::new(n.name.clone(), n.name_lossy),
                 })
                 .collect();
@@ -356,7 +356,7 @@ impl VolumeIndex {
         // journal, so we never touch it here).
         if !is_dir {
             for n in file.names.iter().filter(|n| !n.dos_only) {
-                let parent_idx = self.resolve_or_placeholder_parent(n.parent_frn);
+                let parent_idx = self.resolve_link_parent(file.frn, n.parent_frn);
                 if !self.chain_has_link(file.frn, parent_idx, &n.name) {
                     self.add_link(file.frn, parent_idx, &n.name, n.name_lossy);
                 }
@@ -824,18 +824,21 @@ impl VolumeIndex {
         is_dir: bool,
     ) -> UpsertResult {
         let record = frn.record_number();
-        let parent_idx = self.resolve_or_placeholder_parent(parent_frn);
+        // Record number reused by a different FRN: reclaim the stale chain
+        // first, so the parent resolved below is never a slot it frees.
+        if let Some(head) = self.by_frn.get(record)
+            && self.entries.frn(head) != frn
+        {
+            self.reclaim_stale_slot(record, head);
+        }
+        let parent_idx = self.resolve_link_parent(frn, parent_frn);
 
         if let Some(head) = self.by_frn.get(record) {
-            if self.entries.frn(head) == frn {
-                if self.entries.next_link(head) == NIL {
-                    self.rewrite_entry(head, parent_idx, name, name_lossy, is_dir);
-                    return UpsertResult::Ok;
-                }
-                return UpsertResult::NeedsReconcile;
+            if self.entries.next_link(head) == NIL {
+                self.rewrite_entry(head, parent_idx, name, name_lossy, is_dir);
+                return UpsertResult::Ok;
             }
-            // Record number reused by a different FRN: reclaim the stale chain.
-            self.reclaim_stale_slot(record, head);
+            return UpsertResult::NeedsReconcile;
         }
 
         let id = self.names.intern(name);
@@ -892,9 +895,9 @@ impl VolumeIndex {
     ///
     /// Every site that finds a live `by_frn` entry whose FRN does not match must
     /// call this before overwriting the map. It exists as one function precisely
-    /// so the two callers cannot drift apart again.
+    /// so the callers cannot drift apart again.
     /// Reported through `IndexStats::stale_slots` rather than an `Anomaly`: the
-    /// two callers are deep helpers with no access to the batch's
+    /// callers are deep helpers with no access to the batch's
     /// `ApplyOutcome`, and buffering per-event anomalies on the index would grow
     /// unbounded across a multi-million-entry bootstrap. The counter reaches
     /// `Status` either way.
@@ -902,6 +905,18 @@ impl VolumeIndex {
         self.tombstone_chain(head);
         self.by_frn.remove(record);
         self.stats.stale_slots += 1;
+    }
+
+    /// Resolves the parent of a name of `frn`. A parent with `frn`'s record
+    /// number and another sequence number is that record's previous tenant,
+    /// which only corrupt data names: resolving it would reclaim `frn` itself
+    /// or put a placeholder in its place in the map, so the name goes under
+    /// lost+found, with no full path.
+    fn resolve_link_parent(&mut self, frn: Frn, parent_frn: Frn) -> EntryIdx {
+        if parent_frn != frn && parent_frn.record_number() == frn.record_number() {
+            return self.lost_found;
+        }
+        self.resolve_or_placeholder_parent(parent_frn)
     }
 
     /// Resolves a parent FRN to its entry, synthesizing a placeholder under
@@ -1003,21 +1018,37 @@ impl VolumeIndex {
     /// entries that already match by (parent, name) so their EntryIdx, and
     /// thus any children pointing at them, survive. Only used by
     /// [`Self::reconcile_links`] (live `HARD_LINK_CHANGE`, always a file, which
-    /// has no children) and by the ENUM-missed branch of [`Self::enrich`]
-    /// (nothing exists yet to orphan).
+    /// has no children) and by the branch of [`Self::enrich`] for an FRN with
+    /// no entry yet (nothing of it exists to orphan).
     fn set_chain_links(&mut self, frn: Frn, is_dir: bool, desired: &[LinkTarget]) {
         let record = frn.record_number();
-        // Collect the current chain (only if it is really this FRN's).
+        // Collect the current chain if it is really this FRN's; a chain of the
+        // record's previous tenant is reclaimed before the map is overwritten.
         let mut current: SmallVec<[EntryIdx; 4]> = SmallVec::new();
-        if let Some(head) = self.by_frn.get(record)
-            && self.entries.frn(head) == frn
-        {
-            let mut cur = head;
-            while cur != NIL {
-                current.push(cur);
-                cur = self.entries.next_link(cur);
+        if let Some(head) = self.by_frn.get(record) {
+            if self.entries.frn(head) == frn {
+                let mut cur = head;
+                while cur != NIL {
+                    current.push(cur);
+                    cur = self.entries.next_link(cur);
+                }
+            } else {
+                self.reclaim_stale_slot(record, head);
             }
         }
+        // A link under the tenant just reclaimed, which only a missed record
+        // names, goes under lost+found. Read before any allocation below, which
+        // can give the freed slot to another entry.
+        let parents: SmallVec<[EntryIdx; 4]> = desired
+            .iter()
+            .map(|t| {
+                if self.entries.is_tombstone(t.parent) {
+                    self.lost_found
+                } else {
+                    t.parent
+                }
+            })
+            .collect();
 
         // Every link names the same file record, so a new link starts with the
         // size and date its chain already carries. Nothing stats a link added
@@ -1029,10 +1060,10 @@ impl VolumeIndex {
         // Match each desired link to an existing entry, else allocate.
         let mut kept: SmallVec<[EntryIdx; 4]> = SmallVec::new();
         let mut used: SmallVec<[bool; 4]> = SmallVec::from_elem(false, current.len());
-        for target in desired {
+        for (target, &parent) in desired.iter().zip(&parents) {
             let existing = current.iter().enumerate().position(|(i, &e)| {
                 !used[i]
-                    && self.entries.parent(e) == target.parent
+                    && self.entries.parent(e) == parent
                     && self.names.raw_bytes(self.entries.name_id(e)) == target.name.bytes.as_slice()
             });
             if let Some(pos) = existing {
@@ -1043,9 +1074,7 @@ impl VolumeIndex {
                 let flags = EntryFlags::EMPTY
                     .with(EntryFlags::DIR, is_dir)
                     .with(EntryFlags::NON_UNICODE_NAME, target.name.lossy);
-                let idx = self
-                    .entries
-                    .alloc(frn, target.parent, id, flags, size, mtime, NIL);
+                let idx = self.entries.alloc(frn, parent, id, flags, size, mtime, NIL);
                 self.link_same_name(idx, id);
                 self.link_child(idx);
                 self.dir_index_insert(idx);
