@@ -76,6 +76,10 @@ pub struct QueryRequest {
     /// Populate [`ResultItem::mtime_ft`] (skip the lookup otherwise).
     pub want_mtime: bool,
     pub match_case: bool,
+    /// Fill [`QueryResults::total_size`]: es's `-get-total-size`. A daemon
+    /// predating the field ignores it and leaves `total_size` out.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub want_total_size: bool,
 }
 
 /// A server→client message.
@@ -121,6 +125,15 @@ pub struct QueryResults {
     pub metadata_pending: bool,
     /// Index generation the results were computed against.
     pub generation: u64,
+    /// The summed size in bytes of every matching file, regardless of
+    /// paging, when [`QueryRequest::want_total_size`] asked for it; `None`
+    /// otherwise, or from a daemon predating the field. A folder adds
+    /// nothing, nor a file whose size is not read yet, and each name of a
+    /// hard-linked file adds its size, as each is its own row. A sum past
+    /// `u64::MAX`, which only the names of huge sparse files reach, stops
+    /// there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_size: Option<u64>,
 }
 
 /// One matched file or directory.
@@ -282,6 +295,7 @@ mod tests {
             want_size: true,
             want_mtime: false,
             match_case: true,
+            want_total_size: true,
         }
     }
 
@@ -326,6 +340,7 @@ mod tests {
             want_size: false,
             want_mtime: false,
             match_case: false,
+            want_total_size: false,
         }));
     }
 
@@ -352,6 +367,7 @@ mod tests {
             volumes_incomplete: true,
             metadata_pending: true,
             generation: 42,
+            total_size: Some(u64::MAX),
         }));
         // Empty page.
         rt_response(&Response::Results(QueryResults {
@@ -361,6 +377,7 @@ mod tests {
             volumes_incomplete: false,
             metadata_pending: false,
             generation: 0,
+            total_size: None,
         }));
     }
 
@@ -471,6 +488,39 @@ mod tests {
         let back: ResultItem = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, item);
         assert_eq!(back.path_u16.as_deref(), Some(units.as_slice()));
+    }
+
+    /// A v0.5.4 client sends no `want_total_size`, and its query must still
+    /// parse; a new client that does not ask sends none either.
+    #[test]
+    fn want_total_size_is_optional_both_ways() {
+        let req: Request = serde_json::from_str(
+            r#"{"t":"Query","query":"a","scope":null,"sort":{"key":"Name","dir":"Asc"},
+                "offset":0,"limit":0,"want_size":true,"want_mtime":true,"match_case":false}"#,
+        )
+        .expect("a query without the field");
+        assert!(matches!(req, Request::Query(q) if !q.want_total_size));
+        let mut q = sample_query();
+        q.want_total_size = false;
+        let json = serde_json::to_string(&Request::Query(q)).expect("serialize");
+        assert!(!json.contains("want_total_size"), "json: {json}");
+    }
+
+    /// `--json` prints [`QueryResults`]: a page that was not asked for a
+    /// total size must print as it did before the field.
+    #[test]
+    fn results_without_total_size_omit_it() {
+        let page = QueryResults {
+            total: 1,
+            items: vec![],
+            more: false,
+            volumes_incomplete: false,
+            metadata_pending: false,
+            generation: 0,
+            total_size: None,
+        };
+        let json = serde_json::to_string(&page).expect("serialize");
+        assert!(!json.contains("total_size"), "json: {json}");
     }
 
     /// A daemon predating the field reports no parent cycle.

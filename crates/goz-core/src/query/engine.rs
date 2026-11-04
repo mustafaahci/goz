@@ -59,6 +59,9 @@ pub struct RefOutcome {
     /// Total matches before offset/limit (es `totitems` semantics).
     pub total: u64,
     pub refs: Vec<HitRef>,
+    /// The summed size of every match that is a file, when asked for (see
+    /// [`run_query_refs`]).
+    pub total_size: Option<u64>,
 }
 
 /// A [`ParsedQuery`]'s substring needles prebuilt into finders once (rather
@@ -276,7 +279,7 @@ pub fn run_query(
     offset: u32,
     limit: Option<u32>,
 ) -> QueryOutcome {
-    let (total, refs) = page_refs(
+    let RefOutcome { total, refs, .. } = page_refs(
         index,
         mount_prefix,
         parsed,
@@ -284,6 +287,7 @@ pub fn run_query(
         sort,
         offset,
         limit,
+        false,
         true,
     );
     let hits = build_hits(index, &refs);
@@ -297,6 +301,12 @@ pub fn run_query(
 /// comparators that read the index and allocate nothing; a name-sorted query
 /// over names alone does not order at all (see `page_refs`). The daemon
 /// builds each page's paths from the live index when it encodes them.
+///
+/// `sum_sizes` also sums the size of every match that is a file, for es's
+/// `-get-total-size`: a folder adds nothing, nor a file whose size is not
+/// read yet, and each name of a hard-linked file adds its size, as each is a
+/// row of its own. A sum past `u64::MAX` stops there.
+#[allow(clippy::too_many_arguments)]
 pub fn run_query_refs(
     index: &VolumeIndex,
     mount_prefix: &str,
@@ -305,8 +315,9 @@ pub fn run_query_refs(
     sort: SortSpec,
     offset: u32,
     limit: Option<u32>,
+    sum_sizes: bool,
 ) -> RefOutcome {
-    let (total, refs) = page_refs(
+    page_refs(
         index,
         mount_prefix,
         parsed,
@@ -314,9 +325,9 @@ pub fn run_query_refs(
         sort,
         offset,
         limit,
+        sum_sizes,
         true,
-    );
-    RefOutcome { total, refs }
+    )
 }
 
 /// The page of a query as references: the one implementation behind
@@ -339,8 +350,9 @@ fn page_refs(
     sort: SortSpec,
     offset: u32,
     limit: Option<u32>,
+    sum_sizes: bool,
     allow_name_level: bool,
-) -> (u64, Vec<HitRef>) {
+) -> RefOutcome {
     let compiled = CompiledQuery::new(parsed, mount_prefix);
     // A scope at the root admits every entry with a path, as no scope does,
     // so it goes: kept, it would bar the name-level path, and `-path C:\ e`
@@ -353,11 +365,26 @@ fn page_refs(
         let mut cp_buf = CodePointBuf::new();
         let mut ext_scratch = Vec::new();
         let (matched, total) = match_names(index, parsed, &compiled, &mut cp_buf, &mut ext_scratch);
+        let total_size = sum_sizes.then(|| {
+            files_size(
+                index,
+                matched
+                    .iter()
+                    .flat_map(|&id| index.name_chain(id))
+                    .filter(|&e| !index.is_synthetic(e)),
+            )
+        });
         let (start, end) = page_bounds(total as usize, offset, limit);
-        return (total, name_level_refs(index, matched, sort.dir, start, end));
+        let refs = name_level_refs(index, matched, sort.dir, start, end);
+        return RefOutcome {
+            total,
+            refs,
+            total_size,
+        };
     }
     let mut candidates = scan(index, parsed, &compiled, scope);
     let total = candidates.len() as u64;
+    let total_size = sum_sizes.then(|| files_size(index, candidates.iter().map(|c| c.idx)));
     let (start, end) = page_bounds(candidates.len(), offset, limit);
     order(index, &mut candidates, sort, end);
     let refs = candidates[start..end]
@@ -367,7 +394,21 @@ fn page_refs(
             frn: index.entry(c.idx).frn(),
         })
         .collect();
-    (total, refs)
+    RefOutcome {
+        total,
+        refs,
+        total_size,
+    }
+}
+
+/// The summed size of the files among `entries`: a folder adds nothing, nor
+/// a file whose size is not read yet.
+fn files_size(index: &VolumeIndex, entries: impl Iterator<Item = EntryIdx>) -> u64 {
+    entries
+        .map(|idx| index.entry(idx))
+        .filter(|e| !e.is_dir())
+        .filter_map(|e| e.size())
+        .fold(0, u64::saturating_add)
 }
 
 /// Whether every predicate of `parsed` is decided by the file name alone, so
@@ -1793,6 +1834,136 @@ mod tests {
         });
     }
 
+    /// The summed size of `query`'s matches, as the daemon asks for it.
+    fn total_size(idx: &VolumeIndex, query: &str, scope: Option<EntryIdx>) -> Option<u64> {
+        let parsed = parse_query(query).unwrap();
+        run_query_refs(
+            idx,
+            r"C:\",
+            &parsed,
+            scope,
+            SortSpec::default(),
+            0,
+            Some(0),
+            true,
+        )
+        .total_size
+    }
+
+    /// es's `-get-total-size` sums the files it matches: a folder adds
+    /// nothing, even one whose files match too, and a file whose size is not
+    /// read yet adds nothing (its sentinel would add `u64::MAX`). Unasked,
+    /// no sum is made.
+    #[test]
+    fn total_size_sums_the_matching_files_only() {
+        let mut idx = sample_index();
+        idx.insert_enum(&enum_rec(frn(105), NTFS_ROOT_FRN, "unsized.txt", false));
+        let files = 4096 + 200 + 2 * 1024 * 1024;
+        assert_eq!(total_size(&idx, "", None), Some(files));
+        assert_eq!(
+            total_size(&idx, "docs", None),
+            Some(0),
+            "a folder adds nothing"
+        );
+        assert_eq!(total_size(&idx, "unsized", None), Some(0));
+        let docs = idx.head_of(frn(100));
+        assert_eq!(
+            total_size(&idx, "", docs),
+            Some(4096 + 200),
+            "the scope bounds it"
+        );
+        let parsed = parse_query("").unwrap();
+        let unasked = run_query_refs(
+            &idx,
+            r"C:\",
+            &parsed,
+            None,
+            SortSpec::default(),
+            0,
+            None,
+            false,
+        );
+        assert_eq!(unasked.total_size, None);
+    }
+
+    /// Each name of a hard-linked file is a row of its own, so each adds the
+    /// file's size, and the total is what the listed sizes add up to.
+    #[test]
+    fn each_name_of_a_hard_link_adds_its_size() {
+        use crate::layout::{LayoutFile, LayoutName};
+        let mut idx = sample_index();
+        idx.insert_enum(&enum_rec(frn(300), NTFS_ROOT_FRN, "twin1.bin", false));
+        let name = |parent, name: &str| LayoutName {
+            parent_frn: parent,
+            name: name.as_bytes().to_vec(),
+            name_lossy: false,
+            dos_only: false,
+        };
+        idx.enrich(&LayoutFile {
+            frn: frn(300),
+            attributes: 0x20,
+            size: Some(1000),
+            mtime_ft: Some(1000),
+            names: vec![
+                name(NTFS_ROOT_FRN, "twin1.bin"),
+                name(frn(100), "twin2.bin"),
+            ],
+        });
+        for (query, rows, size) in [("twin", 2, 2000), ("twin2", 1, 1000)] {
+            let parsed = parse_query(query).unwrap();
+            let listed = run_query(&idx, r"C:\", &parsed, None, SortSpec::default(), 0, None);
+            assert_eq!(listed.hits.len(), rows, "{query}");
+            let shown: u64 = listed.hits.iter().filter_map(|h| h.size).sum();
+            assert_eq!(shown, size, "{query}");
+            assert_eq!(total_size(&idx, query, None), Some(size), "{query}");
+        }
+    }
+
+    /// The sum covers the set the count does: files without a full path,
+    /// under lost+found or in a parent cycle, add nothing.
+    #[test]
+    fn files_without_a_path_add_no_size() {
+        let mut idx = index_with_orphans();
+        for (f, size) in [(100, 1), (101, 2), (200, 100), (201, 200), (202, 400)] {
+            idx.set_stat(frn(f), size, 0);
+        }
+        assert_eq!(total_size(&idx, "log", None), Some(3));
+
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        for r in [
+            enum_rec(frn(100), NTFS_ROOT_FRN, "a", true),
+            enum_rec(frn(101), frn(100), "b", true),
+            enum_rec(frn(102), frn(101), "xfile.txt", false),
+            enum_rec(frn(103), NTFS_ROOT_FRN, "xother.txt", false),
+            enum_rec(frn(100), frn(101), "a", true),
+        ] {
+            idx.insert_enum(&r);
+        }
+        idx.optimize_storage();
+        idx.set_stat(frn(102), 50, 0);
+        idx.set_stat(frn(103), 7, 0);
+        assert!(idx.has_parent_cycle());
+        assert_eq!(total_size(&idx, "x", None), Some(7));
+    }
+
+    /// The names of a few huge sparse files can claim more than `u64` holds:
+    /// the sum stops at `u64::MAX` instead of wrapping, or panicking in a
+    /// debug build.
+    #[test]
+    fn the_total_size_stops_at_u64_max() {
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        for f in [100, 101] {
+            idx.insert_enum(&enum_rec(
+                frn(f),
+                NTFS_ROOT_FRN,
+                &format!("huge{f}.bin"),
+                false,
+            ));
+            idx.set_stat(frn(f), u64::MAX - 1, 0);
+        }
+        assert_eq!(total_size(&idx, "huge", None), Some(u64::MAX));
+    }
+
     fn run(idx: &VolumeIndex, query: &str) -> Vec<String> {
         let parsed = parse_query(query).unwrap();
         let out = run_query(idx, r"C:\", &parsed, None, SortSpec::default(), 0, None);
@@ -2303,7 +2474,8 @@ mod tests {
                     (total, Some(5)),
                 ] {
                     let hits = run_query(&idx, r"C:\", &parsed, None, sort, offset, limit);
-                    let refs = run_query_refs(&idx, r"C:\", &parsed, None, sort, offset, limit);
+                    let refs =
+                        run_query_refs(&idx, r"C:\", &parsed, None, sort, offset, limit, false);
                     assert_eq!(refs.total, hits.total);
                     let want: Vec<EntryIdx> = hits.hits.iter().map(|h| h.idx).collect();
                     let got: Vec<EntryIdx> = refs.refs.iter().map(|r| r.idx).collect();
@@ -2358,8 +2530,9 @@ mod tests {
                     0,
                     None,
                     false,
+                    false,
                 )
-                .1
+                .refs
                 .iter()
                 .map(|r| r.idx)
                 .collect();
@@ -2389,17 +2562,29 @@ mod tests {
                             (start + l as usize).min(expected_all.len())
                         });
                         let expected = &expected_all[start..end];
-                        let fast = page_refs(idx, r"C:\", &parsed, None, sort, offset, limit, true);
+                        let fast =
+                            page_refs(idx, r"C:\", &parsed, None, sort, offset, limit, true, true);
                         let slow =
-                            page_refs(idx, r"C:\", &parsed, None, sort, offset, limit, false);
+                            page_refs(idx, r"C:\", &parsed, None, sort, offset, limit, true, false);
                         let ctx = format!("{stage}: {q:?} {dir:?} offset {offset} limit {limit:?}");
-                        assert_eq!(fast.0, u64::from(total), "total (name-level) {ctx}");
-                        assert_eq!(slow.0, u64::from(total), "total (candidates) {ctx}");
-                        let fast_idx: Vec<EntryIdx> = fast.1.iter().map(|r| r.idx).collect();
-                        let slow_idx: Vec<EntryIdx> = slow.1.iter().map(|r| r.idx).collect();
+                        assert_eq!(fast.total, u64::from(total), "total (name-level) {ctx}");
+                        assert_eq!(slow.total, u64::from(total), "total (candidates) {ctx}");
+                        let ground_size = files_size(idx, ground.iter().copied());
+                        assert_eq!(
+                            fast.total_size,
+                            Some(ground_size),
+                            "size (name-level) {ctx}"
+                        );
+                        assert_eq!(
+                            slow.total_size,
+                            Some(ground_size),
+                            "size (candidates) {ctx}"
+                        );
+                        let fast_idx: Vec<EntryIdx> = fast.refs.iter().map(|r| r.idx).collect();
+                        let slow_idx: Vec<EntryIdx> = slow.refs.iter().map(|r| r.idx).collect();
                         assert_eq!(fast_idx, expected, "name-level page {ctx}");
                         assert_eq!(slow_idx, expected, "candidate page {ctx}");
-                        for r in &fast.1 {
+                        for r in &fast.refs {
                             assert!(idx.entry_if_frn(r.idx, r.frn).is_some());
                         }
                     }
@@ -3064,7 +3249,10 @@ mod tests {
                 path_keys_by_built_paths(index, &mut old);
                 order_top(index, &mut old, sort, end);
                 let old: Vec<EntryIdx> = old[start..end].iter().map(|c| c.idx).collect();
-                let (_, refs) = page_refs(index, r"C:\", parsed, None, sort, offset, limit, true);
+                let refs = page_refs(
+                    index, r"C:\", parsed, None, sort, offset, limit, false, true,
+                )
+                .refs;
                 let new: Vec<EntryIdx> = refs.iter().map(|r| r.idx).collect();
                 if new != old {
                     return Some(format!(
@@ -3180,7 +3368,7 @@ mod tests {
                 key: SortKey::Path,
                 dir,
             };
-            let (_, refs) = page_refs(&idx, r"C:\", &parsed, None, sort, 0, None, true);
+            let refs = page_refs(&idx, r"C:\", &parsed, None, sort, 0, None, false, true).refs;
             let got: Vec<EntryIdx> = refs.iter().map(|r| r.idx).collect();
             assert_eq!(got, want, "{dir:?}");
             want.reverse();

@@ -16,8 +16,11 @@
 //! ```text
 //! total:      u64 LE    full match count (es totitems), repeated per page
 //! generation: u64 LE
-//! page_flags: u8        bit0 more, bit1 volumes_incomplete, bit2 metadata_pending
+//! page_flags: u8        bit0 more, bit1 volumes_incomplete, bit2 metadata_pending,
+//!                       bit3 has_total_size
 //! count:      u32 LE    items in this page
+//! total_size: u64 LE    iff has_total_size: summed size of the matching files,
+//!                       repeated per page
 //! count items, each:
 //!   path_len: u32 LE    raw path byte length (WTF-8, mount prefix included)
 //!   path:     path_len bytes
@@ -42,6 +45,7 @@ pub const RESP_TAG_RESULTS: u8 = 1;
 const FLAG_MORE: u8 = 1;
 const FLAG_VOLUMES_INCOMPLETE: u8 = 1 << 1;
 const FLAG_METADATA_PENDING: u8 = 1 << 2;
+const FLAG_TOTAL_SIZE: u8 = 1 << 3;
 
 const IFLAG_IS_DIR: u8 = 1;
 const IFLAG_HAS_SIZE: u8 = 1 << 1;
@@ -53,8 +57,10 @@ const IFLAG_HAS_MTIME: u8 = 1 << 2;
 pub struct BinError(&'static str);
 
 /// Writes a results-page frame payload header: the [`RESP_TAG_RESULTS`] tag byte
-/// followed by the fixed page fields. Callers then push `count` items with
-/// [`push_item`] and wrap the whole payload in a frame.
+/// followed by the page fields. Callers then push `count` items with
+/// [`push_item`] and wrap the whole payload in a frame. Without a
+/// `total_size` the header is the one clients before it decode.
+#[allow(clippy::too_many_arguments)]
 pub fn push_results_header(
     out: &mut Vec<u8>,
     total: u64,
@@ -62,6 +68,7 @@ pub fn push_results_header(
     more: bool,
     volumes_incomplete: bool,
     metadata_pending: bool,
+    total_size: Option<u64>,
     count: u32,
 ) {
     out.push(RESP_TAG_RESULTS);
@@ -77,8 +84,14 @@ pub fn push_results_header(
     if metadata_pending {
         flags |= FLAG_METADATA_PENDING;
     }
+    if total_size.is_some() {
+        flags |= FLAG_TOTAL_SIZE;
+    }
     out.push(flags);
     out.extend_from_slice(&count.to_le_bytes());
+    if let Some(size) = total_size {
+        out.extend_from_slice(&size.to_le_bytes());
+    }
 }
 
 /// Rewrites `more` and `count` in a results header that
@@ -153,6 +166,7 @@ pub fn encode_results_payload(page: &QueryResults, out: &mut Vec<u8>) {
         page.more,
         page.volumes_incomplete,
         page.metadata_pending,
+        page.total_size,
         page.items.len() as u32,
     );
     let mut scratch = Vec::new();
@@ -188,6 +202,7 @@ impl<'a> Reader<'a> {
     fn i64(&mut self) -> Result<i64, BinError> {
         Ok(i64::from_le_bytes(self.arr()?))
     }
+
     fn bytes(&mut self, n: usize) -> Result<&'a [u8], BinError> {
         let end = self.pos.checked_add(n).ok_or(BinError("overflow"))?;
         let slice = self.buf.get(self.pos..end).ok_or(BinError("truncated"))?;
@@ -206,6 +221,9 @@ pub fn decode_results_payload(body: &[u8]) -> Result<QueryResults, BinError> {
     let generation = r.u64()?;
     let flags = r.u8()?;
     let count = r.u32()? as usize;
+    let total_size = (flags & FLAG_TOTAL_SIZE != 0)
+        .then(|| r.u64())
+        .transpose()?;
     let mut items = Vec::with_capacity(count.min(1 << 20));
     for _ in 0..count {
         let plen = r.u32()? as usize;
@@ -233,6 +251,7 @@ pub fn decode_results_payload(body: &[u8]) -> Result<QueryResults, BinError> {
         volumes_incomplete: flags & FLAG_VOLUMES_INCOMPLETE != 0,
         metadata_pending: flags & FLAG_METADATA_PENDING != 0,
         generation,
+        total_size,
     })
 }
 
@@ -241,7 +260,7 @@ mod tests {
     #[test]
     fn patch_results_header_rewrites_more_and_count_only() {
         let mut page = Vec::new();
-        super::push_results_header(&mut page, 7, 3, false, true, false, 0);
+        super::push_results_header(&mut page, 7, 3, false, true, false, Some(9), 0);
         super::patch_results_header(&mut page, true, 42);
         let flags_at = 1 + 8 + 8;
         assert_eq!(page[flags_at] & super::FLAG_MORE, super::FLAG_MORE);
@@ -254,6 +273,9 @@ mod tests {
         assert_eq!(count, 42);
         super::patch_results_header(&mut page, false, 1);
         assert_eq!(page[flags_at] & super::FLAG_MORE, 0);
+        super::patch_results_header(&mut page, false, 0);
+        let back = super::decode_results_payload(&page[1..]).expect("decode");
+        assert_eq!(back.total_size, Some(9), "the patch leaves the total size");
     }
 
     use super::*;
@@ -275,7 +297,45 @@ mod tests {
             volumes_incomplete: false,
             metadata_pending: false,
             generation: 0,
+            total_size: None,
         });
+    }
+
+    /// A total size round-trips, `u64::MAX` too, and a page without one
+    /// decodes as one without.
+    #[test]
+    fn total_size_round_trips() {
+        for total_size in [Some(0), Some(u64::MAX), None] {
+            round_trip(&QueryResults {
+                total: 2,
+                items: vec![ResultItem {
+                    path: r"C:.txt".into(),
+                    path_u16: None,
+                    size: Some(9),
+                    mtime_ft: None,
+                    is_dir: false,
+                }],
+                more: false,
+                volumes_incomplete: false,
+                metadata_pending: true,
+                generation: 0,
+                total_size,
+            });
+        }
+    }
+
+    /// A page not asked for a total size keeps the bytes v0.5.4 sent, so a
+    /// client built before the field decodes it as before.
+    #[test]
+    fn a_page_without_total_size_keeps_its_old_bytes() {
+        let mut page = Vec::new();
+        push_results_header(&mut page, 7, 3, true, false, true, None, 2);
+        let mut old = vec![RESP_TAG_RESULTS];
+        old.extend_from_slice(&7u64.to_le_bytes());
+        old.extend_from_slice(&3u64.to_le_bytes());
+        old.push(FLAG_MORE | FLAG_METADATA_PENDING);
+        old.extend_from_slice(&2u32.to_le_bytes());
+        assert_eq!(page, old);
     }
 
     #[test]
@@ -309,6 +369,7 @@ mod tests {
             volumes_incomplete: true,
             metadata_pending: true,
             generation: 42,
+            total_size: None,
         });
     }
 
@@ -334,6 +395,7 @@ mod tests {
             volumes_incomplete: false,
             metadata_pending: false,
             generation: 0,
+            total_size: None,
         };
         round_trip(&page);
     }
@@ -355,6 +417,7 @@ mod tests {
                 volumes_incomplete: false,
                 metadata_pending: false,
                 generation: 0,
+                total_size: None,
             },
             &mut payload,
         );
@@ -376,7 +439,7 @@ mod tests {
         raw.extend_from_slice(rel);
 
         let mut from_hits = Vec::new();
-        push_results_header(&mut from_hits, 1, 0, false, false, false, 1);
+        push_results_header(&mut from_hits, 1, 0, false, false, false, None, 1);
         push_item(&mut from_hits, &raw, false, Some(55), Some(7));
 
         let mut from_items = Vec::new();
@@ -394,6 +457,7 @@ mod tests {
                 volumes_incomplete: false,
                 metadata_pending: false,
                 generation: 0,
+                total_size: None,
             },
             &mut from_items,
         );
@@ -415,7 +479,7 @@ mod tests {
                 cut in any::<prop::sample::Index>(),
             ) {
                 let mut payload = Vec::new();
-                push_results_header(&mut payload, 1, 2, true, false, false, paths.len() as u32);
+                push_results_header(&mut payload, 1, 2, true, false, false, Some(5), paths.len() as u32);
                 for path in &paths {
                     push_item(&mut payload, path, false, Some(3), Some(4));
                 }

@@ -233,6 +233,7 @@ fn bench_query(c: &mut Criterion) {
                     SortSpec::default(),
                     0,
                     None,
+                    false,
                 );
                 black_box(out.refs.len())
             })

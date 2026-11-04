@@ -148,7 +148,8 @@ fn bench_scopes(c: &mut Criterion) {
                         Some(scope),
                         SortSpec::default(),
                         0,
-                        Some(0)
+                        Some(0),
+                        false
                     )
                     .total
                 );
@@ -162,6 +163,7 @@ fn bench_scopes(c: &mut Criterion) {
                             SortSpec::default(),
                             0,
                             Some(100),
+                            false,
                         );
                         black_box(out.refs.len())
                     })

@@ -312,14 +312,45 @@ fn bench_sorts(c: &mut Criterion) {
             SortSpec { key, dir },
             0,
             limit,
+            false,
         );
         black_box(out.refs.len())
     };
     eprintln!(
         "matches: e {}, e file: {}, kernel {}",
-        run_query_refs(&idx, r"C:\", &broad, None, SortSpec::default(), 0, Some(0)).total,
-        run_query_refs(&idx, r"C:\", &files, None, SortSpec::default(), 0, Some(0)).total,
-        run_query_refs(&idx, r"C:\", &rare, None, SortSpec::default(), 0, Some(0)).total,
+        run_query_refs(
+            &idx,
+            r"C:\",
+            &broad,
+            None,
+            SortSpec::default(),
+            0,
+            Some(0),
+            false
+        )
+        .total,
+        run_query_refs(
+            &idx,
+            r"C:\",
+            &files,
+            None,
+            SortSpec::default(),
+            0,
+            Some(0),
+            false
+        )
+        .total,
+        run_query_refs(
+            &idx,
+            r"C:\",
+            &rare,
+            None,
+            SortSpec::default(),
+            0,
+            Some(0),
+            false
+        )
+        .total,
     );
 
     let mut path = c.benchmark_group("sort_path");

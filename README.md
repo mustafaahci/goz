@@ -75,7 +75,7 @@ goz --json kernel32.dll
 goz --status
 ```
 
-`goz` accepts a subset of `es.exe` flags (`-path`, `-n` / `-max-results`, the `-sort` family, `-size`, `-dm`, `-export-csv`, the CSV-shape switches, and `-get-result-count`) and matches `es.exe`'s exit codes. Unsupported switches exit `6`, the same as `es.exe`. A size or date sort lists the entries without that value last, whichever way it runs: folders, since goz keeps no folder sizes, and files whose size or date is not read yet.
+`goz` accepts a subset of `es.exe` flags (`-path`, `-n` / `-max-results`, the `-sort` family, `-size`, `-dm`, `-export-csv`, the CSV-shape switches, `-get-result-count` and `-get-total-size`) and matches `es.exe`'s exit codes. Unsupported switches exit `6`, the same as `es.exe`. A size or date sort lists the entries without that value last, whichever way it runs: folders, since goz keeps no folder sizes, and files whose size or date is not read yet.
 
 `goz -h` (or `-?`) prints a quick help and `goz --help` the full reference: every switch, the search syntax and the exit codes. `goz --version` prints the client's version and `goz --server-version` the running daemon's. None of them needs the daemon except `--server-version`.
 

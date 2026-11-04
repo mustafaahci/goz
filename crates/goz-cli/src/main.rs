@@ -4,7 +4,8 @@
 //! `goz-core::escompat`, talks to the running daemon over `\\.\pipe\goz-v1`,
 //! and writes results as an es-compatible CSV (`-export-csv`), JSON (`--json`),
 //! or a plain path list (default), or only their number
-//! (`-get-result-count`). The help and version switches print to stdout
+//! (`-get-result-count`) or the summed size of their files
+//! (`-get-total-size`). The help and version switches print to stdout
 //! without contacting the daemon.
 //!
 //! Exit codes (es-compatible where they overlap): 0 ok · 4 missing switch
@@ -155,15 +156,34 @@ mod win {
         }
 
         if plan.result_count {
-            return result_count(&plan, results.total, export_file);
+            return number_only(&plan, results.total, export_file);
+        }
+        if plan.total_size {
+            // A gozd predating the field ignores the ask; 0 would be a lie.
+            let Some(size) = results.total_size else {
+                eprintln!(
+                    "goz: the running gozd does not report total sizes; restart the goz service to run the installed version"
+                );
+                return Err(Exit::Protocol.into());
+            };
+            if results.metadata_pending {
+                eprintln!(
+                    "goz: warning: some file sizes are not read yet; the total leaves them out"
+                );
+            }
+            if size == u64::MAX {
+                eprintln!("goz: warning: the total is at least {size} bytes, the most goz reports");
+            }
+            return number_only(&plan, size, export_file);
         }
         emit(&plan, &results, export_file)
     }
 
     fn build_query(plan: &EsPlan) -> QueryRequest {
-        // A count fetches no rows, in name order as es resets it to, which
-        // the daemon can answer from the distinct names alone.
-        let (sort, limit) = if plan.result_count {
+        // A count or a total size fetches no rows, in name order as es
+        // resets it to, which the daemon can answer from the distinct names
+        // alone.
+        let (sort, limit) = if plan.result_count || plan.total_size {
             (SortSpec::default(), Some(0))
         } else {
             (plan.sort, plan.limit)
@@ -178,6 +198,7 @@ mod win {
             want_size: true,
             want_mtime: true,
             match_case: plan.match_case,
+            want_total_size: plan.total_size && !plan.result_count,
         }
     }
 
@@ -256,21 +277,21 @@ mod win {
         Ok(ExitCode::SUCCESS)
     }
 
-    /// `-get-result-count`: the number alone, on stdout or, as es writes it,
-    /// in the export file after its byte order mark.
-    fn result_count(
+    /// `-get-result-count` and `-get-total-size`: the number alone, on stdout
+    /// or, as es writes it, in the export file after its byte order mark.
+    fn number_only(
         plan: &EsPlan,
-        total: u64,
+        number: impl std::fmt::Display,
         export_file: Option<std::fs::File>,
     ) -> Result<ExitCode, ExitCode> {
         let Some(mut file) = export_file else {
-            return Ok(super::print(&format!("{total}\n")));
+            return Ok(super::print(&format!("{number}\n")));
         };
         let mut bytes = Vec::new();
         if plan.bom {
             bytes.extend_from_slice(b"\xEF\xBB\xBF");
         }
-        bytes.extend_from_slice(format!("{total}\r\n").as_bytes());
+        bytes.extend_from_slice(format!("{number}\r\n").as_bytes());
         if let Err(e) = file.write_all(&bytes) {
             eprintln!("goz: writing export CSV failed: {e}");
             return Err(Exit::WriteFailed.into());

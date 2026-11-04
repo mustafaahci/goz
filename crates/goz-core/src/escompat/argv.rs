@@ -101,6 +101,11 @@ pub struct EsPlan {
     /// rows are fetched, and neither `-n` nor the sort changes the number.
     /// Wins over `json`.
     pub result_count: bool,
+    /// `-get-total-size`: print only the summed size of the matching files,
+    /// in bytes. Fetched as `result_count` is, so neither `-n` nor the sort
+    /// changes it. `result_count` wins over it, as in es; it wins over
+    /// `json`.
+    pub total_size: bool,
     /// Native `--status`: report daemon/index status instead of searching.
     pub status: bool,
     /// Native `--server-version`: print the daemon's version instead of
@@ -129,6 +134,7 @@ impl Default for EsPlan {
             match_case: false,
             json: false,
             result_count: false,
+            total_size: false,
             status: false,
             server_version: false,
             insecure_no_server_check: false,
@@ -212,6 +218,8 @@ pub(super) enum SwitchAction {
     Json,
     /// `-get-result-count`: print only the number of results.
     ResultCount,
+    /// `-get-total-size`: print only the summed size of the matching files.
+    TotalSize,
     /// `--status`: report the daemon's state instead of searching.
     Status,
     /// `--server-version`: print the daemon's version instead of searching.
@@ -243,6 +251,7 @@ impl SwitchAction {
             | SwitchAction::MatchCase
             | SwitchAction::Json
             | SwitchAction::ResultCount
+            | SwitchAction::TotalSize
             | SwitchAction::Status
             | SwitchAction::ServerVersion
             | SwitchAction::InsecureNoServerCheck
@@ -384,6 +393,12 @@ pub(super) const SWITCHES: &[Switch] = &[
         group: Group::Output,
         quick: false,
         help: "Print only the number of results",
+    },
+    Switch {
+        spelling: names(&["get-total-size"], &[], SwitchAction::TotalSize),
+        group: Group::Output,
+        quick: false,
+        help: "Print only the total size of the matching files",
     },
     Switch {
         spelling: names(&[], &["status"], SwitchAction::Status),
@@ -596,6 +611,7 @@ fn apply_switch(
         SwitchAction::MatchCase => plan.match_case = true,
         SwitchAction::Json => plan.json = true,
         SwitchAction::ResultCount => plan.result_count = true,
+        SwitchAction::TotalSize => plan.total_size = true,
         SwitchAction::Status => plan.status = true,
         SwitchAction::ServerVersion => plan.server_version = true,
         SwitchAction::InsecureNoServerCheck => plan.insecure_no_server_check = true,
@@ -757,6 +773,7 @@ mod tests {
                 match_case: false,
                 json: false,
                 result_count: false,
+                total_size: false,
                 status: false,
                 server_version: false,
                 insecure_no_server_check: false,
@@ -773,6 +790,18 @@ mod tests {
         }
         assert!(!plan(&["report"]).result_count);
         assert_eq!(fatal(&["--get-result-count"]).exit_code, 6);
+    }
+
+    #[test]
+    fn get_total_size_asks_for_the_size_only() {
+        for spelling in ["-get-total-size", "-gettotalsize", "/get-total-size"] {
+            let parsed = plan(&["report", spelling, "-n", "5"]);
+            assert!(parsed.total_size, "{spelling}");
+            assert!(!parsed.result_count, "{spelling}");
+            assert_eq!(parsed.query, "report");
+        }
+        assert!(!plan(&["report"]).total_size);
+        assert_eq!(fatal(&["--get-total-size"]).exit_code, 6);
     }
 
     #[test]

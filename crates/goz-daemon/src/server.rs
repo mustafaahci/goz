@@ -400,6 +400,7 @@ fn stream_query_binary(
     let mut runs: Vec<Run> = Vec::new();
     let mut vols: Vec<Arc<VolumeState>> = Vec::new();
     let mut total: u64 = 0;
+    let mut total_size: Option<u64> = q.want_total_size.then_some(0);
     let mut volumes_incomplete = false;
     let mut metadata_pending = false;
 
@@ -432,9 +433,13 @@ fn stream_query_binary(
             q.sort,
             0,
             per_vol_limit,
+            q.want_total_size,
         );
         drop(index);
         total += outcome.total;
+        if let (Some(sum), Some(size)) = (total_size.as_mut(), outcome.total_size) {
+            *sum = sum.saturating_add(size);
+        }
         if !outcome.refs.is_empty() {
             runs.push(Run::new(outcome.refs));
             vols.push(vol.clone());
@@ -474,6 +479,7 @@ fn stream_query_binary(
             false,
             volumes_incomplete,
             metadata_pending,
+            total_size,
             0,
         );
         let mut count = 0u32;
@@ -1251,6 +1257,7 @@ mod tests {
             want_size: true,
             want_mtime: true,
             match_case: false,
+            want_total_size: false,
         }
     }
 
@@ -1698,7 +1705,16 @@ mod tests {
             .iter()
             .map(|v| {
                 let index = v.index.read();
-                let out = run_query_refs(&index, v.mount_prefix(), &parsed, None, sort, 0, None);
+                let out = run_query_refs(
+                    &index,
+                    v.mount_prefix(),
+                    &parsed,
+                    None,
+                    sort,
+                    0,
+                    None,
+                    false,
+                );
                 Run::new(out.refs)
             })
             .collect();
@@ -1899,6 +1915,99 @@ mod tests {
         let mut rec = file_record(frn, NTFS_ROOT_FRN.0, "");
         rec.reason = goz_core::usn::record::USN_REASON_FILE_DELETE;
         rec
+    }
+
+    /// `C:\Windows\System32` holding `a.log` (100 bytes), `b.log` (no size
+    /// read yet) and the folder `logs`, with `c.log` (7 bytes) at the root.
+    fn sized_index() -> VolumeIndex {
+        let mut index = windows_index();
+        index.insert_enum(&file_record(200, 101, "a.log"));
+        index.insert_enum(&file_record(201, 101, "b.log"));
+        index.insert_enum(&dir_record(202, 101, "logs"));
+        index.insert_enum(&file_record(203, NTFS_ROOT_FRN.0, "c.log"));
+        index.set_stat(Frn(200), 100, 0);
+        index.set_stat(Frn(203), 7, 0);
+        index
+    }
+
+    fn total_size_of(q: goz_core::proto::QueryRequest) -> goz_core::proto::QueryRequest {
+        goz_core::proto::QueryRequest {
+            limit: Some(0),
+            want_total_size: true,
+            ..q
+        }
+    }
+
+    /// `-get-total-size` gets one empty page whose total size adds every
+    /// volume's files: no folder, and no file whose size is unknown.
+    #[test]
+    fn the_total_size_adds_the_files_of_every_volume() {
+        let vols = set(&[
+            volume(r"C:\", sized_index(), VolumePhase::Live),
+            volume(r"D:\", sized_index(), VolumePhase::Live),
+        ]);
+        let pages = results(&encode_query_binary(&vols, total_size_of(query("log"))));
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].items.is_empty());
+        assert_eq!(pages[0].total, 8, "four matches a volume, the folder too");
+        assert_eq!(pages[0].total_size, Some(2 * 107));
+
+        let below = total_size_of(scoped("log", r"D:\Windows\System32"));
+        assert_eq!(
+            results(&encode_query_binary(&vols, below))[0].total_size,
+            Some(100)
+        );
+        let nowhere = total_size_of(scoped("log", r"Q:\"));
+        assert_eq!(
+            results(&encode_query_binary(&vols, nowhere))[0].total_size,
+            Some(0)
+        );
+    }
+
+    /// Two volumes whose sums pass `u64::MAX` together: the total stops there
+    /// rather than wrapping, or panicking the query task in a debug build.
+    #[test]
+    fn the_total_size_of_every_volume_stops_at_u64_max() {
+        let huge = || {
+            let mut index = windows_index();
+            index.insert_enum(&file_record(200, 101, "huge.bin"));
+            index.set_stat(Frn(200), u64::MAX / 2 + 1, 0);
+            index
+        };
+        let vols = set(&[
+            volume(r"C:\", huge(), VolumePhase::Live),
+            volume(r"D:\", huge(), VolumePhase::Live),
+        ]);
+        let pages = results(&encode_query_binary(&vols, total_size_of(query("huge"))));
+        assert_eq!(pages[0].total_size, Some(u64::MAX));
+    }
+
+    /// Unasked, a page carries no total size, so its bytes are the ones a
+    /// client built before the field decodes. Asked with rows, every page
+    /// repeats the whole set's sum, as it repeats `total`.
+    #[test]
+    fn the_total_size_comes_only_when_asked_and_on_every_page() {
+        let vols = set(&[volume(r"C:\", sized_index(), VolumePhase::Live)]);
+        let plain = results(&encode_query_binary(&vols, query("log")));
+        assert_eq!(plain[0].total_size, None);
+
+        let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        index.insert_enum(&dir_record(100, NTFS_ROOT_FRN.0, "many"));
+        let n = PAGE_ROWS as u64 + 1;
+        for i in 0..n {
+            index.insert_enum(&file_record(1000 + i, 100, &format!("hit{i:05}.log")));
+            index.set_stat(Frn(1000 + i), 3, 0);
+        }
+        let vols = set(&[volume(r"C:\", index, VolumePhase::Live)]);
+        let q = goz_core::proto::QueryRequest {
+            want_total_size: true,
+            ..query("hit")
+        };
+        let pages = results(&encode_query_binary(&vols, q));
+        assert_eq!(pages.len(), 2);
+        for page in &pages {
+            assert_eq!(page.total_size, Some(3 * n));
+        }
     }
 
     /// A parent cycle no record has broken makes every query pay the
