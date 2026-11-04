@@ -441,6 +441,11 @@ fn stream_query_binary(
         }
     }
 
+    let prefixes: Vec<&str> = vols.iter().map(|v| v.mount_prefix()).collect();
+    let turn = match q.sort.key {
+        SortKey::Path => volumes_in_turn(&prefixes, q.sort.dir),
+        _ => None,
+    };
     let n_total: usize = runs.iter().map(|r| r.refs.len()).sum();
     let start = (q.offset as usize).min(n_total);
     let end = q
@@ -474,7 +479,14 @@ fn stream_query_binary(
         let mut count = 0u32;
         let mut taken = 0usize;
         while taken < page && consumed < end && out.len() < PAGE_BYTE_BUDGET {
-            let Some(ri) = next_head(&mut runs, &guards, &vols, q.sort, &mut consumed) else {
+            let Some(ri) = next_head(
+                &mut runs,
+                &guards,
+                &vols,
+                q.sort,
+                turn.as_deref(),
+                &mut consumed,
+            ) else {
                 break;
             };
             let href = runs[ri].take_head();
@@ -806,14 +818,16 @@ impl Run {
 /// heads whose entry no longer exists (they count as consumed, like any other
 /// merged row). `None` when every run is exhausted. Ties go to the earlier
 /// run, so a multi-volume page equals a stable merge of the per-volume runs.
+/// With a `turn` (see [`volumes_in_turn`]) the first run in it that has a head
+/// comes first, and no heads are compared.
 fn next_head(
     runs: &mut [Run],
     guards: &[IndexGuard<'_>],
     vols: &[Arc<VolumeState>],
     sort: SortSpec,
+    turn: Option<&[usize]>,
     consumed: &mut usize,
 ) -> Option<usize> {
-    let mut best: Option<usize> = None;
     for ri in 0..runs.len() {
         while let Some(h) = runs[ri].head() {
             if guards[ri].entry_if_frn(h.idx, h.frn).is_some() {
@@ -822,6 +836,12 @@ fn next_head(
             runs[ri].take_head();
             *consumed += 1;
         }
+    }
+    if let Some(turn) = turn {
+        return turn.iter().copied().find(|&ri| runs[ri].head().is_some());
+    }
+    let mut best: Option<usize> = None;
+    for ri in 0..runs.len() {
         if runs[ri].head().is_none() {
             continue;
         }
@@ -875,6 +895,34 @@ fn cmp_heads(
     } else {
         base
     }
+}
+
+/// The order a path sort takes volumes in, one whole run after another, when
+/// their mount `prefixes` allow it: by folded prefix, reversed for a
+/// descending sort. Every head key of a volume (see `Run::ensure_head_key`)
+/// starts with its folded prefix, since the closing `\` keeps folding from
+/// joining the prefix to the path after it, so when no prefix starts another
+/// each volume's rows all sort before the next one's. `None` when one does,
+/// as `C:\` starts `C:\mnt\data\`: those rows interleave and the heads are
+/// compared.
+fn volumes_in_turn(prefixes: &[&str], dir: SortDir) -> Option<Vec<usize>> {
+    let folded: Vec<Vec<u8>> = prefixes.iter().map(|p| fold(p.as_bytes())).collect();
+    let nested = folded.iter().enumerate().any(|(i, a)| {
+        !a.ends_with(b"\\")
+            || folded
+                .iter()
+                .enumerate()
+                .any(|(j, b)| i != j && b.starts_with(a))
+    });
+    if nested {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..folded.len()).collect();
+    order.sort_by(|&a, &b| folded[a].cmp(&folded[b]));
+    if dir == SortDir::Desc {
+        order.reverse();
+    }
+    Some(order)
 }
 
 /// Case-insensitive ASCII prefix test (drive letters and `\` are ASCII).
@@ -1541,6 +1589,102 @@ mod tests {
         let mut desc = ordered(SortDir::Desc);
         desc.reverse();
         assert_eq!(desc, asc, "descending is the exact reverse");
+    }
+
+    /// Volumes whose folded mount prefixes do not start one another go in
+    /// prefix order, a GUID path (`\` sorts below the drive letters) first;
+    /// a volume mounted in another, a repeated prefix, or one without its
+    /// closing `\` needs the heads compared.
+    #[test]
+    fn path_sort_takes_volumes_in_turn_unless_one_is_mounted_in_another() {
+        use super::volumes_in_turn;
+        use goz_core::types::SortDir;
+        let guid = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\";
+        let vols = [r"D:\", r"C:\", guid];
+        assert_eq!(volumes_in_turn(&vols, SortDir::Asc), Some(vec![2, 1, 0]));
+        assert_eq!(volumes_in_turn(&vols, SortDir::Desc), Some(vec![0, 1, 2]));
+        assert_eq!(
+            volumes_in_turn(&[r"C:\data2\", r"c:\DATA\"], SortDir::Asc),
+            Some(vec![0, 1]),
+            r"`2` sorts below `\`"
+        );
+        assert_eq!(
+            volumes_in_turn(&[r"C:\", r"c:\mnt\data\"], SortDir::Asc),
+            None
+        );
+        assert_eq!(volumes_in_turn(&[r"C:\", r"C:\"], SortDir::Asc), None);
+        assert_eq!(volumes_in_turn(&["C:", r"D:\"], SortDir::Asc), None);
+    }
+
+    /// Volumes taken in turn give the pages a merge by comparing gave: every
+    /// row of one before every row of the next, across a page cut too.
+    #[test]
+    fn path_sort_over_separate_volumes_pages_like_the_merge() {
+        use goz_core::types::SortDir;
+        let guid = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\";
+        let vols = set(&[
+            volume(r"D:\", merge_index(), VolumePhase::Live),
+            volume(r"C:\", merge_index(), VolumePhase::Live),
+            volume(guid, merge_index(), VolumePhase::Live),
+        ]);
+        let page = |dir, offset, limit| {
+            let mut q = query("log");
+            q.sort = SortSpec {
+                key: SortKey::Path,
+                dir,
+            };
+            q.offset = offset;
+            q.limit = limit;
+            paths(&encode_query_binary(&vols, q))
+        };
+        let asc = page(SortDir::Asc, 0, None);
+        let want: Vec<String> = [guid, r"C:\", r"D:\"]
+            .iter()
+            .flat_map(|p| [format!(r"{p}a\z.log"), format!(r"{p}z\a.log")])
+            .collect();
+        assert_eq!(asc, want);
+        let mut desc = page(SortDir::Desc, 0, None);
+        desc.reverse();
+        assert_eq!(desc, asc, "descending is the exact reverse");
+        assert_eq!(page(SortDir::Asc, 1, Some(2)), asc[1..3]);
+    }
+
+    /// Taken in turn, a merge compares no heads, so it builds no head key: the
+    /// per-row path a compared merge builds is the cost this skips.
+    #[test]
+    fn a_merge_in_turn_builds_no_head_key() {
+        use super::{IndexGuard, Run, next_head};
+        use goz_core::query::{parse_query, run_query_refs};
+        let vols = [
+            volume(r"C:\", merge_index(), VolumePhase::Live),
+            volume(r"D:\", merge_index(), VolumePhase::Live),
+        ];
+        let parsed = parse_query("log").unwrap();
+        let sort = SortSpec::default_for(SortKey::Path);
+        let mut runs: Vec<Run> = vols
+            .iter()
+            .map(|v| {
+                let index = v.index.read();
+                let out = run_query_refs(&index, v.mount_prefix(), &parsed, None, sort, 0, None);
+                Run::new(out.refs)
+            })
+            .collect();
+        let guards: Vec<IndexGuard<'_>> = vols.iter().map(|v| v.index.read()).collect();
+        let mut consumed = 0;
+        let mut taken = Vec::new();
+        while let Some(ri) = next_head(
+            &mut runs,
+            &guards,
+            &vols,
+            sort,
+            Some(&[0, 1]),
+            &mut consumed,
+        ) {
+            assert!(runs.iter().all(|r| r.head_key.is_none()));
+            runs[ri].take_head();
+            taken.push(ri);
+        }
+        assert_eq!(taken, [0, 0, 1, 1]);
     }
 
     /// Every emitted path, in wire order, across all pages.
