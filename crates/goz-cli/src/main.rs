@@ -20,6 +20,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(windows)]
 mod client;
+#[cfg(windows)]
+mod not_running;
 
 use goz_core::escompat::{Command, Exit, VERSION_LINE, help, parse_argv};
 use std::io::Write;
@@ -102,9 +104,9 @@ mod win {
         let mut connection = match Client::connect(plan.insecure_no_server_check) {
             Ok(c) => c,
             Err(ClientError::Unreachable) => {
-                // es-verbatim line for consumers that grep stderr, plus our hint.
+                // es's line, then the goz service's state and its fix.
                 eprintln!("{ES_NOT_RUNNING}");
-                eprintln!("goz: the gozd daemon is not running (start it with `gozd run`).");
+                eprint!("{}", super::not_running::advice());
                 return Err(Exit::NotRunning.into());
             }
             Err(ClientError::Untrusted) => {

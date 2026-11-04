@@ -26,10 +26,8 @@ use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::{run, server};
+use goz_core::proto::SERVICE_NAME;
 
-/// Service key name (the SCM/registry key). Keep stable across versions.
-/// (The pipe name is independent: `goz_core::proto::PIPE_NAME`.)
-pub(crate) const SERVICE_NAME: &str = "goz";
 const DISPLAY_NAME: &str = "goz file index";
 const DESCRIPTION: &str =
     "Indexes NTFS volumes (MFT + USN journal) for instant file search in arsivle.";

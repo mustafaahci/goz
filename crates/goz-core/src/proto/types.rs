@@ -20,6 +20,10 @@ pub const PROTO_VERSION: u16 = 1;
 /// The daemon's named pipe.
 pub const PIPE_NAME: &str = r"\\.\pipe\goz-v1";
 
+/// The Windows service the daemon installs as, the SCM and registry key
+/// name. Keep it stable across versions; it is independent of [`PIPE_NAME`].
+pub const SERVICE_NAME: &str = "goz";
+
 /// Server-side decoder cap for client→server frames (1 MiB). A length prefix
 /// is a DoS lever; oversize frames poison the connection.
 pub const MAX_CLIENT_FRAME: u32 = 1 << 20;

@@ -51,6 +51,8 @@ Or install it as an auto-start Windows service (elevated):
 .\target\release\gozd.exe uninstall   # stop and remove
 ```
 
+When the daemon is not running, `goz` says what state the `goz` service is in (not installed, stopped, disabled or still starting) and prints the commands that fix it, each on its own line.
+
 ## Usage
 
 Query the running daemon from any terminal:

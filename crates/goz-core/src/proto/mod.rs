@@ -24,6 +24,6 @@ pub use frame::{
 };
 pub use types::{
     DaemonStatus, MAX_CLIENT_FRAME, MAX_SERVER_FRAME, MemPair, PAGE_ROWS, PIPE_NAME, PROTO_VERSION,
-    ProtoError, QueryRequest, QueryResults, Request, Response, ResultItem, VolumeMemory,
-    VolumeStatus,
+    ProtoError, QueryRequest, QueryResults, Request, Response, ResultItem, SERVICE_NAME,
+    VolumeMemory, VolumeStatus,
 };
