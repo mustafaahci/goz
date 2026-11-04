@@ -9,10 +9,10 @@
 //! without contacting the daemon.
 //!
 //! Exit codes (es-compatible where they overlap): 0 ok · 4 missing switch
-//! parameter / bad query · 5 export-file create failure / output write failure ·
-//! 6 unknown switch · 7 protocol failure (malformed daemon reply, 30 s of
-//! silence from the daemon, or pipe open error) · 8 daemon unreachable · 9
-//! pipe server not trusted.
+//! parameter / bad query / argument not valid Unicode · 5 export-file
+//! create failure / output write failure · 6 unknown switch · 7 protocol
+//! failure (malformed daemon reply, 30 s of silence from the daemon, or
+//! pipe open error) · 8 daemon unreachable · 9 pipe server not trusted.
 
 // Thread-caching allocator: decoding a broad result set allocates a String per
 // path (millions of them), which the Windows default heap serializes.
@@ -30,11 +30,28 @@ mod reply;
 mod status;
 
 use goz_core::escompat::{Command, Exit, VERSION_LINE, help, parse_argv};
+use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `std::env::args` panics on an argument that is not valid Unicode, such
+    // as a lone surrogate on Windows; goz cannot use one, so it is a bad
+    // parameter.
+    let args = match std::env::args_os()
+        .skip(1)
+        .map(OsString::into_string)
+        .collect::<Result<Vec<String>, OsString>>()
+    {
+        Ok(args) => args,
+        Err(arg) => {
+            eprintln!(
+                "goz: an argument is not valid Unicode: {}",
+                arg.to_string_lossy()
+            );
+            return Exit::BadParam.into();
+        }
+    };
     match parse_argv(&args) {
         Ok(Command::Run(plan)) => execute(plan),
         Ok(Command::Help(screen)) => print(&help(screen)),

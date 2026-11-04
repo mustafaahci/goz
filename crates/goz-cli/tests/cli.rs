@@ -90,6 +90,37 @@ fn missing_switch_parameter_exits_4() {
     );
 }
 
+/// es exit code 4 for an argument goz cannot read at all: one that is not
+/// valid Unicode used to panic, exit 101, before parsing began.
+#[test]
+fn a_non_unicode_argument_exits_4() {
+    #[cfg(windows)]
+    let bad = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[u16::from(b'a'), 0xD800])
+    };
+    #[cfg(unix)]
+    let bad = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![b'a', 0xFF])
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_goz"))
+        .arg(&bad)
+        .output()
+        .expect("failed to spawn the goz binary");
+    assert_eq!(out.status.code(), Some(4), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("goz: an argument is not valid Unicode: a\u{FFFD}"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("panicked"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
 /// es exit code 5. The export file is created up front, so an uncreatable path
 /// fails before `Client::connect` and needs no daemon.
 ///
