@@ -55,7 +55,7 @@ pub(crate) fn build_engine() -> Result<Engine> {
             )),
             phase: RwLock::new(VolumePhase::Failed { reason: fv.reason }),
             metadata_pending: RwLock::new(false),
-            journal_max_bytes: None,
+            journal_max_bytes: RwLock::new(None),
             scope_cache: parking_lot::Mutex::new(None),
         }));
     }
@@ -70,7 +70,7 @@ pub(crate) fn build_engine() -> Result<Engine> {
             // True only when the FILE_LAYOUT pass stopped and ENUM named the
             // rest without sizes or dates.
             metadata_pending: RwLock::new(bv.metadata_pending),
-            journal_max_bytes: bv.journal.cursor().map(|c| c.maximum_size),
+            journal_max_bytes: RwLock::new(bv.journal.cursor().map(|c| c.maximum_size)),
             scope_cache: parking_lot::Mutex::new(None),
         });
 

@@ -669,8 +669,8 @@ fn rescan(
 
     // Pass the stop flag so a shutdown arriving mid-rebuild aborts promptly
     // instead of blocking `TailHandle::shutdown`'s join for the full MFT scan.
-    let new_index = match bootstrap::build_index(handle, Some(stop)) {
-        Ok(Some(built)) => built.index,
+    let built = match bootstrap::build_index(handle, Some(stop)) {
+        Ok(Some(built)) => built,
         // Aborted by shutdown: leave the old index in place and stop cleanly;
         // this is NOT a failure, so do not mark the volume Failed.
         Ok(None) => return None,
@@ -680,16 +680,7 @@ fn rescan(
         }
     };
 
-    {
-        let mut index = state.index.write();
-        *index = new_index;
-        // Invalidate the scope cache while the index write lock is held: its
-        // EntryIdx values belong to the old generation. Clearing it here (rather
-        // than after the lock drops) guarantees a reader never sees the new,
-        // possibly smaller index alongside a stale EntryIdx, which would index
-        // out of bounds in VolumeIndex::path_of during scope validation.
-        *state.scope_cache.lock() = None;
-    }
+    install(state, built, cursor);
 
     match cursor {
         Some(c) => {
@@ -711,6 +702,21 @@ fn rescan(
             None
         }
     }
+}
+
+/// Publishes a rebuilt index with the flags that describe it, under the index
+/// write lock and before the phase returns to Live.
+fn install(state: &VolumeState, built: bootstrap::BuiltIndex, journal: Option<JournalInfo>) {
+    let mut index = state.index.write();
+    *index = built.index;
+    *state.metadata_pending.write() = built.metadata_pending;
+    *state.journal_max_bytes.write() = journal.map(|c| c.maximum_size);
+    // Invalidate the scope cache while the index write lock is held: its
+    // EntryIdx values belong to the old generation. Clearing it here (rather
+    // than after the lock drops) guarantees a reader never sees the new,
+    // possibly smaller index alongside a stale EntryIdx, which would index
+    // out of bounds in VolumeIndex::path_of during scope validation.
+    *state.scope_cache.lock() = None;
 }
 
 /// Sleeps up to `total`, waking early if `stop` flips. Plain `sleep` here
@@ -744,10 +750,17 @@ fn mark_failed(state: &VolumeState, reason: RescanReason, detail: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEGRADE_AFTER, ESCALATE_AFTER, REASON_MASK, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN};
+    use super::{
+        DEGRADE_AFTER, ESCALATE_AFTER, REASON_MASK, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN, install,
+    };
+    use crate::bootstrap::BuiltIndex;
+    use crate::volume_state::{ScopeCache, VolumeState};
+    use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
     use goz_core::types::Frn;
+    use goz_core::types::VolumePhase;
     use goz_core::usn::ops_for;
     use goz_core::usn::record::ParsedUsnRecord;
+    use parking_lot::{Mutex, RwLock};
     use std::time::Duration;
 
     fn record_with(reason: u32) -> ParsedUsnRecord {
@@ -824,6 +837,49 @@ mod tests {
         // But not so patient that an unmappable read error (the observed
         // ERROR_INVALID_PARAMETER zombie) parks a volume for minutes.
         assert!(ESCALATE_AFTER <= Duration::from_secs(120));
+    }
+
+    fn built(metadata_pending: bool) -> BuiltIndex {
+        BuiltIndex {
+            index: VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse()),
+            layout_secs: 0.0,
+            enum_secs: None,
+            metadata_pending,
+        }
+    }
+
+    /// A rescan publishes the flags of the index it built, not the ones its
+    /// volume had at bootstrap.
+    #[test]
+    fn a_rebuilt_index_brings_its_own_flags() {
+        let state = VolumeState {
+            guid: r"\\?\Volume{00000000-0000-0000-0000-000000000000}\".to_string(),
+            mounts: vec![r"C:\".to_string()],
+            index: RwLock::new(VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse())),
+            phase: RwLock::new(VolumePhase::Rescanning),
+            metadata_pending: RwLock::new(true),
+            journal_max_bytes: RwLock::new(None),
+            scope_cache: Mutex::new(Some(ScopeCache {
+                rel: b"windows".to_vec(),
+                entry: 1,
+            })),
+        };
+        let journal = goz_winfs::JournalInfo {
+            journal_id: 7,
+            first_usn: 0,
+            next_usn: 4096,
+            lowest_valid_usn: 0,
+            max_usn: i64::MAX,
+            maximum_size: 64 << 20,
+        };
+        install(&state, built(false), Some(journal));
+        assert!(!*state.metadata_pending.read());
+        assert_eq!(*state.journal_max_bytes.read(), Some(64 << 20));
+        assert!(state.scope_cache.lock().is_none());
+
+        install(&state, built(true), None);
+        assert!(*state.metadata_pending.read());
+        assert_eq!(*state.journal_max_bytes.read(), None);
     }
 
     /// The converse direction is deliberately NOT asserted: the mask may name
