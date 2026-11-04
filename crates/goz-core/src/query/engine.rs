@@ -9,7 +9,6 @@
 //! and is its folder's path, built once per folder and query (see
 //! `FolderPaths`), plus its own name.
 
-use super::dates::DateFilter;
 use super::folder_rank::FolderRanks;
 use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange};
 use crate::index::volume::MAX_PATH_HOPS;
@@ -886,10 +885,17 @@ fn evaluate(
     if !kind_matches(parsed.filters.kind, entry.is_dir()) {
         return None;
     }
-    if !size_matches(parsed.filters.size, entry.size()) {
+    // Each column is read only when its filter asks: a broad query visits
+    // millions of entries in no particular order, and an unconditional
+    // read of the size and date columns cost each of them two cache misses.
+    if let Some(range) = parsed.filters.size
+        && !size_matches(range, entry.size())
+    {
         return None;
     }
-    if !date_matches(parsed.filters.date, entry.mtime()) {
+    if let Some(filter) = parsed.filters.date
+        && !filter.matches(entry.mtime())
+    {
         return None;
     }
 
@@ -957,17 +963,8 @@ fn kind_matches(kind: Option<Kind>, is_dir: bool) -> bool {
 
 /// A size filter excludes entries whose size is unknown (not yet enriched):
 /// we cannot confirm the predicate, so we do not claim a match.
-fn size_matches(filter: Option<SizeRange>, size: Option<u64>) -> bool {
-    match filter {
-        None => true,
-        Some(range) => size.is_some_and(|s| range.contains(s)),
-    }
-}
-
-/// A date filter excludes entries whose date is unknown unless it asks for
-/// them (`dm:unknown`), as a size filter excludes unknown sizes.
-fn date_matches(filter: Option<DateFilter>, mtime: Option<i64>) -> bool {
-    filter.is_none_or(|f| f.matches(mtime))
+fn size_matches(range: SizeRange, size: Option<u64>) -> bool {
+    size.is_some_and(|s| range.contains(s))
 }
 
 /// Extension matching is always case-insensitive (es semantics): the filter
