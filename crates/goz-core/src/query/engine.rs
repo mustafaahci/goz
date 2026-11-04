@@ -593,14 +593,46 @@ fn name_level_refs(
 }
 
 /// A folder-scoped query walks the scope's subtree instead of scanning the
-/// whole volume, up to this many visited entries. Past it (a near-volume
-/// scope), the walk aborts and the ordinary scan+ancestry-filter path runs:
-/// pointer-chasing millions of entries is slower than the SIMD arena scan.
-/// The cutoff makes a Downloads-sized scope independent of disk size: the
+/// whole volume, so a Downloads-sized scope costs the same on any disk: the
 /// old path cost ~300 ms on a broad query over 3.9M entries because every
-/// candidate on the volume paid an ancestry check; the walk touches only
-/// the folder.
+/// candidate on the volume paid an ancestry check. The walk goes on
+/// unconditionally up to this many visited entries, and past it only while
+/// it has visited no more entries than the scan would check (see
+/// [`scan_cost`]): a rare term in a big folder scans the names instead, while
+/// a broad term, or a filter with no name to scan for, walks the folder. An
+/// entry walked and an entry scanned are weighed alike: on a real volume, in
+/// MFT order, the walk stayed the cheaper even for a folder holding two thirds
+/// of it.
 const SUBTREE_WALK_MAX: usize = 200_000;
+
+/// How many entries the scan of `parsed` checks, for the scope walk to weigh
+/// itself against (see [`SUBTREE_WALK_MAX`]): those bearing a name the
+/// prefilter finds, whose ids go to `hits` so the scan does not search the
+/// names again; none for a query that walks below the names holding a piece
+/// of its path, whose cost shows only by walking, so the scope walk gives up
+/// at its floor as it always has; or else every entry.
+fn scan_cost(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    hits: &mut Option<Vec<NameId>>,
+) -> usize {
+    let Some(needle) = compiled.prefilter.as_deref().filter(|_| !parsed.match_case) else {
+        return if compiled.path_piece.is_some() {
+            0
+        } else {
+            index.len()
+        };
+    };
+    let mut ids = Vec::new();
+    let mut entries = 0usize;
+    for_each_prefilter_hit(index, needle, |id| {
+        entries += index.name_refcount(id) as usize;
+        ids.push(id);
+    });
+    *hits = Some(ids);
+    entries
+}
 
 /// Collects every match of `parsed` under `scope`, in scan order.
 fn scan(
@@ -608,6 +640,19 @@ fn scan(
     parsed: &ParsedQuery,
     compiled: &CompiledQuery,
     scope: Option<EntryIdx>,
+) -> Vec<Candidate> {
+    scan_with(index, parsed, compiled, scope, SUBTREE_WALK_MAX)
+}
+
+/// [`scan`], with a scope walked unconditionally up to `walk_floor` entries
+/// instead of [`SUBTREE_WALK_MAX`], so a test can make a small tree decide
+/// between walking and scanning.
+fn scan_with(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    scope: Option<EntryIdx>,
+    walk_floor: usize,
 ) -> Vec<Candidate> {
     if !compiled.volume_admits {
         return Vec::new();
@@ -631,14 +676,22 @@ fn scan(
     // tracks the folder, not the volume. Membership is by construction, so
     // `evaluate` runs without the scope (its ancestry walk is the expensive
     // part this path exists to avoid); every other predicate is identical to
-    // the scan paths below. Oversized scopes abort to those paths.
+    // the scan paths below. A scope that grows costlier to walk than the scan
+    // aborts to the scan (see [`SUBTREE_WALK_MAX`]).
     let mut subtree_done = false;
+    let mut prefilter_hits: Option<Vec<NameId>> = None;
     if let Some(root) = scope {
         let mut visited = 0usize;
+        let mut cap = walk_floor;
+        let mut priced = false;
         subtree_done = true;
         for idx in index.subtree_entries(root) {
             visited += 1;
-            if visited > SUBTREE_WALK_MAX {
+            if visited > cap && !priced {
+                priced = true;
+                cap = cap.max(scan_cost(index, parsed, compiled, &mut prefilter_hits));
+            }
+            if visited > cap {
                 candidates.clear();
                 subtree_done = false;
                 break;
@@ -674,8 +727,9 @@ fn scan(
         // The scan cost is proportional to the unique-name bytes (~1/3 of
         // the total on a real volume); a hit fans out to every entry bearing
         // the name through its same-name chain. The chains are exact, so no
-        // per-candidate staleness guard is needed.
-        for_each_prefilter_hit(index, needle, |id| {
+        // per-candidate staleness guard is needed. A scope walk that priced
+        // this scan already found the names.
+        let on_hit = |id: NameId| {
             for idx in index.name_chain(id) {
                 if index.is_synthetic(idx) {
                     continue;
@@ -696,7 +750,11 @@ fn scan(
                     candidates.push(c);
                 }
             }
-        });
+        };
+        match prefilter_hits {
+            Some(ids) => ids.into_iter().for_each(on_hit),
+            None => for_each_prefilter_hit(index, needle, on_hit),
+        }
     } else if let Some(piece) = compiled.path_piece.as_deref()
         && walk_below_names(index, piece, index.len() / PATH_WALK_SHARE, |idx| {
             if index.is_synthetic(idx) {
@@ -2791,6 +2849,45 @@ mod tests {
             got.sort();
             prop_assert_eq!(out.total as usize, got.len());
             prop_assert_eq!(got, want, "query {:?} under {}", query, prefix);
+        }
+
+        /// A scoped query finds the same entries however far its walk goes
+        /// before the scan is priced: walked to the end, or given up for the
+        /// names the pricing found, or for a walk below the names holding a
+        /// piece of its path and the scan of every entry that walk falls back
+        /// to once it grows too large.
+        #[test]
+        fn a_scope_finds_the_same_walked_or_scanned(
+            nodes in prop::collection::vec(
+                (any::<prop::sample::Index>(), "[aAbB]{1,3}(\\.txt)?", any::<bool>()),
+                1..40,
+            ),
+            orphans in prop::collection::vec("[aAbB]{1,3}", 0..3),
+            scope_pick in any::<prop::sample::Index>(),
+            query in prop::sample::select(vec![
+                "ab", "b.txt", "*.txt", "ab b", "b ext:txt", "b.txt file:", "file:", "folder:",
+                "A case:", r"a\", r"path:*\b*",
+            ]),
+        ) {
+            let (idx, entries) = random_tree(&nodes, &orphans, false);
+            let folders: Vec<EntryIdx> =
+                entries.iter().copied().filter(|&e| idx.entry(e).is_dir()).collect();
+            prop_assume!(!folders.is_empty());
+            let scope = *scope_pick.get(&folders);
+            let parsed = parse_query(query).unwrap();
+            let compiled = CompiledQuery::new(&parsed, r"C:\");
+            let found = |floor| {
+                let mut found: Vec<EntryIdx> = scan_with(&idx, &parsed, &compiled, Some(scope), floor)
+                    .iter()
+                    .map(|c| c.idx)
+                    .collect();
+                found.sort_unstable();
+                found
+            };
+            let walked = found(usize::MAX);
+            for floor in [0, 1, 2, 5] {
+                prop_assert_eq!(&found(floor), &walked, "{:?} with floor {}", query, floor);
+            }
         }
     }
 

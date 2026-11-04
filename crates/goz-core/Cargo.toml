@@ -37,5 +37,9 @@ harness = false
 name = "sort"
 harness = false
 
+[[bench]]
+name = "scope"
+harness = false
+
 [lints]
 workspace = true
