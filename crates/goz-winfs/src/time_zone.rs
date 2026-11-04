@@ -45,6 +45,9 @@ impl TimeZone {
     /// (`SystemTimeToTzSpecificLocalTimeEx`), or `None` outside the years a
     /// `SYSTEMTIME` holds, 1601 to 30827.
     pub fn local_from_utc(&self, utc: i64) -> Option<i64> {
+        if let Some(bias) = self.fixed_bias() {
+            return shifted(utc, -bias);
+        }
         let (whole, below_ms) = split_ms(utc)?;
         let mut local = SYSTEMTIME::default();
         // SAFETY: plain Win32 FFI; both SYSTEMTIMEs and the zone are valid
@@ -61,6 +64,9 @@ impl TimeZone {
     /// `SYSTEMTIME` holds. Windows maps a time that a daylight-saving change
     /// skips or repeats to one within the change.
     pub fn utc_from_local(&self, local: i64) -> Option<i64> {
+        if let Some(bias) = self.fixed_bias() {
+            return shifted(local, bias);
+        }
         let (whole, below_ms) = split_ms(local)?;
         let mut utc = SYSTEMTIME::default();
         // SAFETY: as in `local_from_utc`, with the roles of the two times
@@ -71,6 +77,26 @@ impl TimeZone {
         }
         from_system_time(&utc)?.checked_add(below_ms)
     }
+
+    /// UTC minus local time, in ticks, when "Adjust for daylight saving time
+    /// automatically" is off. The clock in the taskbar then keeps the zone's
+    /// standard offset all year, but the `...Ex` conversions look the zone's
+    /// rules up by name and still apply daylight saving, so this zone
+    /// converts with the fixed offset instead.
+    fn fixed_bias(&self) -> Option<i64> {
+        self.info
+            .DynamicDaylightTimeDisabled
+            .then(|| i64::from(self.info.Bias) * 60 * 10_000_000)
+    }
+}
+
+/// `ticks` moved by `delta`, within the years a `SYSTEMTIME` holds as the
+/// `...Ex` conversions are.
+fn shifted(ticks: i64, delta: i64) -> Option<i64> {
+    split_ms(ticks)?;
+    let moved = ticks.checked_add(delta)?;
+    split_ms(moved)?;
+    Some(moved)
 }
 
 /// `ticks` as the `SYSTEMTIME` of its whole milliseconds, and the ticks below
@@ -194,6 +220,24 @@ mod tests {
         assert_eq!(eastern.utc_from_local(t - 4 * 36_000_000_000), Some(t));
         assert_eq!(eastern.local_from_utc(-1), None);
         assert_eq!(eastern.utc_from_local(i64::MAX), None);
+    }
+
+    /// With "Adjust for daylight saving time automatically" off, Eastern time
+    /// stays five hours behind UTC in July, as the clock in the taskbar does,
+    /// though the zone's rules would put daylight saving there.
+    #[test]
+    fn a_zone_without_automatic_daylight_saving_keeps_its_standard_offset() {
+        let mut eastern = named("Eastern Standard Time");
+        eastern.info.DynamicDaylightTimeDisabled = true;
+        assert_eq!(
+            eastern.local_from_utc(ft("2026-07-01T12:00")),
+            Some(ft("2026-07-01T07:00"))
+        );
+        assert_eq!(
+            eastern.utc_from_local(ft("2026-07-01T00:00")),
+            Some(ft("2026-07-01T05:00"))
+        );
+        assert_eq!(eastern.local_from_utc(-1), None);
     }
 
     /// The machine's zone agrees, right now, with the conversion the file
