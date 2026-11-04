@@ -119,11 +119,12 @@ pub struct IndexStats {
     ///
     /// Reconciling walks the file's real link set from Win32 and applies it
     /// (see [`VolumeIndex::reconcile_links`]). This counts the walks that could
-    /// NOT complete (one that failed or stopped part way, a file locked or
-    /// pending delete, or a link in a folder not indexed yet): those are
-    /// skipped rather than reconciled to a partial set, so a few names may be
-    /// stale until the next rescan. A file that is gone is not counted. Counted so the gap is visible in
-    /// `Status` rather than silent.
+    /// NOT complete (one that failed or stopped part way, a file pending
+    /// delete, a link folder the walk may not read, or a link in a folder not
+    /// indexed yet): those are skipped rather than reconciled to a partial set,
+    /// so a few names may be stale until the next rescan. A file that is gone
+    /// is not counted. Counted so the gap is visible in `Status` rather than
+    /// silent.
     pub link_reconciles_dropped: u64,
 }
 

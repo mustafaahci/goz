@@ -57,10 +57,10 @@ pub enum Resync {
 
 /// Why a full rescan was decided. [`validate_cursor`] produces only
 /// `JournalIdChanged` / `CursorPurged` / `RestampDiscontinuity`; `ParserAnomaly`,
-/// `EntryDeletedError`, `NoCursor`, and `ReadsKeptFailing` are mapped by the
-/// daemon from runtime conditions. `JournalNotActive`,
-/// `JournalDeleteInProgress`, and `VolumeReattached` are reserved for causes
-/// the daemon does not yet map. All live here so every rescan cause shares one
+/// `EntryDeletedError`, `JournalNotActive`, `JournalDeleteInProgress`,
+/// `NoCursor`, and `ReadsKeptFailing` are mapped by the daemon from runtime
+/// conditions. `VolumeReattached` is reserved for a cause the daemon does not
+/// yet map. All live here so every rescan cause shares one
 /// telemetry vocabulary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RescanReason {
