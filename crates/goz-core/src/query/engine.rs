@@ -369,9 +369,9 @@ fn page_refs(
 /// Whether every predicate of `parsed` is decided by the file name alone, so
 /// the query can run over the distinct names instead of the entries: no
 /// scope, no path term the mount prefix leaves open, no kind, size or date
-/// filter, and no orphan whose presentability would need a per-entry walk.
-/// Extensions, wildcards and case sensitivity are properties of the name and
-/// pass.
+/// filter, and no entry without a path (an orphan, or one in a parent cycle)
+/// whose presentability would need a per-entry walk. Extensions, wildcards
+/// and case sensitivity are properties of the name and pass.
 fn is_name_level(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
@@ -384,7 +384,7 @@ fn is_name_level(
         && parsed.filters.kind.is_none()
         && parsed.filters.size.is_none()
         && parsed.filters.date.is_none()
-        && !index.has_orphans()
+        && !index.may_have_unpresentable()
 }
 
 /// The name predicates of `parsed` against one distinct name: substring
@@ -920,17 +920,17 @@ fn evaluate(
         return None;
     }
 
-    // An entry whose parent has no presentable path (ancestry ends in lost+found)
-    // is dropped by the page loop. Reject it here so it never counts toward
+    // An entry whose parent has no presentable path (ancestry ends in lost+found
+    // or runs in a cycle) is dropped by the page loop. Reject it here so it never counts toward
     // `total` and never occupies a page slot: otherwise `goz -n 10 report` can
     // print nothing while reporting a non-zero total, and the same query without
     // `-n` prints the real hits.
     //
     // Calls the very function the page loop uses rather than re-deriving its
     // rules, so the two cannot drift, and memoizes per parent directory rather
-    // than per file. Gated on `has_orphans` because an index with nothing
-    // under lost+found cannot contain an unpresentable entry: `has_orphans` is a
-    // single load, while the walk it guards is one `path_of` per distinct parent
+    // than per file. Gated on `may_have_unpresentable` because an index with
+    // nothing under lost+found and no parent cycle cannot contain an
+    // unpresentable entry: the gate is two loads, while the walk it guards is one `path_of` per distinct parent
     // directory, which on a broad limited query is tens of thousands of walks
     // the page (100 rows) would never have needed. Paying it unconditionally
     // cost a broad limited query ~20%.
@@ -944,7 +944,9 @@ fn evaluate(
             }
         }
         None => {
-            if index.has_orphans() && parent_path(index, entry.parent(), dir_paths).is_none() {
+            if index.may_have_unpresentable()
+                && parent_path(index, entry.parent(), dir_paths).is_none()
+            {
                 return None;
             }
         }
@@ -1926,6 +1928,40 @@ mod tests {
         assert_eq!(paths, vec!["docs\\sub\\Report.PDF"]); // descendants only, not "docs\sub" itself
     }
 
+    /// A folder whose record put it under its own subfolder forms a cycle
+    /// cut off from the root, and nothing goes under lost+found. Its files
+    /// used to count, and to take the slots of a limited page that could not
+    /// list them: `goz -n 1 x` printed nothing while `xother.txt` matched.
+    #[test]
+    fn a_parent_cycle_is_neither_counted_nor_listed() {
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        for r in [
+            enum_rec(frn(100), NTFS_ROOT_FRN, "a", true),
+            enum_rec(frn(101), frn(100), "b", true),
+            enum_rec(frn(102), frn(101), "xfile.txt", false),
+            enum_rec(frn(103), NTFS_ROOT_FRN, "xother.txt", false),
+            enum_rec(frn(100), frn(101), "a", true),
+        ] {
+            idx.insert_enum(&r);
+        }
+        idx.optimize_storage();
+        assert!(!idx.has_orphans());
+        let parsed = parse_query("x").unwrap();
+        for key in [SortKey::Name, SortKey::Path, SortKey::Size] {
+            for scope in [None, Some(idx.root())] {
+                let sort = SortSpec::default_for(key);
+                let page = run_query(&idx, r"C:\", &parsed, scope, sort, 0, Some(1));
+                let paths: Vec<String> = page
+                    .hits
+                    .iter()
+                    .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                    .collect();
+                assert_eq!(paths, ["xother.txt"], "{key:?} {scope:?}");
+                assert_eq!(page.total, 1, "{key:?} {scope:?}");
+            }
+        }
+    }
+
     #[test]
     fn sort_path_orders_by_parent_then_name() {
         let idx = sample_index();
@@ -2207,7 +2243,7 @@ mod tests {
     }
 
     /// A child of a removed folder has no full path. The name-level page
-    /// trusts each name's refcount only while `has_orphans` is false, so the
+    /// trusts each name's refcount only while `may_have_unpresentable` is false, so the
     /// child used to be counted and shown under the folder's zero-filled
     /// name, and once a compaction ran its page panicked.
     #[test]

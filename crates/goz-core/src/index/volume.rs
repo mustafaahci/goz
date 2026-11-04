@@ -216,6 +216,10 @@ pub struct VolumeIndex {
     /// happens both live here and `child_dir` disambiguates by comparing the
     /// actual folded names.
     dir_children: FxHashMap<(EntryIdx, u64), SmallVec<[EntryIdx; 1]>>,
+    /// The entries whose record closed a parent cycle, until
+    /// [`Self::prune_cycle_suspects`] finds the cycle gone. Empty on a
+    /// healthy index.
+    cycle_suspects: Vec<EntryIdx>,
 }
 
 impl VolumeIndex {
@@ -260,20 +264,27 @@ impl VolumeIndex {
             stats: IndexStats::default(),
             dirty: 0,
             dir_children: FxHashMap::default(),
+            cycle_suspects: Vec::new(),
         };
         this.link_same_name(root, root_name);
         this.link_same_name(lost_found, lf_name);
         this
     }
 
-    /// Whether any entry could fail to reconstruct to a real path.
-    ///
-    /// False means nothing sits under lost+found (no placeholder for a parent
-    /// whose record has not arrived, no child of a removed folder), so every
-    /// entry is presentable. The query engine uses this single load to skip
-    /// its per-directory presentability walk entirely on a healthy index.
+    /// Whether anything sits under lost+found: a placeholder for a parent
+    /// whose record has not arrived, or a child of a removed folder. Such an
+    /// entry has no real path. A parent cycle is the other way to lose one;
+    /// [`Self::may_have_unpresentable`] covers both.
     pub fn has_orphans(&self) -> bool {
         self.entries.first_child(self.lost_found) != NIL
+    }
+
+    /// Whether any entry could fail to reconstruct to a real path: one is
+    /// under lost+found, or a record closed a parent cycle that no record
+    /// has broken yet. False on a healthy index, where the query engine
+    /// skips its per-directory presentability walk entirely.
+    pub fn may_have_unpresentable(&self) -> bool {
+        self.has_orphans() || !self.cycle_suspects.is_empty()
     }
 
     pub fn root(&self) -> EntryIdx {
@@ -450,6 +461,7 @@ impl VolumeIndex {
         if self.names.wants_merge() {
             self.names.merge_unranked();
         }
+        self.prune_cycle_suspects();
         self.generation += 1;
         // Compaction is NOT performed here: it is reported so the caller can do
         // the expensive part off the write lock. Doing it inline made a single
@@ -602,9 +614,9 @@ impl VolumeIndex {
             || flags.contains(EntryFlags::LOST_FOUND)
     }
 
-    /// Forces an entry's parent link. Test-only: the public API never
-    /// produces a cycle, so this exists solely to exercise the defensive
-    /// cycle guard in [`Self::path_of`].
+    /// Forces an entry's parent link, past the cycle bookkeeping of
+    /// [`Self::rewrite_entry`]. Test-only: it builds the corrupt links the
+    /// cycle guards of [`Self::path_of`] and the walks must survive.
     #[cfg(test)]
     pub fn force_parent(&mut self, idx: EntryIdx, parent: EntryIdx) {
         self.entries.set_parent(idx, parent);
@@ -873,6 +885,15 @@ impl VolumeIndex {
         let id = self.names.intern(name);
         self.entries.set_name_id(idx, id);
         self.link_same_name(idx, id);
+        // A parent at or below the entry closes a cycle cut off from the root,
+        // which only a stale link gives: a snapshot read while folders moved,
+        // a missed record, corrupt data. The link stays as the record says,
+        // since the moves still to be replayed may belong to other entries
+        // and heal it only that way; the entry is noted so queries check
+        // presentability until then (see `prune_cycle_suspects`).
+        if self.is_at_or_below(parent_idx, idx) && !self.cycle_suspects.contains(&idx) {
+            self.cycle_suspects.push(idx);
+        }
         // Unlink from the OLD parent's child chain while `parent` still
         // points there, then relink under the new parent.
         self.unlink_child(idx);
@@ -887,6 +908,34 @@ impl VolumeIndex {
         self.entries.set_flags(idx, flags);
         self.dir_index_insert(idx);
         self.dirty += 1;
+    }
+
+    /// Drops the cycle suspects no cycle runs through any more: their parents
+    /// lead out again, to the root or to lost+found (where
+    /// [`Self::has_orphans`] covers them), or the entry was removed, which
+    /// leaves its slot no parent. Every cycle still holds a suspect: only
+    /// [`Self::rewrite_entry`] closes one, noting the entry that did. A slot
+    /// reused by another entry stays only while a cycle runs through it,
+    /// which the rewrite that closed that cycle noted as well.
+    fn prune_cycle_suspects(&mut self) {
+        let mut suspects = core::mem::take(&mut self.cycle_suspects);
+        suspects.retain(|&idx| self.is_at_or_below(self.entries.parent(idx), idx));
+        self.cycle_suspects = suspects;
+    }
+
+    /// Whether `node` is `ancestor` or below it by parent links, giving up
+    /// after [`MAX_PATH_HOPS`] as [`Self::path_of`] does.
+    fn is_at_or_below(&self, mut node: EntryIdx, ancestor: EntryIdx) -> bool {
+        for _ in 0..MAX_PATH_HOPS {
+            if node == ancestor {
+                return true;
+            }
+            if node == NIL || node == self.root || node == self.lost_found {
+                return false;
+            }
+            node = self.entries.parent(node);
+        }
+        false
     }
 
     /// Reclaims a record number NTFS has re-tenanted: tombstones the stale chain
@@ -1184,11 +1233,13 @@ impl VolumeIndex {
     /// FRN map to its cheaper dense backing when the record space allows it,
     /// build the name order while every name is known (one parallel sort,
     /// ~100 ms per million names, instead of the tail merging them in a
-    /// thousand at a time), then return all growth slack. Runs before the
-    /// index is published; do not call it per batch.
+    /// thousand at a time), drop the cycle suspects the build healed, then
+    /// return all growth slack. Runs before the index is published; do not
+    /// call it per batch.
     pub fn optimize_storage(&mut self) {
         self.by_frn.densify_if_smaller();
         self.names.build_order();
+        self.prune_cycle_suspects();
         self.shrink_to_fit();
     }
 

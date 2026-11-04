@@ -1522,6 +1522,72 @@ fn a_parent_that_is_its_own_records_previous_tenant_goes_to_lost_found() {
     }
 }
 
+/// A snapshot read while folders move shows each record as it was when it
+/// was read, so it can put a folder under its own subfolder: a cycle cut off
+/// from the root, with nothing under lost+found for the orphan check to
+/// see. Unscoped searches counted the cycle's files and could not list them.
+/// The index now reports the cycle, and the replayed moves heal it whichever
+/// member's record closed it, so it must keep the links as the records say.
+/// `snapshot` reads each record once, in record order as a real read does,
+/// and `replay` is the journal from before the read.
+#[test]
+fn a_cycle_from_a_snapshot_read_during_moves_heals_on_replay() {
+    let (a, b, c) = (frn(100), frn(101), frn(102));
+    let dir = |f, parent, name| create(f, parent, name, true);
+    let cases = [
+        // root\b\a\f.txt at first. The read saw a in b, then a moved to the
+        // root and b into a, and the read saw b and f.txt in a. b closes
+        // the cycle.
+        (
+            vec![dir(a, b, "a"), dir(b, a, "b"), create(c, a, "f.txt", false)],
+            vec![rename(a, root_frn(), "a", true), rename(b, a, "b", true)],
+            ["a", r"a\b", r"a\f.txt"],
+        ),
+        // root\b\a\c at first. The read saw a in b, then a moved to the root
+        // and b into c, and the read saw b in c and c in a. c closes the
+        // cycle, and only a's and b's moves are replayed.
+        (
+            vec![dir(a, b, "a"), dir(b, c, "b"), dir(c, a, "c")],
+            vec![rename(a, root_frn(), "a", true), rename(b, c, "b", true)],
+            ["a", r"a\c", r"a\c\b"],
+        ),
+        // root\c\a and root\b at first. The read saw a in c and b at the
+        // root, then b moved into a, a to the root and c into b, and the
+        // read saw c in b. b's replayed move closes the cycle, a's breaks it.
+        (
+            vec![dir(a, c, "a"), dir(b, root_frn(), "b"), dir(c, b, "c")],
+            vec![
+                rename(b, a, "b", true),
+                rename(a, root_frn(), "a", true),
+                rename(c, b, "c", true),
+            ],
+            ["a", r"a\b", r"a\b\c"],
+        ),
+    ];
+    for (i, (snapshot, replay, disk)) in cases.into_iter().enumerate() {
+        let mut idx = index_from_enum(&snapshot);
+        assert_whole(&idx);
+        if i < 2 {
+            assert!(!idx.has_orphans(), "case {i}");
+            assert!(
+                idx.may_have_unpresentable(),
+                "case {i}: the cycle is not reported"
+            );
+        }
+        idx.apply_batch(&replay);
+        assert_eq!(
+            path_set(&idx),
+            disk.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+            "case {i}"
+        );
+        assert!(
+            !idx.may_have_unpresentable(),
+            "case {i}: the healed cycle is still reported"
+        );
+        assert_whole(&idx);
+    }
+}
+
 /// The same corrupt parent in a FILE_LAYOUT name. Each of the file's names
 /// resolved it, and resolving it once the file held the record reclaimed the
 /// file itself, so its name was chained to the placeholder that took the
