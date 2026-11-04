@@ -23,6 +23,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod client;
 #[cfg(windows)]
 mod not_running;
+#[cfg(any(windows, test))]
+mod status;
 
 use goz_core::escompat::{Command, Exit, VERSION_LINE, help, parse_argv};
 use std::io::Write;
@@ -327,104 +329,11 @@ mod win {
     fn status(connection: &mut Client) -> Result<ExitCode, ExitCode> {
         match connection.request(&Request::Status) {
             Ok(Response::Status(s)) => {
-                // Locked writeln! that tolerates a broken pipe (`goz --status | head`)
-                // instead of println!, which panics on any stdout write error.
+                // Locked write that tolerates a broken pipe (`goz --status | head`)
+                // instead of print!, which panics on any stdout write error.
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
-                let _ = writeln!(out, "gozd status: {} volume(s)", s.volumes.len());
-                for v in &s.volumes {
-                    let mount = v.mounts.first().cloned().unwrap_or_else(|| v.guid.clone());
-                    let _ = writeln!(
-                        out,
-                        "  {mount:<8} {:>12} entries  phase={}{}",
-                        v.entries,
-                        v.phase, // user-facing Display, not Debug
-                        if v.metadata_pending {
-                            "  (metadata pending)"
-                        } else {
-                            ""
-                        }
-                    );
-                    // The journal's size is the replay horizon: everything
-                    // older than what it holds costs a full rescan on restart.
-                    if let Some(bytes) = v.journal_max_bytes {
-                        let _ =
-                            writeln!(out, "           journal max {} MiB", bytes / (1024 * 1024));
-                    }
-                    // Orphans make every query walk each candidate's parent
-                    // chain; a healthy volume has none, so say when it does.
-                    if v.has_orphans {
-                        let _ = writeln!(
-                            out,
-                            "           orphans: entries without a full path (a parent never arrived, or its folder was removed first) sit under lost+found; queries pay a presentability walk"
-                        );
-                    }
-                    if v.names_waiting > 0 {
-                        let _ = writeln!(
-                            out,
-                            "           {} name(s) waiting to join the sort order",
-                            v.names_waiting
-                        );
-                    }
-                    // Drift counters, shown only when non-zero. These are the
-                    // only outward sign that the index and the volume have
-                    // diverged, so reporting them nowhere made a drifting index
-                    // indistinguishable from a healthy one.
-                    if v.link_reconciles_dropped > 0 {
-                        let _ = writeln!(
-                            out,
-                            "           {} hard-link change(s) not reconciled: some names may be stale",
-                            v.link_reconciles_dropped
-                        );
-                    }
-                    if v.stale_slots > 0 || v.delete_of_unknown > 0 || v.placeholders_created > 0 {
-                        let _ = writeln!(
-                            out,
-                            "           drift: {} stale slot(s), {} unknown delete(s), {} placeholder(s)",
-                            v.stale_slots, v.delete_of_unknown, v.placeholders_created
-                        );
-                    }
-                    // Index memory, component by component. `alloc` differing
-                    // from `used` is capacity slack held by that component.
-                    if let Some(m) = &v.memory {
-                        let mb = |p: &goz_core::proto::MemPair| {
-                            format!("{:.1}/{:.1}", p.used as f64 / 1e6, p.alloc as f64 / 1e6)
-                        };
-                        let total_used = m.entries.used
-                            + m.arena_raw.used
-                            + m.arena_folded.used
-                            + m.frn_map.used
-                            + m.name_tables.used
-                            + m.dir_children.used;
-                        let total_alloc = m.entries.alloc
-                            + m.arena_raw.alloc
-                            + m.arena_folded.alloc
-                            + m.frn_map.alloc
-                            + m.name_tables.alloc
-                            + m.dir_children.alloc;
-                        let _ = writeln!(
-                            out,
-                            "           mem MB used/alloc: total {:.1}/{:.1}  entries {}  names {}  folded {}  frn[{}] {}  ntables {}  dirs {}",
-                            total_used as f64 / 1e6,
-                            total_alloc as f64 / 1e6,
-                            mb(&m.entries),
-                            mb(&m.arena_raw),
-                            mb(&m.arena_folded),
-                            m.frn_map_kind,
-                            mb(&m.frn_map),
-                            mb(&m.name_tables),
-                            mb(&m.dir_children),
-                        );
-                    }
-                }
-                if s.process_private_bytes > 0 {
-                    let _ = writeln!(
-                        out,
-                        "  daemon: {:.1} MB private, {:.1} MB working set",
-                        s.process_private_bytes as f64 / 1e6,
-                        s.process_working_set as f64 / 1e6,
-                    );
-                }
+                let _ = out.write_all(super::status::render(&s).as_bytes());
                 if s.volumes_incomplete {
                     eprintln!("goz: some volumes are not fully live");
                 }

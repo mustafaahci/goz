@@ -593,6 +593,7 @@ fn build_status(volumes: &VolumeSet) -> DaemonStatus {
                 metadata_pending: *v.metadata_pending.read(),
                 journal_max_bytes: *v.journal_max_bytes.read(),
                 has_orphans: index.has_orphans(),
+                has_parent_cycle: index.has_parent_cycle(),
                 names_waiting: index.name_order_stats().1,
                 placeholders_created: stats.placeholders_created,
                 delete_of_unknown: stats.delete_of_unknown,
@@ -1898,6 +1899,24 @@ mod tests {
         let mut rec = file_record(frn, NTFS_ROOT_FRN.0, "");
         rec.reason = goz_core::usn::record::USN_REASON_FILE_DELETE;
         rec
+    }
+
+    /// A parent cycle no record has broken makes every query pay the
+    /// presentability walk, so `--status` must say so, apart from orphans.
+    #[test]
+    fn status_reports_a_parent_cycle() {
+        let mut index = windows_index();
+        index.insert_enum(&dir_record(100, 101, "Windows"));
+        index.optimize_storage();
+        assert!(index.has_parent_cycle());
+        let vols = set(&[
+            volume(r"C:\", index, VolumePhase::Live),
+            live_volume(r"D:\"),
+        ]);
+        let status = build_status(&vols);
+        assert!(status.volumes[0].has_parent_cycle);
+        assert!(!status.volumes[0].has_orphans);
+        assert!(!status.volumes[1].has_parent_cycle);
     }
 
     fn scoped(q: &str, scope: &str) -> goz_core::proto::QueryRequest {

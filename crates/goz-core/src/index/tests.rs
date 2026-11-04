@@ -1570,9 +1570,10 @@ fn a_cycle_from_a_snapshot_read_during_moves_heals_on_replay() {
         if i < 2 {
             assert!(!idx.has_orphans(), "case {i}");
             assert!(
-                idx.may_have_unpresentable(),
+                idx.has_parent_cycle(),
                 "case {i}: the cycle is not reported"
             );
+            assert!(idx.may_have_unpresentable(), "case {i}");
         }
         idx.apply_batch(&replay);
         assert_eq!(
@@ -1581,9 +1582,10 @@ fn a_cycle_from_a_snapshot_read_during_moves_heals_on_replay() {
             "case {i}"
         );
         assert!(
-            !idx.may_have_unpresentable(),
+            !idx.has_parent_cycle(),
             "case {i}: the healed cycle is still reported"
         );
+        assert!(!idx.may_have_unpresentable(), "case {i}");
         assert_whole(&idx);
     }
 }

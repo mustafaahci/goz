@@ -273,18 +273,25 @@ impl VolumeIndex {
 
     /// Whether anything sits under lost+found: a placeholder for a parent
     /// whose record has not arrived, or a child of a removed folder. Such an
-    /// entry has no real path. A parent cycle is the other way to lose one;
-    /// [`Self::may_have_unpresentable`] covers both.
+    /// entry has no real path. A parent cycle is the other way to lose one
+    /// ([`Self::has_parent_cycle`]); [`Self::may_have_unpresentable`] covers
+    /// both.
     pub fn has_orphans(&self) -> bool {
         self.entries.first_child(self.lost_found) != NIL
     }
 
+    /// Whether a record closed a parent cycle that no record has broken yet:
+    /// folders cut off from the root, whose entries have no real path.
+    pub fn has_parent_cycle(&self) -> bool {
+        !self.cycle_suspects.is_empty()
+    }
+
     /// Whether any entry could fail to reconstruct to a real path: one is
-    /// under lost+found, or a record closed a parent cycle that no record
-    /// has broken yet. False on a healthy index, where the query engine
-    /// skips its per-directory presentability walk entirely.
+    /// under lost+found, or sits in a parent cycle. False on a healthy index,
+    /// where the query engine skips its per-directory presentability walk
+    /// entirely.
     pub fn may_have_unpresentable(&self) -> bool {
-        self.has_orphans() || !self.cycle_suspects.is_empty()
+        self.has_orphans() || self.has_parent_cycle()
     }
 
     pub fn root(&self) -> EntryIdx {

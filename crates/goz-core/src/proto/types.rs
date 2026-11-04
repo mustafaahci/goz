@@ -207,6 +207,11 @@ pub struct VolumeStatus {
     /// a healthy volume reports `false`.
     #[serde(default)]
     pub has_orphans: bool,
+    /// `true` while a record has closed a parent cycle that no record has
+    /// broken yet: the entries in it have no full path, and every query pays
+    /// the presentability walk, as with [`Self::has_orphans`].
+    #[serde(default)]
+    pub has_parent_cycle: bool,
     /// Distinct names waiting to join the volume's name order (the sorted
     /// list a name-sorted page walks). They join on the tail's next merge;
     /// until then each costs a name-sorted query a binary search.
@@ -382,6 +387,7 @@ mod tests {
                 metadata_pending: i % 2 == 0,
                 journal_max_bytes: (i % 2 == 1).then_some(64 << 20),
                 has_orphans: i % 3 == 0,
+                has_parent_cycle: i % 2 == 1,
                 names_waiting: 7 * i as u64,
                 placeholders_created: i as u64,
                 delete_of_unknown: 2 * i as u64,
@@ -465,6 +471,18 @@ mod tests {
         let back: ResultItem = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, item);
         assert_eq!(back.path_u16.as_deref(), Some(units.as_slice()));
+    }
+
+    /// A daemon predating the field reports no parent cycle.
+    #[test]
+    fn status_without_has_parent_cycle_reads_false() {
+        let v: VolumeStatus = serde_json::from_str(
+            r#"{"guid":"g","mounts":[],"phase":{"phase":"Live"},"entries":1,"generation":0,
+                "metadata_pending":false,"has_orphans":true}"#,
+        )
+        .expect("an older status");
+        assert!(v.has_orphans);
+        assert!(!v.has_parent_cycle);
     }
 
     #[test]
