@@ -103,6 +103,26 @@ impl Wildcard {
         (!best.is_empty()).then_some(best)
     }
 
+    /// Each maximal run of literal characters holding no `\`, as WTF-8 bytes
+    /// (already folded iff the query is case-insensitive). A full path the
+    /// pattern matches holds each run inside one of its names or inside the
+    /// mount prefix, since a literal matches only itself.
+    pub(crate) fn separator_free_literals(&self) -> Vec<Vec<u8>> {
+        let mut runs = Vec::new();
+        let mut run = Vec::new();
+        for tok in &self.tokens {
+            match tok {
+                GlobTok::Lit(cp) if *cp != u32::from(b'\\') => encode_wtf8(*cp, &mut run),
+                _ if !run.is_empty() => runs.push(std::mem::take(&mut run)),
+                _ => {}
+            }
+        }
+        if !run.is_empty() {
+            runs.push(run);
+        }
+        runs
+    }
+
     /// The literal characters before the pattern's first `*` or `?`, as WTF-8
     /// bytes: what every match must start with.
     pub fn leading_literal(&self) -> Vec<u8> {
@@ -110,6 +130,23 @@ impl Wildcard {
         for tok in &self.tokens {
             let GlobTok::Lit(cp) = tok else { break };
             encode_wtf8(*cp, &mut lit);
+        }
+        lit
+    }
+
+    /// The literal characters after the pattern's last `*` or `?`, as WTF-8
+    /// bytes: what every match must end with.
+    pub(crate) fn trailing_literal(&self) -> Vec<u8> {
+        let start = self
+            .tokens
+            .iter()
+            .rposition(|t| !matches!(t, GlobTok::Lit(_)))
+            .map_or(0, |i| i + 1);
+        let mut lit = Vec::new();
+        for tok in &self.tokens[start..] {
+            if let GlobTok::Lit(cp) = tok {
+                encode_wtf8(*cp, &mut lit);
+            }
         }
         lit
     }

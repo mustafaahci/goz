@@ -41,7 +41,7 @@ const LOST_FOUND_FRN: Frn = Frn(u64::MAX);
 
 /// Maximum parent hops before [`VolumeIndex::path_of`] declares a cycle. Deep
 /// but bounded; real NTFS trees are far shallower.
-const MAX_PATH_HOPS: usize = 4096;
+pub(crate) const MAX_PATH_HOPS: usize = 4096;
 
 /// The `dir_children` key hash of a folded name. One fixed function for
 /// insert, remove, and lookup: the three must agree or the scope index

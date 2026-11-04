@@ -4,13 +4,16 @@
 //! The scan matches each candidate against the index's precomputed folded name
 //! (case-insensitive queries) and tests the cheapest predicates first: kind,
 //! size and date, then name substrings and wildcards, then ext, then (only for
-//! survivors) scope ancestry and the reconstructed full path. Path reconstruction, the one expensive step, is
-//! deferred until a candidate has passed everything else.
+//! survivors) scope ancestry and the full path. The full path, the one
+//! expensive step, is deferred until a candidate has passed everything else,
+//! and is its folder's path, built once per folder and query (see
+//! `FolderPaths`), plus its own name.
 
 use super::dates::DateFilter;
 use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange};
+use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
-use crate::types::{EntryIdx, Frn, SortDir, SortKey, SortSpec};
+use crate::types::{EntryIdx, Frn, NIL, SortDir, SortKey, SortSpec};
 use memchr::memmem;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -63,6 +66,8 @@ pub struct RefOutcome {
 /// straight off the `ParsedQuery` in the scan loop.
 pub struct CompiledQuery<'a> {
     name_finders: Vec<memmem::Finder<'a>>,
+    /// The path terms the mount prefix does not already hold. One it holds
+    /// is in every full path on the volume, so `C:\ report` tests names only.
     path_finders: Vec<memmem::Finder<'a>>,
     /// The longest literal substring guaranteed present in any match, drawn
     /// from the name terms, from wildcard literals (e.g. `.dll` of `*.dll`), and
@@ -81,6 +86,15 @@ pub struct CompiledQuery<'a> {
     /// `false` when a path term or path wildcard cannot match anywhere under
     /// `prefix` (see [`term_admits`]), so the volume has no hits.
     volume_admits: bool,
+    /// Each path wildcard's leading and trailing literals: what a matching
+    /// full path starts and ends with. Two byte compares turn most candidates
+    /// away before the wildcard decodes the path.
+    path_wildcard_ends: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The longest separator-free piece of path text that every match must
+    /// hold inside one of its names (see [`path_piece`]); drives
+    /// [`walk_below_names`]. `None` for a case-sensitive query, whose pieces
+    /// the folded arena cannot find.
+    path_piece: Option<Vec<u8>>,
 }
 
 impl<'a> CompiledQuery<'a> {
@@ -136,6 +150,10 @@ impl<'a> CompiledQuery<'a> {
                 lit[..n] == prefix[..n]
             });
 
+        let path_piece = (!parsed.match_case)
+            .then(|| path_piece(parsed, &prefix))
+            .flatten();
+
         Self {
             name_finders: parsed
                 .name_terms
@@ -145,6 +163,7 @@ impl<'a> CompiledQuery<'a> {
             path_finders: parsed
                 .path_terms
                 .iter()
+                .filter(|t| memmem::find(&prefix, t).is_none())
                 .map(|t| memmem::Finder::new(t.as_slice()))
                 .collect(),
             prefilter: prefilter.map(Cow::into_owned),
@@ -154,8 +173,54 @@ impl<'a> CompiledQuery<'a> {
                 && parsed.filters.ext.is_none(),
             prefix,
             volume_admits,
+            path_wildcard_ends: parsed
+                .path_wildcards
+                .iter()
+                .map(|w| (w.leading_literal(), w.trailing_literal()))
+                .collect(),
+            path_piece,
         }
     }
+
+    /// Whether a candidate's full path has anything left to decide.
+    fn tests_paths(&self, parsed: &ParsedQuery) -> bool {
+        !self.path_finders.is_empty() || !parsed.path_wildcards.is_empty()
+    }
+}
+
+/// The longest piece of `parsed`'s path terms and path wildcards that holds
+/// no separator and does not occur in `prefix`, the later one on a tie.
+///
+/// A piece lies within one part of the full path between separators, and
+/// when it is not in the prefix, that part is the name of the match or of
+/// one of its folders. Only the entries at or below a name holding the piece
+/// can match, then. The longest piece is usually the rarest, and on a tie the
+/// later one usually names the deeper folder, with the smaller subtree.
+///
+/// `None` when `prefix` does not end with a separator, since then its last
+/// part runs into the first name and a piece could span the two.
+fn path_piece(parsed: &ParsedQuery, prefix: &[u8]) -> Option<Vec<u8>> {
+    if !prefix.is_empty() && !prefix.ends_with(b"\\") {
+        return None;
+    }
+    let mut best: Option<Vec<u8>> = None;
+    let mut consider = |piece: &[u8]| {
+        if !piece.is_empty()
+            && piece.len() >= best.as_ref().map_or(0, Vec::len)
+            && memmem::find(prefix, piece).is_none()
+        {
+            best = Some(piece.to_vec());
+        }
+    };
+    for term in &parsed.path_terms {
+        term.split(|&b| b == b'\\').for_each(&mut consider);
+    }
+    for w in &parsed.path_wildcards {
+        for piece in w.separator_free_literals() {
+            consider(&piece);
+        }
+    }
+    best
 }
 
 /// Whether path term `term` can match a full path that starts with `prefix`
@@ -276,7 +341,10 @@ fn page_refs(
     allow_name_level: bool,
 ) -> (u64, Vec<HitRef>) {
     let compiled = CompiledQuery::new(parsed, mount_prefix);
-    if allow_name_level && sort.key == SortKey::Name && is_name_level(index, parsed, scope) {
+    if allow_name_level
+        && sort.key == SortKey::Name
+        && is_name_level(index, parsed, &compiled, scope)
+    {
         let mut cp_buf = CodePointBuf::new();
         let mut ext_scratch = Vec::new();
         let (matched, total) = match_names(index, parsed, &compiled, &mut cp_buf, &mut ext_scratch);
@@ -302,13 +370,19 @@ fn page_refs(
 
 /// Whether every predicate of `parsed` is decided by the file name alone, so
 /// the query can run over the distinct names instead of the entries: no
-/// scope, no path term, no kind, size or date filter, and no orphan whose
-/// presentability would need a per-entry walk. Extensions, wildcards and case
-/// sensitivity are properties of the name and pass.
-fn is_name_level(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> bool {
+/// scope, no path term the mount prefix leaves open, no kind, size or date
+/// filter, and no orphan whose presentability would need a per-entry walk.
+/// Extensions, wildcards and case sensitivity are properties of the name and
+/// pass.
+fn is_name_level(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    scope: Option<EntryIdx>,
+) -> bool {
     scope.is_none()
-        && parsed.path_terms.is_empty()
-        && parsed.path_wildcards.is_empty()
+        && compiled.volume_admits
+        && !compiled.tests_paths(parsed)
         && parsed.filters.kind.is_none()
         && parsed.filters.size.is_none()
         && parsed.filters.date.is_none()
@@ -547,7 +621,10 @@ fn scan(
             dir_paths: FxHashMap::default(),
         };
     }
-    let has_path_terms = !parsed.path_terms.is_empty() || !parsed.path_wildcards.is_empty();
+    // Built only when a full path has something left to decide.
+    let mut folders = compiled
+        .tests_paths(parsed)
+        .then(|| FolderPaths::new(index, &compiled.prefix, !parsed.match_case));
     let mut scope_memo: FxHashMap<EntryIdx, bool> = FxHashMap::default();
     // Each parent directory's reconstructed path, or None when it has none (its
     // ancestry ends in lost+found, or hit the hop cap). ONE memo, shared by the
@@ -587,7 +664,7 @@ fn scan(
                 None,
                 &mut scope_memo,
                 &mut dir_paths,
-                has_path_terms,
+                &mut folders,
                 false,
                 &mut cp_buf,
                 &mut ext_scratch,
@@ -621,7 +698,7 @@ fn scan(
                     scope,
                     &mut scope_memo,
                     &mut dir_paths,
-                    has_path_terms,
+                    &mut folders,
                     compiled.prefilter_decides_name,
                     &mut cp_buf,
                     &mut ext_scratch,
@@ -630,9 +707,35 @@ fn scan(
                 }
             }
         });
+    } else if let Some(piece) = compiled.path_piece.as_deref()
+        && walk_below_names(index, piece, index.len() / PATH_WALK_SHARE, |idx| {
+            if index.is_synthetic(idx) {
+                return;
+            }
+            if let Some(c) = evaluate(
+                index,
+                parsed,
+                compiled,
+                idx,
+                scope,
+                &mut scope_memo,
+                &mut dir_paths,
+                &mut folders,
+                false,
+                &mut cp_buf,
+                &mut ext_scratch,
+            ) {
+                candidates.push(c);
+            }
+        })
+    {
+        // Every match is at or below a name holding the piece, and the walk
+        // visited each of those entries once.
     } else {
         // Slow path: case-sensitive, or no positive substring term (only
-        // wildcards / filters / path terms). Iterate every live entry.
+        // wildcards / filters / path terms), or a path walk that grew past
+        // its share. Iterate every live entry.
+        candidates.clear();
         for idx in index.live_entries() {
             if index.is_synthetic(idx) {
                 continue;
@@ -645,7 +748,7 @@ fn scan(
                 scope,
                 &mut scope_memo,
                 &mut dir_paths,
-                has_path_terms,
+                &mut folders,
                 false,
                 &mut cp_buf,
                 &mut ext_scratch,
@@ -802,8 +905,8 @@ fn build_hits(index: &VolumeIndex, page: &[HitRef]) -> Vec<QueryHit> {
     hits
 }
 
-/// Verifies all predicates for one candidate, returning it (with a
-/// pre-reconstructed path when path terms forced one) if it matches.
+/// Verifies all predicates for one candidate, returning it if it matches.
+/// `folders` is `Some` exactly when [`CompiledQuery::tests_paths`].
 #[allow(clippy::too_many_arguments)]
 fn evaluate(
     index: &VolumeIndex,
@@ -813,7 +916,7 @@ fn evaluate(
     scope: Option<EntryIdx>,
     scope_memo: &mut FxHashMap<EntryIdx, bool>,
     dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
-    has_path_terms: bool,
+    folders: &mut Option<FolderPaths>,
     name_decided: bool,
     cp_buf: &mut CodePointBuf,
     ext_scratch: &mut Vec<u8>,
@@ -864,35 +967,19 @@ fn evaluate(
     // directory, which on a broad limited query is tens of thousands of walks
     // the page (100 rows) would never have needed. Paying it unconditionally
     // cost a broad limited query ~20%.
-    if index.has_orphans() && parent_path(index, entry.parent(), dir_paths).is_none() {
-        return None;
-    }
-
-    if has_path_terms {
-        let mut buf = Vec::new();
-        if !matches!(index.path_of(idx, &mut buf), crate::index::PathStatus::Ok) {
-            return None;
+    //
+    // A full path test decides presentability as well: an entry with no
+    // path fails it.
+    match folders {
+        Some(folders) => {
+            if !folders.full_path_matches(index, idx, parsed, compiled, cp_buf) {
+                return None;
+            }
         }
-        // The full path a user sees, `C:\` included, so `C:\Windows\` and a
-        // rooted `\Windows\` both match. `path_of` puts a separator before
-        // anything already in its buffer, so the prefix goes in afterwards.
-        let mut full = Vec::with_capacity(compiled.prefix.len() + buf.len());
-        full.extend_from_slice(&compiled.prefix);
-        if parsed.match_case {
-            full.extend_from_slice(&buf);
-        } else {
-            crate::fold::fold_into(&buf, &mut full);
-        }
-        if !compiled
-            .path_finders
-            .iter()
-            .all(|f| f.find(&full).is_some())
-            || !parsed
-                .path_wildcards
-                .iter()
-                .all(|w| w.matches_into(&full, cp_buf))
-        {
-            return None;
+        None => {
+            if index.has_orphans() && parent_path(index, entry.parent(), dir_paths).is_none() {
+                return None;
+            }
         }
     }
 
@@ -960,6 +1047,402 @@ fn parent_path<'a>(
             _ => None, // parent under lost+found or a cycle: not presentable
         }
     })
+}
+
+/// Folder paths longer than this past the prefix are rebuilt from their
+/// nearest cached ancestor when needed instead of cached: caching every
+/// folder of a deep chain of long names would store each ancestor's path
+/// again inside every descendant's, which grows with the square of the depth.
+const CACHED_PATH_MAX: usize = 1024;
+
+/// The most path bytes [`FolderPaths`] holds before it starts over: 16 MB, a
+/// size the arena's doubling reaches exactly. A query that spans more
+/// folders than fit builds some of them again, each at most once per start.
+const FOLDER_PATH_BYTES_MAX: usize = 16 << 20;
+
+/// The most folders [`FolderPaths`] knows before it starts over: what a table
+/// of 2^19 slots of 21 bytes holds, since the table grows past 7/8 full.
+/// With the paths, about 27 MB, under the 32 MB the daemon allows the parent
+/// paths it keeps for one query's pages.
+const FOLDERS_MAX: usize = (1 << 19) / 8 * 7;
+
+/// A folder [`FolderPaths`] has built: where its path past the prefix lies in
+/// the arena, and how many entries its walk to the root visits, itself and
+/// the root included.
+#[derive(Clone, Copy)]
+struct Folder {
+    start: u32,
+    end: u32,
+    depth: u32,
+}
+
+/// Each folder's full path as the query compares it: the mount prefix, then
+/// the names down from the root joined by `\`, folded iff the query ignores
+/// case. A folder's path is built once per query from its parent's, so the
+/// test of a candidate appends one name instead of walking to the root and
+/// folding the result.
+///
+/// The bytes equal `prefix + path_of` folded alike, because folding never
+/// joins characters across a `\`, and an entry has a path exactly when
+/// [`VolumeIndex::path_of`] gives one: its walk ends at the root within
+/// [`MAX_PATH_HOPS`] entries.
+struct FolderPaths {
+    root: EntryIdx,
+    fold: bool,
+    prefix_len: usize,
+    /// [`FOLDER_PATH_BYTES_MAX`] and [`FOLDERS_MAX`], or less in tests.
+    max_bytes: usize,
+    max_folders: usize,
+    /// Each cached folder's path past the prefix, back to back.
+    arena: Vec<u8>,
+    /// `None` for a folder with no path. A folder missing here is not built
+    /// yet, or has a path too long to cache.
+    known: FxHashMap<EntryIdx, Option<Folder>>,
+    /// The folder whose full path `path` holds, and its depth (`None` when it
+    /// has no path). Siblings tested in a row share it without a lookup.
+    current: Option<(EntryIdx, Option<u32>)>,
+    /// The prefix and the current folder's path, and while a candidate is
+    /// tested, its name.
+    path: Vec<u8>,
+    /// What each path term needs of a name in the folder `needs_for`.
+    needs: Vec<Need>,
+    needs_for: Option<EntryIdx>,
+}
+
+/// What a path term needs of a candidate's name for its full path to hold the
+/// term, decided once per folder from the folder's path and the separator
+/// that follows it. A name holds no separator, so a term with one either lies
+/// in the folder's part, or its last separator is the one before the name.
+#[derive(Clone, Copy)]
+enum Need {
+    /// The folder's part holds the term.
+    Nothing,
+    /// The folder's part ends with the term up to its last separator; the
+    /// name must start with the term's bytes from this offset on.
+    Start(usize),
+    /// The term holds no separator, so the name must hold it.
+    Within,
+    /// No name can complete the term.
+    Never,
+    /// The folder's part does not end with a separator (a mount prefix
+    /// without one), so the term is searched in the whole path.
+    Whole,
+}
+
+impl FolderPaths {
+    /// `prefix` is the mount prefix folded iff `fold`, as the query's path
+    /// terms are.
+    fn new(index: &VolumeIndex, prefix: &[u8], fold: bool) -> Self {
+        let mut this = Self {
+            root: index.root(),
+            fold,
+            prefix_len: prefix.len(),
+            max_bytes: FOLDER_PATH_BYTES_MAX,
+            max_folders: FOLDERS_MAX,
+            arena: Vec::new(),
+            known: FxHashMap::default(),
+            current: None,
+            path: prefix.to_vec(),
+            needs: Vec::new(),
+            needs_for: None,
+        };
+        this.restart();
+        this
+    }
+
+    /// Forgets every folder but the root, whose path is the prefix alone.
+    fn restart(&mut self) {
+        self.arena.clear();
+        self.known.clear();
+        let root = Folder {
+            start: 0,
+            end: 0,
+            depth: 1,
+        };
+        self.known.insert(self.root, Some(root));
+    }
+
+    /// Whether `idx`'s full path holds every path term the prefix leaves open
+    /// and matches every path wildcard. `false` when `idx` has no path.
+    fn full_path_matches(
+        &mut self,
+        index: &VolumeIndex,
+        idx: EntryIdx,
+        parsed: &ParsedQuery,
+        compiled: &CompiledQuery,
+        cp_buf: &mut CodePointBuf,
+    ) -> bool {
+        let folder = index.entry(idx).parent();
+        // The entry's own walk is one entry longer than its folder's.
+        if !self
+            .load(index, folder)
+            .is_some_and(|depth| (depth as usize) < MAX_PATH_HOPS)
+        {
+            return false;
+        }
+        if self.needs_for != Some(folder) {
+            self.decide_needs(compiled);
+            self.needs_for = Some(folder);
+        }
+        let name = name_bytes(index, idx, self.fold);
+        // NTFS keeps separators out of names. One that corrupt data put there
+        // could complete a term anywhere, so that name takes the whole path.
+        let mut whole = memchr::memchr(b'\\', name).is_some();
+        if !whole {
+            for (finder, need) in compiled.path_finders.iter().zip(&self.needs) {
+                let held = match *need {
+                    Need::Nothing => true,
+                    Need::Start(from) => name.starts_with(&finder.needle()[from..]),
+                    Need::Within => finder.find(name).is_some(),
+                    Need::Never => false,
+                    Need::Whole => {
+                        whole = true;
+                        true
+                    }
+                };
+                if !held {
+                    return false;
+                }
+            }
+        }
+        if !whole && parsed.path_wildcards.is_empty() {
+            return true;
+        }
+        self.with_full_path(index, idx, |full| {
+            (!whole || compiled.path_finders.iter().all(|f| f.find(full).is_some()))
+                && parsed
+                    .path_wildcards
+                    .iter()
+                    .zip(&compiled.path_wildcard_ends)
+                    .all(|(w, (lead, trail))| {
+                        full.starts_with(lead)
+                            && full.ends_with(trail)
+                            && w.matches_into(full, cp_buf)
+                    })
+        })
+        .unwrap_or(false)
+    }
+
+    /// Decides what each path term needs of a name in the folder whose path
+    /// `path` holds.
+    fn decide_needs(&mut self, compiled: &CompiledQuery) {
+        let folder_end = self.path.len();
+        if folder_end > self.prefix_len {
+            self.path.push(b'\\');
+        }
+        let before_name = self.path.as_slice();
+        let open = before_name.last() == Some(&b'\\');
+        self.needs.clear();
+        for finder in &compiled.path_finders {
+            let term = finder.needle();
+            self.needs.push(if finder.find(before_name).is_some() {
+                Need::Nothing
+            } else if !open {
+                Need::Whole
+            } else {
+                match memchr::memrchr(b'\\', term) {
+                    Some(last) if before_name.ends_with(&term[..=last]) => Need::Start(last + 1),
+                    Some(_) => Need::Never,
+                    None => Need::Within,
+                }
+            });
+        }
+        self.path.truncate(folder_end);
+    }
+
+    /// `f` of `idx`'s full path, or `None` when `idx` has no path.
+    fn with_full_path<R>(
+        &mut self,
+        index: &VolumeIndex,
+        idx: EntryIdx,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        // The entry's own walk is one entry longer than its folder's.
+        let depth = self.load(index, index.entry(idx).parent())?;
+        if depth as usize >= MAX_PATH_HOPS {
+            return None;
+        }
+        let folder_end = self.path.len();
+        if folder_end > self.prefix_len {
+            self.path.push(b'\\');
+        }
+        self.path
+            .extend_from_slice(name_bytes(index, idx, self.fold));
+        let out = f(&self.path);
+        self.path.truncate(folder_end);
+        Some(out)
+    }
+
+    /// Puts `dir`'s full path in `path` and returns its depth, or `None` when
+    /// it has no path.
+    fn load(&mut self, index: &VolumeIndex, dir: EntryIdx) -> Option<u32> {
+        match self.current {
+            Some((cur, depth)) if cur == dir => depth,
+            _ => {
+                let depth = self.build(index, dir);
+                self.current = Some((dir, depth));
+                depth
+            }
+        }
+    }
+
+    fn build(&mut self, index: &VolumeIndex, dir: EntryIdx) -> Option<u32> {
+        self.path.truncate(self.prefix_len);
+        // Only a top has no parent, and `path_of` starts a path at any top
+        // but lost+found.
+        if dir == NIL {
+            return Some(0);
+        }
+        // Climb to the nearest known folder, then build each folder on the
+        // way back down from its parent's path.
+        let mut chain: SmallVec<[EntryIdx; 32]> = SmallVec::new();
+        let mut cur = dir;
+        let base = loop {
+            if let Some(&known) = self.known.get(&cur) {
+                break known;
+            }
+            if chain.len() == MAX_PATH_HOPS {
+                // More than MAX_PATH_HOPS entries from any top, or a cycle.
+                self.remember(dir, None);
+                return None;
+            }
+            chain.push(cur);
+            let parent = index.entry(cur).parent();
+            if parent == NIL {
+                // The root is always known.
+                break (cur != index.lost_found()).then_some(Folder {
+                    start: 0,
+                    end: 0,
+                    depth: 0,
+                });
+            }
+            cur = parent;
+        };
+        let Some(base) = base else {
+            for &folder in &chain {
+                self.remember(folder, None);
+            }
+            return None;
+        };
+        self.path
+            .extend_from_slice(&self.arena[base.start as usize..base.end as usize]);
+        let mut depth = base.depth as usize;
+        for (i, &folder) in chain.iter().rev().enumerate() {
+            depth += 1;
+            if depth > MAX_PATH_HOPS {
+                // This folder and every one below it walk too far.
+                for &deeper in chain.iter().rev().skip(i) {
+                    self.remember(deeper, None);
+                }
+                return None;
+            }
+            if self.path.len() > self.prefix_len {
+                self.path.push(b'\\');
+            }
+            self.path
+                .extend_from_slice(name_bytes(index, folder, self.fold));
+            if self.path.len() - self.prefix_len <= CACHED_PATH_MAX {
+                self.cache(folder, depth as u32);
+            }
+        }
+        Some(depth as u32)
+    }
+
+    /// Caches `folder` with the path `path` now holds.
+    fn cache(&mut self, folder: EntryIdx, depth: u32) {
+        let rel = self.path.len() - self.prefix_len;
+        if self.arena.len() + rel > self.max_bytes || self.known.len() >= self.max_folders {
+            self.restart();
+        }
+        let start = self.arena.len() as u32;
+        self.arena.extend_from_slice(&self.path[self.prefix_len..]);
+        let end = self.arena.len() as u32;
+        self.known
+            .insert(folder, Some(Folder { start, end, depth }));
+    }
+
+    fn remember(&mut self, folder: EntryIdx, known: Option<Folder>) {
+        if self.known.len() >= self.max_folders {
+            self.restart();
+        }
+        self.known.insert(folder, known);
+    }
+}
+
+/// `idx`'s name as a full path of the query holds it: folded iff `fold`.
+fn name_bytes(index: &VolumeIndex, idx: EntryIdx, fold: bool) -> &[u8] {
+    let id = index.name_id(idx);
+    if fold {
+        index.name_folded(id)
+    } else {
+        index.name_raw(id)
+    }
+}
+
+/// A path walk visits at most this share of the volume (a quarter) before
+/// the scan of every entry takes over, which reads the entries in order
+/// rather than chasing their child chains.
+const PATH_WALK_SHARE: usize = 4;
+
+/// Calls `visit` once for each entry at or below an entry whose folded name
+/// holds `piece`: when a match can hold `piece` only in a name of its path,
+/// the only entries that can match. A walk that tops out at lost+found or
+/// runs past [`MAX_PATH_HOPS`] holds no path and is skipped; `visit` still
+/// sees entries too deep for a path, for its caller to reject.
+///
+/// Returns `false`, having visited some entries, once more than `budget`
+/// entries would be visited.
+fn walk_below_names(
+    index: &VolumeIndex,
+    piece: &[u8],
+    budget: usize,
+    mut visit: impl FnMut(EntryIdx),
+) -> bool {
+    let mut bearing = 0usize;
+    let mut tops: Vec<EntryIdx> = Vec::new();
+    for_each_prefilter_hit(index, piece, |id| {
+        bearing += index.name_refcount(id) as usize;
+        if bearing <= budget {
+            tops.extend(index.name_chain(id));
+        }
+    });
+    if bearing > budget {
+        return false;
+    }
+    // Sorted so that a climb can ask whether a folder is a top.
+    tops.sort_unstable();
+    let mut visited = 0usize;
+    for &top in &tops {
+        if !walk_starts_at(index, top, &tops) {
+            continue;
+        }
+        for idx in core::iter::once(top).chain(index.subtree_entries(top)) {
+            visited += 1;
+            if visited > budget {
+                return false;
+            }
+            visit(idx);
+        }
+    }
+    true
+}
+
+/// Whether [`walk_below_names`] walks from `top`: its chain reaches a top
+/// other than lost+found within [`MAX_PATH_HOPS`] entries, and passes no
+/// other of `tops` (sorted), whose walk covers it.
+fn walk_starts_at(index: &VolumeIndex, top: EntryIdx, tops: &[EntryIdx]) -> bool {
+    let mut cur = top;
+    for _ in 0..MAX_PATH_HOPS {
+        let parent = index.entry(cur).parent();
+        if parent == NIL {
+            return cur != index.lost_found();
+        }
+        if tops.binary_search(&parent).is_ok() {
+            return false;
+        }
+        cur = parent;
+    }
+    false
 }
 
 /// Is `node` a descendant of `root`? Memoized parent walk.
@@ -1805,6 +2288,404 @@ mod tests {
                 .collect();
             assert_eq!(paths, ["real.log"], "{key:?}");
             assert_eq!(out.total, 1, "{key:?}");
+        }
+    }
+
+    // -- full paths ------------------------------------------------------------
+
+    /// `prefix + path_of(e)` folded iff `fold`, built the slow way: what a
+    /// full path test must compare.
+    fn slow_full_path(idx: &VolumeIndex, e: EntryIdx, prefix: &str, fold: bool) -> Option<Vec<u8>> {
+        let mut rel = Vec::new();
+        if !matches!(idx.path_of(e, &mut rel), crate::index::PathStatus::Ok) {
+            return None;
+        }
+        let full = [prefix.as_bytes(), &rel].concat();
+        Some(if fold { crate::fold::fold(&full) } else { full })
+    }
+
+    /// [`FolderPaths`] gives every entry `prefix + path_of`, folded alike, and
+    /// a path exactly when `path_of` does: none in a cycle or below
+    /// lost+found. Caps of a few hundred bytes and six folders make it start
+    /// over again and again, and two visiting orders build the folders in
+    /// different orders.
+    #[test]
+    fn folder_paths_agree_with_path_of() {
+        let root = NTFS_ROOT_FRN;
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        let mut recs = Vec::new();
+        for a in 0..4u64 {
+            recs.push(enum_rec(frn(100 + a), root, &format!("Dir{a}Ç"), true));
+            for b in 0..4u64 {
+                let sub = frn(200 + a * 10 + b);
+                // NFD: `e` then a combining acute, which folding composes.
+                recs.push(enum_rec(sub, frn(100 + a), &format!("e\u{301}{b}X"), true));
+                for c in 0..3u64 {
+                    recs.push(enum_rec(
+                        frn(1000 + a * 100 + b * 10 + c),
+                        sub,
+                        &format!("F{c}.TxT"),
+                        false,
+                    ));
+                }
+            }
+        }
+        recs.push(enum_rec(frn(300), root, "loopA", true));
+        recs.push(enum_rec(frn(301), frn(300), "loopB", true));
+        recs.push(enum_rec(frn(302), frn(301), "inside.txt", false));
+        recs.push(enum_rec(frn(400), frn(999), "lost.txt", false));
+        for r in &recs {
+            idx.insert_enum(r);
+        }
+        let (a, b) = (
+            idx.head_of(frn(300)).unwrap(),
+            idx.head_of(frn(301)).unwrap(),
+        );
+        idx.force_parent(a, b);
+
+        let entries: Vec<EntryIdx> = idx
+            .live_entries()
+            .filter(|&e| e != idx.root() && e != idx.lost_found())
+            .collect();
+        let mut checked = 0;
+        for prefix in [r"C:\", r"C:\Mnt\Dá\"] {
+            for fold in [false, true] {
+                let mount = if fold {
+                    crate::fold::fold(prefix.as_bytes())
+                } else {
+                    prefix.as_bytes().to_vec()
+                };
+                for order in [entries.clone(), entries.iter().rev().copied().collect()] {
+                    let mut paths = FolderPaths::new(&idx, &mount, fold);
+                    paths.max_bytes = 200;
+                    paths.max_folders = 6;
+                    for &e in &order {
+                        let got = paths.with_full_path(&idx, e, <[u8]>::to_vec);
+                        let want = slow_full_path(&idx, e, prefix, fold);
+                        checked += usize::from(want.is_some());
+                        assert_eq!(got, want, "{prefix} fold {fold} entry {e}");
+                        assert!(paths.arena.len() <= paths.max_bytes);
+                        assert!(paths.known.len() <= paths.max_folders);
+                    }
+                }
+            }
+        }
+        // 4 folders, 16 below them and 48 files, in 8 passes.
+        assert_eq!(checked, 8 * 68);
+    }
+
+    /// The folder table never doubles past 2^19 slots of 21 bytes, which is
+    /// what [`FOLDERS_MAX`] promises.
+    #[test]
+    fn the_folder_table_stays_at_its_size() {
+        let mut known: FxHashMap<EntryIdx, Option<Folder>> = FxHashMap::default();
+        for i in 0..FOLDERS_MAX as EntryIdx {
+            known.insert(i, None);
+        }
+        assert_eq!(known.capacity(), FOLDERS_MAX);
+        assert_eq!(size_of::<(EntryIdx, Option<Folder>)>() + 1, 21);
+    }
+
+    /// An entry has a path when its walk to the root visits at most
+    /// `MAX_PATH_HOPS` entries, itself and the root included, as `path_of`
+    /// has it; one entry deeper has none, and neither does anything below.
+    #[test]
+    fn folder_paths_stop_at_the_depth_path_of_stops_at() {
+        let root = NTFS_ROOT_FRN;
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        let mut parent = root;
+        let mut recs = Vec::new();
+        for i in 0..MAX_PATH_HOPS as u64 + 2 {
+            let f = frn(10_000 + i);
+            recs.push(enum_rec(f, parent, "d", true));
+            recs.push(enum_rec(frn(20_000 + i), f, "f", false));
+            parent = f;
+        }
+        idx.apply_batch(&recs);
+        let mut paths = FolderPaths::new(&idx, br"C:\", false);
+        let mut with_path = 0;
+        for e in idx
+            .live_entries()
+            .filter(|&e| e != idx.root() && e != idx.lost_found())
+        {
+            let got = paths.with_full_path(&idx, e, <[u8]>::to_vec);
+            let want = slow_full_path(&idx, e, r"C:\", false);
+            with_path += usize::from(want.is_some());
+            assert_eq!(got, want, "entry {e}");
+        }
+        // Folders at depths 2 to MAX_PATH_HOPS, and a file below each of the
+        // folders but the deepest of those.
+        assert_eq!(with_path, 2 * (MAX_PATH_HOPS - 1) - 1);
+    }
+
+    /// The walk visits each entry at or below a name holding the piece once:
+    /// a holder below another holder is walked with it, a holder below
+    /// lost+found is not walked at all, and past its budget the walk gives up.
+    #[test]
+    fn the_path_walk_covers_each_holder_subtree_once() {
+        let root = NTFS_ROOT_FRN;
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        for r in [
+            enum_rec(frn(100), root, "Sys32", true),
+            enum_rec(frn(101), frn(100), "a.dll", false),
+            enum_rec(frn(102), frn(100), "sys32", true),
+            enum_rec(frn(103), frn(102), "b.dll", false),
+            enum_rec(frn(104), root, "other", true),
+            enum_rec(frn(105), frn(104), "c.dll", false),
+            enum_rec(frn(106), frn(104), "my_SYS32.txt", false),
+            enum_rec(frn(107), frn(999), "sys32.log", false),
+        ] {
+            idx.insert_enum(&r);
+        }
+        let e = |f: u64| idx.head_of(frn(f)).unwrap();
+        let mut seen = Vec::new();
+        assert!(walk_below_names(&idx, b"sys32", 100, |x| seen.push(x)));
+        seen.sort_unstable();
+        let mut want = vec![e(100), e(101), e(102), e(103), e(106)];
+        want.sort_unstable();
+        assert_eq!(seen, want);
+        assert!(
+            !walk_below_names(&idx, b"sys32", 4, |_| {}),
+            "five to visit"
+        );
+        assert!(
+            !walk_below_names(&idx, b"sys32", 3, |_| panic!("walked")),
+            "four names hold the piece"
+        );
+    }
+
+    /// The walk is driven by the longest piece of path text between
+    /// separators that the mount prefix does not hold, the later on a tie.
+    #[test]
+    fn the_path_walk_takes_the_longest_piece_the_prefix_lacks() {
+        let piece = |query: &str, prefix: &str| {
+            let parsed = parse_query(query).unwrap();
+            CompiledQuery::new(&parsed, prefix)
+                .path_piece
+                .map(|p| String::from_utf8(p).unwrap())
+        };
+        assert_eq!(
+            piece(r"windows\system32", r"C:\").as_deref(),
+            Some("system32")
+        );
+        assert_eq!(piece(r"C:\Windows\", r"C:\").as_deref(), Some("windows"));
+        assert_eq!(
+            piece(r"abc\xyz", r"C:\").as_deref(),
+            Some("xyz"),
+            "the later on a tie"
+        );
+        assert_eq!(piece(r"*\bin\*.dll", r"C:\").as_deref(), Some(".dll"));
+        assert_eq!(piece("path:sys report", r"C:\").as_deref(), Some("sys"));
+        assert_eq!(
+            piece(r"data\x", r"C:\mnt\data\").as_deref(),
+            Some("x"),
+            "the prefix holds data"
+        );
+        assert_eq!(piece(r"C:\", r"C:\"), None);
+        assert_eq!(
+            piece(r"C:a\b", "C:"),
+            None,
+            "C:a spans the prefix and a name"
+        );
+        assert_eq!(piece(r"Windows\ case:", r"C:\"), None, "case-sensitive");
+        assert_eq!(piece("report", r"C:\"), None);
+    }
+
+    /// A path term the mount prefix holds is in every full path on the
+    /// volume, so `C:\ report` is decided by names alone, as `report` is, and
+    /// runs per distinct name. Another drive's term still empties the volume,
+    /// and under `case:` a lowercase drive is not in `C:\`.
+    #[test]
+    fn a_path_term_the_prefix_holds_leaves_the_query_to_names() {
+        let mut idx = sample_index();
+        idx.optimize_storage();
+        let report = parse_query("report").unwrap();
+        for query in [r"C:\ report", r"\ report", "path:c: report"] {
+            let parsed = parse_query(query).unwrap();
+            let compiled = CompiledQuery::new(&parsed, r"C:\");
+            assert!(is_name_level(&idx, &parsed, &compiled, None), "{query}");
+            assert_eq!(
+                hits_under(&idx, r"C:\", &parsed),
+                hits_under(&idx, r"C:\", &report),
+                "{query}"
+            );
+        }
+        let other_drive = parse_query(r"C:\ report").unwrap();
+        assert!(!is_name_level(
+            &idx,
+            &other_drive,
+            &CompiledQuery::new(&other_drive, r"D:\"),
+            None
+        ));
+        assert!(hits_under(&idx, r"D:\", &other_drive).is_empty());
+        assert!(hits_under(&idx, r"C:\", &parse_query(r"c:\ Report case:").unwrap()).is_empty());
+        assert_eq!(
+            hits_under(&idx, r"C:\", &parse_query(r"C:\ Report case:").unwrap()),
+            [r"docs\sub\Report.PDF"]
+        );
+    }
+
+    /// Builds a tree from `nodes` (a parent among the folders so far, a name,
+    /// whether it is a folder) and puts `orphans` below a folder that never
+    /// arrives. `padded` adds files named by digits at the root, which no
+    /// query below holds, so that a path walk over the tree stays within its
+    /// budget; without them, a walk may give up part way. Returns the index
+    /// and each node's entry.
+    fn random_tree(
+        nodes: &[(prop::sample::Index, String, bool)],
+        orphans: &[String],
+        padded: bool,
+    ) -> (VolumeIndex, Vec<EntryIdx>) {
+        let root = NTFS_ROOT_FRN;
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        let mut dirs = vec![root];
+        let mut frns = Vec::new();
+        for (i, (parent, name, is_dir)) in nodes.iter().enumerate() {
+            let f = frn(1000 + i as u64);
+            idx.insert_enum(&enum_rec(f, *parent.get(&dirs), name, *is_dir));
+            if *is_dir {
+                dirs.push(f);
+            }
+            frns.push(f);
+        }
+        for (i, name) in orphans.iter().enumerate() {
+            idx.insert_enum(&enum_rec(frn(5000 + i as u64), frn(9999), name, false));
+        }
+        let padding = if padded {
+            4 * (nodes.len() + orphans.len() + 8)
+        } else {
+            0
+        };
+        for i in 0..padding as u64 {
+            idx.insert_enum(&enum_rec(frn(10_000 + i), root, &i.to_string(), false));
+        }
+        let entries = frns.iter().map(|&f| idx.head_of(f).unwrap()).collect();
+        (idx, entries)
+    }
+
+    /// `chars` with the case of each letter whose bit in `flip` is set swapped.
+    fn flip_case(chars: &[char], flip: u64) -> String {
+        chars
+            .iter()
+            .enumerate()
+            .map(|(k, &c)| match (flip >> (k % 64)) & 1 {
+                1 if c.is_lowercase() => c.to_uppercase().next().unwrap_or(c),
+                1 => c.to_lowercase().next().unwrap_or(c),
+                _ => c,
+            })
+            .collect()
+    }
+
+    fn is_below(idx: &VolumeIndex, e: EntryIdx, folder: EntryIdx) -> bool {
+        let mut cur = idx.entry(e).parent();
+        while cur != NIL {
+            if cur == folder {
+                return true;
+            }
+            cur = idx.entry(cur).parent();
+        }
+        false
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Path terms and path wildcards over random trees agree with an
+        /// oracle that builds `prefix + path_of` for every entry and searches
+        /// it naively, whichever way the scan runs: driven by a name term,
+        /// walking below the names that hold a piece of the path, scanning
+        /// every entry (case-sensitive, or after a walk that gave up), walking
+        /// a scope, or per distinct name when the prefix holds every path
+        /// term. The terms are cut from a real full path with their case
+        /// scrambled, so they match. A prefix without a trailing separator,
+        /// which the daemon never passes, and names holding one, which NTFS
+        /// never stores, are covered too.
+        #[test]
+        fn path_queries_agree_with_a_full_path_oracle(
+            nodes in prop::collection::vec(
+                (any::<prop::sample::Index>(), "[aAbBçÇ_\u{301}]{1,3}|[ab]\\\\[ab]", any::<bool>()),
+                1..30,
+            ),
+            orphans in prop::collection::vec("[aAbBçÇ]{1,3}", 0..3),
+            pick in any::<prop::sample::Index>(),
+            cuts in prop::collection::vec(any::<prop::sample::Index>(), 6),
+            shape in 0u8..6,
+            flip in any::<u64>(),
+            match_case in any::<bool>(),
+            mount in 0usize..3,
+            scope_pick in proptest::option::of(any::<prop::sample::Index>()),
+            padded in any::<bool>(),
+        ) {
+            let (idx, entries) = random_tree(&nodes, &orphans, padded);
+            let prefix = [r"C:\", r"C:\Mnt\aB\", "C:"][mount];
+            let target = *pick.get(&entries);
+            let full: Vec<char> = String::from_utf8(slow_full_path(&idx, target, prefix, false).unwrap())
+                .unwrap()
+                .chars()
+                .collect();
+            let name: Vec<char> = String::from_utf8(idx.entry(target).name().to_vec())
+                .unwrap()
+                .chars()
+                .collect();
+            let span = |a: usize, b: usize, len: usize| {
+                let (x, y) = (cuts[a].index(len + 1), cuts[b].index(len + 1));
+                (x.min(y), x.max(y))
+            };
+            let path_term = |(i, j): (usize, usize)| {
+                let t = flip_case(&full[i..j], flip);
+                if t.contains('\\') { t } else { format!("path:{t}") }
+            };
+            let wildcard = |(i, j): (usize, usize)| {
+                format!("path:{}*{}", flip_case(&full[..i], flip), flip_case(&full[j..], flip >> 5))
+            };
+            let (m, n) = span(4, 5, name.len());
+            let name_term = flip_case(&name[m..n], flip >> 11);
+            let mut terms = match shape {
+                0 => vec![path_term(span(0, 1, full.len()))],
+                1 => vec![path_term(span(0, 1, full.len())), name_term],
+                2 => vec![path_term(span(0, 1, full.len())), path_term(span(2, 3, full.len()))],
+                3 => vec![wildcard(span(0, 1, full.len()))],
+                4 => vec![wildcard(span(0, 1, full.len())), name_term],
+                _ => vec![path_term(span(0, 1, full.len())), wildcard(span(2, 3, full.len()))],
+            };
+            if match_case {
+                terms.push("case:".into());
+            }
+            let query = terms.join(" ");
+            let parsed = parse_query(&query).unwrap();
+            let folders: Vec<EntryIdx> = entries.iter().copied().filter(|&e| idx.entry(e).is_dir()).collect();
+            let scope = scope_pick.filter(|_| !folders.is_empty()).map(|p| *p.get(&folders));
+
+            let fold = |b: &[u8]| if parsed.match_case { b.to_vec() } else { crate::fold::fold(b) };
+            let holds = |hay: &[u8], t: &[u8]| hay.windows(t.len().max(1)).any(|w| w == t);
+            let mut want: Vec<String> = idx
+                .live_entries()
+                .filter(|&e| !idx.is_synthetic(e))
+                .filter(|&e| {
+                    let Some(full) = slow_full_path(&idx, e, prefix, !parsed.match_case) else {
+                        return false;
+                    };
+                    let name = fold(idx.entry(e).name());
+                    scope.is_none_or(|s| is_below(&idx, e, s))
+                        && parsed.name_terms.iter().all(|t| holds(&name, t))
+                        && parsed.path_terms.iter().all(|t| holds(&full, t))
+                        && parsed.path_wildcards.iter().all(|w| w.matches(&full))
+                })
+                .map(|e| {
+                    let full = slow_full_path(&idx, e, "", false).unwrap();
+                    crate::wtf8::to_string_lossy(&full)
+                })
+                .collect();
+            want.sort();
+            let out = run_query(&idx, prefix, &parsed, scope, SortSpec::default(), 0, None);
+            let mut got: Vec<String> = out
+                .hits
+                .iter()
+                .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                .collect();
+            got.sort();
+            prop_assert_eq!(out.total as usize, got.len());
+            prop_assert_eq!(got, want, "query {:?} under {}", query, prefix);
         }
     }
 }

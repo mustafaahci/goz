@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 345afb85e78fecaa2ddc20332a1df0783c477d2e0eaf04d612aa35eb2c50d500 # shrinks to nodes = [(Index(0), "a", false)], orphans = [], pick = Index(0), cuts = [Index(13835058055282163712), Index(0), Index(0), Index(0), Index(0), Index(0)], shape = 0, flip = 0, match_case = false, mount = 2, scope_pick = None, padded = false
