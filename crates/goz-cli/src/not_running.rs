@@ -61,8 +61,8 @@ fn advice_for(state: Result<ServiceState, String>, gozd_folder: Option<&Path>) -
         }
         // Running without its pipe is the moment between the two at start.
         Ok(ServiceState::Starting | ServiceState::Running) => format!(
-            "goz: the {name} service is starting and serves searches once its index is \
-             built; try again in a few seconds\n"
+            "goz: the {name} service is starting and answers searches within a few \
+             seconds, while it builds its index; try again shortly\n"
         ),
         Ok(ServiceState::Stopping) => format!(
             "goz: the {name} service is stopping. To start it again once it has stopped, \
