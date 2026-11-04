@@ -64,6 +64,10 @@ goz report.pdf
 # scope to a folder, cap results, add columns, sort, export
 goz -path C:\Users\me invoice -n 50 -size -dm -sort-path -export-csv out.csv
 
+# filter by date modified: calendar days run between local midnights
+goz invoice dm:lastmonth
+goz "dm:>=2024-01-01" ext:pdf
+
 # machine-readable output
 goz --json kernel32.dll
 
@@ -74,6 +78,8 @@ goz --status
 `goz` accepts a subset of `es.exe` flags (`-path`, `-n` / `-max-results`, the `-sort` family, `-size`, `-dm`, `-export-csv`, and the CSV-shape switches) and matches `es.exe`'s exit codes. Unsupported switches exit `6`, the same as `es.exe`.
 
 `goz -h` (or `-?`) prints a quick help and `goz --help` the full reference: every switch, the search syntax and the exit codes. `goz --version` prints the client's version and `goz --server-version` the running daemon's. None of them needs the daemon except `--server-version`.
+
+`dm:` (or `datemodified:`) takes `today`, `yesterday`, `thisweek`, `lastweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear`, a year, month or day (`2024`, `2024-05`, `2024-05-01`), or a duration back from now (`7days`, `last2hours`, `3months`), each optionally after `<`, `<=`, `>` or `>=`, or two of them as a range `2024-01-01..2024-03-31`. Days run between midnights in the machine's time zone, a week starts on the first day of the week of the service's regional format, and a file whose date goz has not read yet matches only `dm:unknown`.
 
 ## Performance
 

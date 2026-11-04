@@ -2,11 +2,12 @@
 //! index, apply scope and sort, and return a page of hits.
 //!
 //! The scan matches each candidate against the index's precomputed folded name
-//! (case-insensitive queries) and tests the cheapest predicates first: kind and
-//! size, then name substrings and wildcards, then ext, then (only for
+//! (case-insensitive queries) and tests the cheapest predicates first: kind,
+//! size and date, then name substrings and wildcards, then ext, then (only for
 //! survivors) scope ancestry and the reconstructed full path. Path reconstruction, the one expensive step, is
 //! deferred until a candidate has passed everything else.
 
+use super::dates::DateFilter;
 use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange};
 use crate::index::{NameId, VolumeIndex};
 use crate::types::{EntryIdx, Frn, SortDir, SortKey, SortSpec};
@@ -301,7 +302,7 @@ fn page_refs(
 
 /// Whether every predicate of `parsed` is decided by the file name alone, so
 /// the query can run over the distinct names instead of the entries: no
-/// scope, no path term, no kind or size filter, and no orphan whose
+/// scope, no path term, no kind, size or date filter, and no orphan whose
 /// presentability would need a per-entry walk. Extensions, wildcards and case
 /// sensitivity are properties of the name and pass.
 fn is_name_level(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryIdx>) -> bool {
@@ -310,6 +311,7 @@ fn is_name_level(index: &VolumeIndex, parsed: &ParsedQuery, scope: Option<EntryI
         && parsed.path_wildcards.is_empty()
         && parsed.filters.kind.is_none()
         && parsed.filters.size.is_none()
+        && parsed.filters.date.is_none()
         && !index.has_orphans()
 }
 
@@ -823,6 +825,9 @@ fn evaluate(
     if !size_matches(parsed.filters.size, entry.size()) {
         return None;
     }
+    if !date_matches(parsed.filters.date, entry.mtime()) {
+        return None;
+    }
 
     // `name_decided`: the caller reached this entry through a prefilter hit
     // that already settles the name predicates (`prefilter_decides_name`).
@@ -909,6 +914,12 @@ fn size_matches(filter: Option<SizeRange>, size: Option<u64>) -> bool {
         None => true,
         Some(range) => size.is_some_and(|s| range.contains(s)),
     }
+}
+
+/// A date filter excludes entries whose date is unknown unless it asks for
+/// them (`dm:unknown`), as a size filter excludes unknown sizes.
+fn date_matches(filter: Option<DateFilter>, mtime: Option<i64>) -> bool {
+    filter.is_none_or(|f| f.matches(mtime))
 }
 
 /// Extension matching is always case-insensitive (es semantics): the filter
@@ -1286,6 +1297,63 @@ mod tests {
         let mut tiny = run(&idx, "size:tiny");
         tiny.sort();
         assert_eq!(tiny, vec!["docs\\notes.txt", "docs\\sub\\Report.PDF"]);
+    }
+
+    /// The sample index dated: `docs` and `Report.PDF` today, `notes.txt`
+    /// last month, `photo.JPG` in 1601, and `docs\sub` unknown. The clock
+    /// reads 2026-11-04T10:00Z in UTC.
+    fn dated_index() -> (VolumeIndex, crate::query::dates::tests::FixedClock) {
+        use crate::query::dates::tests::{FixedClock, ft};
+        let mut idx = sample_index();
+        idx.set_stat(frn(100), 0, ft("2026-11-04T08:00:00"));
+        idx.set_stat(frn(102), 4096, ft("2026-11-04T09:00:00"));
+        idx.set_stat(frn(103), 200, ft("2026-10-01T12:00:00"));
+        (idx, FixedClock::utc(ft("2026-11-04T10:00:00")))
+    }
+
+    /// `dm:` keeps the entries dated in its range and no entry whose date is
+    /// unknown, which only `dm:unknown` finds, under every sort. A name sort
+    /// over names alone counts each name's entries without reading them, so a
+    /// date filter must keep the query off that path.
+    #[test]
+    fn date_filter_keeps_dated_entries_under_every_sort() {
+        let (mut idx, clock) = dated_index();
+        idx.optimize_storage(); // builds the name order the name-level path walks
+        let today = ["docs", r"docs\sub\Report.PDF"];
+        for (query, expected) in [
+            ("dm:today", &today[..]),
+            ("dm:thismonth", &today[..]),
+            ("dm:last59mins", &[][..]),
+            ("dm:last1hours", &[r"docs\sub\Report.PDF"][..]),
+            ("dm:lastmonth", &[r"docs\notes.txt"][..]),
+            ("dm:<2000", &["photo.JPG"][..]),
+            ("dm:unknown", &[r"docs\sub"][..]),
+            ("report dm:today", &[r"docs\sub\Report.PDF"][..]),
+            ("notes dm:today", &[][..]),
+            ("folder: dm:today", &["docs"][..]),
+            ("dm:2026-10-01..2026-11-03", &[r"docs\notes.txt"][..]),
+        ] {
+            let parsed = crate::query::parse_query_at(query, false, &clock).unwrap();
+            for key in [SortKey::Name, SortKey::Path, SortKey::DateModified] {
+                let out = run_query(
+                    &idx,
+                    r"C:\",
+                    &parsed,
+                    None,
+                    SortSpec::default_for(key),
+                    0,
+                    None,
+                );
+                let mut paths: Vec<String> = out
+                    .hits
+                    .iter()
+                    .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                    .collect();
+                paths.sort();
+                assert_eq!(paths, expected, "{query} {key:?}");
+                assert_eq!(out.total, expected.len() as u64, "{query} {key:?}");
+            }
+        }
     }
 
     #[test]

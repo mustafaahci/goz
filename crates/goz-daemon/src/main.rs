@@ -16,6 +16,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(windows)]
 mod bootstrap;
 #[cfg(windows)]
+mod local_clock;
+#[cfg(windows)]
 mod pulse;
 #[cfg(windows)]
 mod run;
@@ -214,11 +216,13 @@ fn run_scan(query: Option<String>) -> anyhow::Result<()> {
 /// results: the end-to-end smoke test (bootstrap → search).
 #[cfg(windows)]
 fn run_demo_query(scans: &[bootstrap::BootstrappedVolume], query: &str) -> anyhow::Result<()> {
-    use goz_core::query::{parse_query, run_query};
+    use goz_core::query::{parse_query_at, run_query};
     use goz_core::types::SortSpec;
     use std::time::Instant;
 
-    let parsed = parse_query(query).map_err(|e| anyhow::anyhow!("bad query: {e}"))?;
+    let clock = local_clock::MachineClock::read();
+    let parsed =
+        parse_query_at(query, false, &clock).map_err(|e| anyhow::anyhow!("bad query: {e}"))?;
     println!("\nquery: {query:?}");
     for s in scans {
         // The prefix the daemon gives this volume (`VolumeState::mount_prefix`),

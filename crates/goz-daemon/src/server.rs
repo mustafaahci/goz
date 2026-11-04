@@ -20,7 +20,7 @@ use goz_core::proto::{
     MAX_CLIENT_FRAME, MAX_SERVER_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame,
     patch_results_header, push_item, push_results_header,
 };
-use goz_core::query::{HitRef, parse_query_with_case, resolve_scope, run_query_refs};
+use goz_core::query::{HitRef, parse_query_at, resolve_scope, run_query_refs};
 use goz_core::types::{EntryIdx, SortDir, SortKey, SortSpec};
 use goz_winfs::{PipeSecurity, build_pipe_security};
 use rustc_hash::FxHashMap;
@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{Semaphore, watch};
 
+use crate::local_clock::MachineClock;
 use crate::volume_state::{VolumeSet, VolumeState};
 
 /// Cap on concurrently-served pipe connections. A silent/hostile local client
@@ -351,7 +352,8 @@ fn stream_query_binary(
     q: QueryRequest,
     emit: &mut dyn FnMut(Vec<u8>) -> bool,
 ) {
-    let parsed = match parse_query_with_case(&q.query, q.match_case) {
+    // Read as the query arrives, so its `dm:` dates count from now.
+    let parsed = match parse_query_at(&q.query, q.match_case, &MachineClock::read()) {
         Ok(p) => p,
         Err(e) => {
             let mut out = Vec::new();
@@ -1323,6 +1325,30 @@ mod tests {
             scoped("case:0 system32", r"C:\windows", true),
             [r"C:\Windows\System32"]
         );
+    }
+
+    /// The daemon resolves `dm:` against its own clock and time zone as the
+    /// query arrives: a folder touched now is newer than 2001 and in the last
+    /// hour, one dated mid 2001 is in 2001 wherever the machine is.
+    #[test]
+    fn dm_dates_resolve_against_the_machine_clock() {
+        use goz_core::query::LocalClock;
+        let mut index = windows_index();
+        let now = crate::local_clock::MachineClock::read().now();
+        index.set_stat(Frn(100), 0, now);
+        index.set_stat(
+            Frn(101),
+            0,
+            goz_core::output::unix_ms_to_filetime(993_945_600_000), // 2001-07-01T00:00Z
+        );
+        let vols = set(&[volume(r"C:\", index, VolumePhase::Live)]);
+        assert_eq!(result_paths(&vols, query("dm:>2001")), [r"C:\Windows"]);
+        assert_eq!(result_paths(&vols, query("dm:last1hours")), [r"C:\Windows"]);
+        assert_eq!(
+            result_paths(&vols, query("datemodified:2001")),
+            [r"C:\Windows\System32"]
+        );
+        assert!(result_paths(&vols, query("dm:unknown")).is_empty());
     }
 
     /// An absolute path finds what is on that volume and nothing on another.

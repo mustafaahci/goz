@@ -4,17 +4,19 @@
 //! `*`/`?` wildcards (anchored to the whole name, or to the whole full path
 //! for a path wildcard), path terms (a term
 //! containing `\` or `/`, matched against the full path with its drive), and
-//! the functions `ext:`, `size:`, `path:`, `file:`, `folder:`, `case:`, whose
-//! value may be quoted. The boolean operators `|` and `!` are rejected loudly
-//! rather than silently mis-executed: es's own precedence for them is
+//! the functions `ext:`, `size:`, `dm:`, `path:`, `file:`, `folder:`, `case:`,
+//! whose value may be quoted. The boolean operators `|` and `!` are rejected
+//! loudly rather than silently mis-executed: es's own precedence for them is
 //! undocumented, so guessing it would be a compatibility trap. An unknown
 //! `func:` prefix is refused too: as text it could match nothing, since no name
 //! contains `:`.
 //!
 //! Terms are folded at parse time when the query is case-insensitive, so the
 //! engine compares candidate data (folded iff `!match_case`) against
-//! ready-to-use needles.
+//! ready-to-use needles. A `dm:` value is resolved here too, to FILETIME
+//! bounds, against the [`LocalClock`] the query is parsed with.
 
+use super::dates::{DateFilter, LocalClock, date_filter};
 use crate::fold::fold;
 use smallvec::SmallVec;
 
@@ -196,6 +198,8 @@ pub struct Filters {
     pub ext: Option<Vec<Vec<u8>>>,
     pub size: Option<SizeRange>,
     pub kind: Option<Kind>,
+    /// The date modified, from every `dm:` term at once.
+    pub date: Option<DateFilter>,
 }
 
 /// A fully parsed query.
@@ -241,9 +245,12 @@ pub enum QueryError {
     /// A `func:` goz does not know, carried with its colon. Searching it as text
     /// would match nothing, since no name contains `:`.
     #[error(
-        "unknown search function '{0}'; goz supports ext:, size:, path:, file:, folder:, dir: and case:"
+        "unknown search function '{0}'; goz supports ext:, size:, dm:, path:, file:, folder:, dir: and case:"
     )]
     UnknownFunction(String),
+    /// A `dm:` term in a query parsed without a [`LocalClock`] to resolve it.
+    #[error("dm: needs a clock to resolve dates against, and this query was parsed without one")]
+    NoClock,
 }
 
 /// The most terms one query may hold. The engine tests each candidate against
@@ -255,7 +262,7 @@ const MAX_QUERY_TERMS: usize = 256;
 
 /// How many terms `q` holds, as [`MAX_QUERY_TERMS`] counts them: name and path
 /// terms, wildcards and `ext:` values, since each costs a candidate one test.
-/// `size:` and the kind filters cost the same whatever their value.
+/// `size:`, `dm:` and the kind filters cost the same whatever their value.
 fn term_count(q: &ParsedQuery) -> usize {
     q.name_terms.len()
         + q.path_terms.len()
@@ -283,7 +290,28 @@ pub fn parse_query(input: &str) -> Result<ParsedQuery, QueryError> {
 
 /// Parses a query string into a [`ParsedQuery`] whose case sensitivity is
 /// `match_case` (the `-case` switch) unless a `case:` directive overrides it.
+/// A `dm:` term is refused with [`QueryError::NoClock`]; see
+/// [`parse_query_at`].
 pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuery, QueryError> {
+    parse(input, match_case, None)
+}
+
+/// Like [`parse_query_with_case`], with `dm:` values resolved against
+/// `clock`: the daemon's entry point, called as each query arrives so that
+/// `today` is the day it runs.
+pub fn parse_query_at(
+    input: &str,
+    match_case: bool,
+    clock: &dyn LocalClock,
+) -> Result<ParsedQuery, QueryError> {
+    parse(input, match_case, Some(clock))
+}
+
+fn parse(
+    input: &str,
+    match_case: bool,
+    clock: Option<&dyn LocalClock>,
+) -> Result<ParsedQuery, QueryError> {
     let tokens = tokenize(input)?;
 
     // First pass: detect case-sensitivity so text folding is correct. The
@@ -329,6 +357,11 @@ pub fn parse_query_with_case(input: &str, match_case: bool) -> Result<ParsedQuer
                 }
                 "size" => {
                     q.filters.size = Some(parse_size(value)?);
+                    continue;
+                }
+                "dm" | "datemodified" | "date-modified" => {
+                    let date = date_filter(value, clock.ok_or(QueryError::NoClock)?)?;
+                    q.filters.date = Some(q.filters.date.map_or(date, |d| d.and(date)));
                     continue;
                 }
                 "path" => {
@@ -755,8 +788,8 @@ mod tests {
     #[test]
     fn unknown_functions_are_refused_but_drives_are_paths() {
         assert_eq!(
-            parse_query("dm:today"),
-            Err(QueryError::UnknownFunction("dm:".to_string()))
+            parse_query("dc:today"),
+            Err(QueryError::UnknownFunction("dc:".to_string()))
         );
         assert_eq!(
             parse_query("report Parent:foo"),
@@ -845,6 +878,57 @@ mod tests {
         assert_eq!(q(r#""*.rs""#).name_terms, vec![b"*.rs".to_vec()]);
     }
 
+    /// `dm:` and its es spellings resolve against the clock the query is
+    /// parsed with, next to the text they filter, and two `dm:` terms must
+    /// both pass.
+    #[test]
+    fn dm_terms_resolve_against_the_clock() {
+        use crate::query::dates::tests::{FixedClock, ft};
+        let clock = FixedClock::utc(ft("2026-11-04T10:00:00"));
+        let at = |text| parse_query_at(text, false, &clock).unwrap();
+        let today = Some(DateFilter::Within {
+            min: ft("2026-11-04T00:00:00"),
+            max: ft("2026-11-05T00:00:00") - 1,
+        });
+        let p = at("Report dm:today");
+        assert_eq!(p.name_terms, vec![b"report".to_vec()]);
+        assert_eq!(p.filters.date, today);
+        assert_eq!(
+            term_count(&p),
+            1,
+            "a date costs the same whatever its value"
+        );
+        for alias in [
+            "DM:today",
+            "datemodified:today",
+            "date-modified:today",
+            r#"dm:"today""#,
+        ] {
+            assert_eq!(at(alias).filters.date, today, "{alias}");
+        }
+        assert_eq!(at("dm:thismonth dm:today").filters.date, today);
+        assert_eq!(
+            at("dm:today dm:unknown")
+                .filters
+                .date
+                .map(|d| d.matches(None)),
+            Some(false)
+        );
+        assert!(at("report").filters.date.is_none());
+    }
+
+    /// Without a clock a `dm:` term cannot be resolved, so it is refused
+    /// rather than read as some other day; a bad value is malformed.
+    #[test]
+    fn dm_needs_a_clock_and_a_date() {
+        assert_eq!(parse_query("dm:today"), Err(QueryError::NoClock));
+        let clock = crate::query::dates::tests::FixedClock::utc(0);
+        assert!(matches!(
+            parse_query_at("dm:soon", false, &clock),
+            Err(QueryError::Malformed { what: "dm:", .. })
+        ));
+    }
+
     #[test]
     fn malformed_size_is_reported() {
         assert!(matches!(
@@ -896,7 +980,8 @@ mod tests {
             let fragment = prop_oneof![
                 prop::sample::select(vec![
                     "size:", "ext:", "path:", "file:", "folder:", "case:", "case:0", "..", ">=",
-                    "<", "=", "*", "?", ";", ".", "\"", " ", "\\", "/", "kb", "gb", "tiny",
+                    "<", "=", "*", "?", ";", ".", "\"", " ", "\\", "/", "kb", "gb", "tiny", "dm:",
+                    "today", "lastweek", "thisyear", "days", "months", "last", "-", "unknown",
                 ])
                 .prop_map(str::to_string),
                 "[0-9]{1,24}",
@@ -912,8 +997,11 @@ mod tests {
             fn arbitrary_text_errors_instead_of_panicking(
                 input in arb_query(),
                 match_case in any::<bool>(),
+                now in prop_oneof![Just(i64::MIN), Just(0), Just(i64::MAX), any::<i64>()],
             ) {
                 let _ = parse_query_with_case(&input, match_case);
+                let clock = crate::query::dates::tests::FixedClock::utc(now);
+                let _ = parse_query_at(&input, match_case, &clock);
             }
         }
     }

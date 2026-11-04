@@ -142,6 +142,11 @@ const SEARCH_TEXT: &[(&str, &str)] = &[
         "size:>1mb",
         "Larger than 1 MB; also size:<=4kb, size:1kb..2mb or size:huge",
     ),
+    (
+        "dm:today",
+        "Modified today; also dm:lastweek, dm:2024-05, dm:<30days, \
+         dm:2024-01-01..2024-03-31 or dm:unknown",
+    ),
     ("path:TEXT", "Full paths that contain TEXT"),
     (
         "file:, folder:, dir:",
@@ -267,7 +272,7 @@ fn wrap(out: &mut String, start: &str, text: &str, indent: usize) {
 mod tests {
     use super::*;
     use crate::escompat::{Command, parse_argv};
-    use crate::query::parse_query;
+    use crate::query::{parse_query, parse_query_at};
 
     fn argv(tokens: &[&str]) -> Vec<String> {
         tokens.iter().map(ToString::to_string).collect()
@@ -482,7 +487,10 @@ mod tests {
         for (usage, _) in SEARCH_TEXT {
             for form in usage.split(", ") {
                 let form = form.replace("TEXT", "x");
-                let parsed = parse_query(&form).unwrap_or_else(|e| panic!("{form}: {e}"));
+                // dm: resolves against a clock; a fixed one in 2022 will do.
+                let clock = crate::query::dates::tests::FixedClock::utc(133_000_000_000_000_000);
+                let parsed =
+                    parse_query_at(&form, false, &clock).unwrap_or_else(|e| panic!("{form}: {e}"));
                 assert!(
                     !parsed.name_terms.iter().any(|term| term.contains(&b':')),
                     "{form} is searched as text"

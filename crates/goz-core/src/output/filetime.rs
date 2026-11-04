@@ -17,7 +17,7 @@ pub const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;
 
 /// Whole days from 1601-01-01 to 1970-01-01 (the same offset in days:
 /// `FILETIME_UNIX_EPOCH / 10_000_000 / 86_400`).
-const DAYS_1601_TO_1970: i64 = 134_774;
+pub(crate) const DAYS_1601_TO_1970: i64 = 134_774;
 
 /// Converts a FILETIME tick count to Unix milliseconds.
 ///
@@ -66,7 +66,7 @@ pub fn format_filetime_utc(ft: i64) -> String {
 /// The first two divisions are Euclidean so arbitrarily negative day counts
 /// land in the right 400-year era; every later division operates on
 /// non-negative intermediates exactly as in the reference.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097); // [0, 146096]
@@ -77,6 +77,21 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// Howard Hinnant's `days_from_civil`, the inverse of [`civil_from_days`]:
+/// days since 1970-01-01 of a proleptic-Gregorian date. `month` is `1..=12`
+/// and `day` is `1..=31`; the year may be any value whose day count fits.
+///
+/// Reference: <https://howardhinnant.github.io/date_algorithms.html#days_from_civil>.
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400); // [0, 399]
+    let mp = i64::from((month + 9) % 12); // March is 0
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -150,6 +165,26 @@ mod tests {
             unix_ms_to_filetime(i64::MIN),
             i64::MIN + FILETIME_UNIX_EPOCH
         );
+    }
+
+    #[test]
+    fn days_from_civil_inverts_civil_from_days() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1601, 1, 1), -DAYS_1601_TO_1970);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        for days in [
+            -1_000_000,
+            -DAYS_1601_TO_1970,
+            -1,
+            0,
+            59,
+            60,
+            11_016,
+            2_932_896,
+        ] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "{y}-{m}-{d}");
+        }
     }
 
     proptest! {

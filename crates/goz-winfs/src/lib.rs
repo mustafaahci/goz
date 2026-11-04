@@ -37,6 +37,7 @@ mod pipe_sd;
 mod pipe_trust;
 #[cfg(windows)]
 mod service;
+mod time_zone;
 #[cfg(windows)]
 mod volume;
 #[cfg(windows)]
@@ -52,6 +53,8 @@ pub use error::WinError;
 pub use cancel_io::{ThreadIoHandle, cancel_synchronous_io, current_thread_io_handle};
 #[cfg(windows)]
 pub use clock::awake_time;
+#[cfg(windows)]
+pub use time_zone::{TimeZone, first_day_of_week};
 #[cfg(windows)]
 pub use working_set::{SelfMemory, pin_working_set, self_memory, trim_working_set};
 
