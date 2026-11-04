@@ -383,5 +383,57 @@ mod tests {
             prop_assert_eq!(got, payloads);
             prop_assert_eq!(dec.next_frame(), Ok(None));
         }
+
+        /// Both ends of the pipe decode bytes the other side wrote, and a
+        /// length prefix is the lever a hostile peer pulls. Frames on both
+        /// sides of the cap, split at random points, must come back exactly
+        /// and in order up to the first one over the cap, and none after it:
+        /// once refused, the decoder stays refused.
+        #[test]
+        fn frames_over_the_cap_are_refused_however_they_arrive(
+            lens in proptest::collection::vec(0usize..128, 0..8),
+            max_frame in 0u32..64,
+            cuts in proptest::collection::vec(any::<proptest::sample::Index>(), 0..8),
+        ) {
+            let mut wire = Vec::new();
+            for (i, &len) in lens.iter().enumerate() {
+                wire.extend_from_slice(&(len as u32).to_le_bytes());
+                wire.extend(std::iter::repeat_n(i as u8, len));
+            }
+            let expected: Vec<Vec<u8>> = lens
+                .iter()
+                .enumerate()
+                .take_while(|&(_, &len)| len <= max_frame as usize)
+                .map(|(i, &len)| vec![i as u8; len])
+                .collect();
+            let mut at: Vec<usize> = cuts.iter().map(|c| c.index(wire.len() + 1)).collect();
+            at.extend([0, wire.len()]);
+            at.sort_unstable();
+
+            let mut dec = FrameDecoder::new(max_frame);
+            let mut got = Vec::new();
+            let mut refused = false;
+            for span in at.windows(2) {
+                dec.feed(&wire[span[0]..span[1]]);
+                loop {
+                    match dec.next_frame() {
+                        Ok(Some(frame)) => {
+                            prop_assert!(!refused, "a frame after a refusal");
+                            got.push(frame);
+                        }
+                        Ok(None) => {
+                            prop_assert!(!refused, "no error after a refusal");
+                            break;
+                        }
+                        Err(_) => {
+                            refused = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            prop_assert_eq!(got, expected);
+            prop_assert_eq!(refused, lens.iter().any(|&len| len > max_frame as usize));
+        }
     }
 }

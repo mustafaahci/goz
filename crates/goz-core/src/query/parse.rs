@@ -885,4 +885,36 @@ mod tests {
             Err(QueryError::TooManyTerms(MAX_QUERY_TERMS + 1))
         );
     }
+
+    mod arbitrary {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Query text built from the parser's own syntax and arbitrary
+        /// characters, so that functions, ranges and wildcards are reached.
+        fn arb_query() -> impl Strategy<Value = String> {
+            let fragment = prop_oneof![
+                prop::sample::select(vec![
+                    "size:", "ext:", "path:", "file:", "folder:", "case:", "case:0", "..", ">=",
+                    "<", "=", "*", "?", ";", ".", "\"", " ", "\\", "/", "kb", "gb", "tiny",
+                ])
+                .prop_map(str::to_string),
+                "[0-9]{1,24}",
+                "\\PC{0,4}",
+            ];
+            prop::collection::vec(fragment, 0..12).prop_map(|parts| parts.concat())
+        }
+
+        proptest! {
+            /// The query text arrives from the pipe, so any text can arrive,
+            /// and a panic would fail the query instead of reporting it.
+            #[test]
+            fn arbitrary_text_errors_instead_of_panicking(
+                input in arb_query(),
+                match_case in any::<bool>(),
+            ) {
+                let _ = parse_query_with_case(&input, match_case);
+            }
+        }
+    }
 }
