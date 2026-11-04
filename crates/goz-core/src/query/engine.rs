@@ -1016,9 +1016,10 @@ fn parent_path<'a>(
 /// again inside every descendant's, which grows with the square of the depth.
 const CACHED_PATH_MAX: usize = 1024;
 
-/// The most path bytes [`FolderPaths`] holds before it starts over: 16 MB, a
-/// size the arena's doubling reaches exactly. A query that spans more
-/// folders than fit builds some of them again, each at most once per start.
+/// The most path bytes [`FolderPaths`] holds before it starts over: 16 MB,
+/// which also bounds the arena's allocation, since its doubling stops there.
+/// A query that spans more folders than fit builds some of them again, each
+/// at most once per start.
 const FOLDER_PATH_BYTES_MAX: usize = 16 << 20;
 
 /// The most folders [`FolderPaths`] knows before it starts over: what a table
@@ -1314,6 +1315,13 @@ impl FolderPaths {
         let rel = self.path.len() - self.prefix_len;
         if self.arena.len() + rel > self.max_bytes || self.known.len() >= self.max_folders {
             self.restart();
+        }
+        let needed = self.arena.len() + rel;
+        if needed > self.arena.capacity() {
+            // Double as a Vec would, but never past the cap: left to itself,
+            // doubling from an odd first path ends anywhere up to twice it.
+            let target = (self.arena.capacity() * 2).min(self.max_bytes).max(needed);
+            self.arena.reserve_exact(target - self.arena.len());
         }
         let start = self.arena.len() as u32;
         self.arena.extend_from_slice(&self.path[self.prefix_len..]);
@@ -2325,7 +2333,7 @@ mod tests {
                         let want = slow_full_path(&idx, e, prefix, fold);
                         checked += usize::from(want.is_some());
                         assert_eq!(got, want, "{prefix} fold {fold} entry {e}");
-                        assert!(paths.arena.len() <= paths.max_bytes);
+                        assert!(paths.arena.capacity() <= paths.max_bytes);
                         assert!(paths.known.len() <= paths.max_folders);
                     }
                 }
@@ -2333,6 +2341,29 @@ mod tests {
         }
         // 4 folders, 16 below them and 48 files, in 8 passes.
         assert_eq!(checked, 8 * 68);
+    }
+
+    /// The arena's allocation, not only its length, stays within its cap:
+    /// doubling from a first path of 36 bytes passes 1000 at 1152.
+    #[test]
+    fn the_folder_arena_allocates_no_more_than_its_cap() {
+        let root = NTFS_ROOT_FRN;
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        for i in 0..60u64 {
+            idx.insert_enum(&enum_rec(frn(100 + i), root, &format!("{i:036}"), true));
+            idx.insert_enum(&enum_rec(frn(1000 + i), frn(100 + i), "f.txt", false));
+        }
+        let mut paths = FolderPaths::new(&idx, br"c:\", true);
+        paths.max_bytes = 1000;
+        for i in 0..60 {
+            let file = idx.head_of(frn(1000 + i)).unwrap();
+            assert!(paths.with_full_path(&idx, file, <[u8]>::to_vec).is_some());
+            assert!(
+                paths.arena.capacity() <= paths.max_bytes,
+                "capacity {}",
+                paths.arena.capacity()
+            );
+        }
     }
 
     /// The folder table never doubles past 2^19 slots of 21 bytes, which is
