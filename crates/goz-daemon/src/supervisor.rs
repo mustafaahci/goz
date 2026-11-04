@@ -1382,9 +1382,16 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(indexed(&volumes), [C]);
-        assert_eq!(
-            *volumes.current()[0].phase.read(),
-            VolumePhase::Bootstrapping
+        // Bootstrapping, unless the start worker, failing to open a volume
+        // no disk has, has already said why.
+        let phase = volumes.current()[0].phase.read().clone();
+        assert!(
+            match &phase {
+                VolumePhase::Bootstrapping => true,
+                VolumePhase::Failed { reason } => reason.starts_with("opening the volume"),
+                _ => false,
+            },
+            "{phase:?}"
         );
         assert_eq!(fleet.supervised.len(), 1);
         assert!(fleet.supervised[0].pending.is_some());
