@@ -38,6 +38,9 @@ mod volume;
 #[cfg(windows)]
 mod working_set;
 
+#[cfg(all(windows, test))]
+mod test_support;
+
 #[cfg(windows)]
 pub use error::WinError;
 

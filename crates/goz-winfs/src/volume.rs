@@ -192,6 +192,15 @@ impl Drop for VolumeHandle {
 // DeviceIoControl on one handle is not supported.
 unsafe impl Send for VolumeHandle {}
 
+#[cfg(test)]
+impl VolumeHandle {
+    /// Takes over `file` as an `OpenFileById` volume hint.
+    pub(crate) fn from_file(file: std::fs::File) -> Self {
+        use std::os::windows::io::IntoRawHandle;
+        VolumeHandle(file.into_raw_handle() as HANDLE)
+    }
+}
+
 /// Opens a volume for FSCTL use from its GUID path (as returned by
 /// [`enumerate_volumes`]). The trailing backslash is stripped first: opening
 /// `\\?\Volume{GUID}\` yields the root directory, not the volume device.

@@ -21,9 +21,10 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_HANDLE_EOF, ERROR_MORE_DATA, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FindClose, FindFirstFileNameW,
-    FindNextFileNameW, GetFinalPathNameByHandleW, OpenFileById, VOLUME_NAME_GUID,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FindClose, FindFirstFileNameW, FindNextFileNameW, GetFinalPathNameByHandleW,
+    OpenFileById, VOLUME_NAME_GUID,
 };
 
 use crate::error::WinError;
@@ -63,7 +64,8 @@ pub fn link_paths(volume: &VolumeHandle, frn: u64) -> Result<Option<Vec<Vec<u16>
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
-            FILE_FLAG_BACKUP_SEMANTICS,
+            // A link opens as itself, so the anchor below is its own name.
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         )
     };
     if file == INVALID_HANDLE_VALUE {
@@ -171,4 +173,56 @@ fn walk_links(anchor: &[u16]) -> Result<Option<Vec<Vec<u16>>>, WinError> {
 fn take_name(buf: &[u16]) -> Vec<u16> {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     buf[..end].to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_paths;
+    use crate::test_support::{Scratch, frn_of, junction, own_info, volume_hint};
+
+    /// A junction walks its own name, not its target's. Opened by ID without
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` it fails and the reconcile is skipped.
+    #[test]
+    fn a_junction_walks_its_own_name() {
+        let scratch = Scratch::new("links");
+        let target = scratch.0.join("target");
+        std::fs::create_dir(&target).expect("create target");
+        let link = scratch.0.join("link");
+        junction(&link, &target);
+
+        let names = link_paths(&volume_hint(&scratch.0), frn_of(&own_info(&link)))
+            .expect("walk")
+            .expect("a junction opens by ID as itself");
+        let names: Vec<String> = names.iter().map(|n| String::from_utf16_lossy(n)).collect();
+        let folder = scratch
+            .0
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("folder name");
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].ends_with(&format!(r"\{folder}\link")), "{names:?}");
+    }
+
+    /// The control: a plain file with two hard links walks both.
+    #[test]
+    fn a_hard_linked_file_walks_every_name() {
+        let scratch = Scratch::new("links-plain");
+        let first = scratch.0.join("a.txt");
+        std::fs::write(&first, b"x").expect("write");
+        std::fs::hard_link(&first, scratch.0.join("b.txt")).expect("hard link");
+
+        let mut names: Vec<String> =
+            link_paths(&volume_hint(&scratch.0), frn_of(&own_info(&first)))
+                .expect("walk")
+                .expect("a plain file opens by ID")
+                .iter()
+                .map(|n| String::from_utf16_lossy(n))
+                .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names[0].ends_with(r"\a.txt") && names[1].ends_with(r"\b.txt"),
+            "{names:?}"
+        );
+    }
 }
