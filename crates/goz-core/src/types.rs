@@ -37,6 +37,11 @@ impl fmt::Debug for Frn {
     }
 }
 
+/// The most bytes an NTFS name component takes in UTF-16: 255 code units.
+/// The journal and layout parsers reject a longer name as corrupt, which also
+/// keeps every stored name far below the name store's 64 KiB limit.
+pub(crate) const MAX_NAME_UTF16_BYTES: usize = 510;
+
 /// Dense index into the `EntryTable` columns.
 pub type EntryIdx = u32;
 

@@ -23,7 +23,7 @@
 use zerocopy::byteorder::little_endian::{I64, U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use crate::types::Frn;
+use crate::types::{Frn, MAX_NAME_UTF16_BYTES};
 use crate::wtf8;
 
 /// `USN_REASON_DATA_OVERWRITE`: data in the file was overwritten.
@@ -115,8 +115,9 @@ pub enum WalkError {
     #[error("USN record at offset {offset} is too short for its version's fixed header")]
     TruncatedHeader { offset: usize },
     /// The name span (`FileNameOffset .. FileNameOffset + FileNameLength`)
-    /// falls outside the record, or `FileNameLength` is odd (names are
-    /// UTF-16 code units, so byte lengths are always even).
+    /// falls outside the record, `FileNameLength` is odd (names are UTF-16
+    /// code units, so byte lengths are always even), or it is longer than any
+    /// NTFS name (255 code units).
     #[error("USN record at offset {offset} has a malformed file-name span")]
     MalformedName { offset: usize },
 }
@@ -353,7 +354,7 @@ fn extract_name(
     min_name_off: usize,
     offset: usize,
 ) -> Result<(Vec<u8>, bool), WalkError> {
-    if !name_len.is_multiple_of(2) {
+    if !name_len.is_multiple_of(2) || name_len > MAX_NAME_UTF16_BYTES {
         return Err(WalkError::MalformedName { offset });
     }
     // The name must start at or after the version's fixed header. A
@@ -668,6 +669,28 @@ mod tests {
         );
     }
 
+    /// The layout parser refused names past the NTFS limit, but the journal
+    /// parser took any even length up to 65534 bytes. In WTF-8 such a name
+    /// can pass 64 KiB, and the name store keeps a name's length in a `u16`.
+    #[test]
+    fn name_longer_than_ntfs_allows_is_an_error() {
+        for version in [2, 3] {
+            let longest = RecordFixture::file(1, 2, "")
+                .with_name_units(vec![0x0800; 255])
+                .with_version(version);
+            let walk = walk_journal_buffer(&build_journal_buffer(0, &[longest])).unwrap();
+            assert_eq!(walk.records[0].name.len(), 765);
+
+            let too_long = RecordFixture::file(1, 2, "")
+                .with_name_units(vec![0x0078; 256])
+                .with_version(version);
+            assert_eq!(
+                walk_journal_buffer(&build_journal_buffer(0, &[too_long])).unwrap_err(),
+                WalkError::MalformedName { offset: 8 }
+            );
+        }
+    }
+
     #[test]
     fn leading_values_are_extracted_with_correct_signedness() {
         let e = walk_enum_buffer(&build_enum_buffer(u64::MAX, &[])).unwrap();
@@ -801,6 +824,38 @@ mod tests {
                 let walk = walk_journal_buffer(&buf).expect("fixture buffers must walk");
                 prop_assert_eq!(walk.next_usn, lead);
                 prop_assert_eq!(walk.records.len(), recs.len());
+            }
+
+            /// Journal and enum buffers come from the disk, so any bytes can
+            /// arrive. A corrupt buffer must give an error, not a panic that
+            /// stops the volume's tail. Random patches rarely make a name
+            /// past the NTFS limit, so the length check here is only a
+            /// backstop; `name_longer_than_ntfs_allows_is_an_error` pins it.
+            #[test]
+            fn corrupted_buffers_error_instead_of_panicking(
+                recs in proptest::collection::vec(arb_fixture(), 1..4),
+                v3 in any::<bool>(),
+                patches in proptest::collection::vec(
+                    (any::<proptest::sample::Index>(), any::<u8>()),
+                    0..8,
+                ),
+                cut in any::<proptest::sample::Index>(),
+            ) {
+                let version = if v3 { 3 } else { 2 };
+                let recs: Vec<_> = recs.into_iter().map(|f| f.with_version(version)).collect();
+                let mut buf = build_enum_buffer(0, &recs);
+                let len = buf.len();
+                for (at, byte) in &patches {
+                    buf[at.index(len)] = *byte;
+                }
+                buf.truncate(cut.index(len + 1));
+                let records = [
+                    walk_enum_buffer(&buf).map(|w| w.records),
+                    walk_journal_buffer(&buf).map(|w| w.records),
+                ];
+                for r in records.iter().flatten().flatten() {
+                    prop_assert!(r.name.len() <= 765, "{}-byte name", r.name.len());
+                }
             }
         }
     }

@@ -25,7 +25,7 @@
 //! All multi-byte fields are little-endian and read through unaligned
 //! [`zerocopy`] views; the parser contains no `unsafe` code.
 
-use crate::types::Frn;
+use crate::types::{Frn, MAX_NAME_UTF16_BYTES};
 use crate::wtf8;
 use zerocopy::little_endian::{I64, U32, U64};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
@@ -230,6 +230,19 @@ pub enum LayoutWalkError {
         /// The maximum plausible byte length (510).
         max: u32,
     },
+    /// The file entries list more names than the buffer has room for, so
+    /// several of them share one name chain. Each real name entry takes at
+    /// least its own 24 bytes; shared chains instead grow the name count with
+    /// the square of the buffer size, until an allocation aborts the daemon.
+    #[error("file entries list {count} names, but a {len}-byte buffer holds at most {max}")]
+    TooManyNames {
+        /// Names parsed so far.
+        count: usize,
+        /// The most name entries the buffer can hold.
+        max: usize,
+        /// Total buffer length.
+        len: usize,
+    },
 }
 
 // ------------------------------------------------------------------------
@@ -342,6 +355,8 @@ pub fn walk_layout_buffer(buf: &[u8]) -> Result<Vec<LayoutFile>, LayoutWalkError
         return Ok(Vec::new());
     }
     let mut files = Vec::with_capacity(count.min(4096) as usize);
+    let max_names = buf.len() / size_of::<RawNameEntry>();
+    let mut names = 0usize;
     let mut entry_off = follow_offset(
         buf,
         0,
@@ -351,7 +366,18 @@ pub fn walk_layout_buffer(buf: &[u8]) -> Result<Vec<LayoutFile>, LayoutWalkError
     )?;
     loop {
         let entry: RawFileEntry = read_struct(buf, entry_off, "FILE_LAYOUT_ENTRY")?;
-        files.push(parse_file(buf, entry_off, &entry)?);
+        // Checked per file: one chain cannot exceed `max_names` on its own,
+        // because each hop advances at least one name entry.
+        let file = parse_file(buf, entry_off, &entry)?;
+        names += file.names.len();
+        if names > max_names {
+            return Err(LayoutWalkError::TooManyNames {
+                count: names,
+                max: max_names,
+                len: buf.len(),
+            });
+        }
+        files.push(file);
         let next = entry.next_file_offset.get();
         if next == 0 {
             break;
@@ -389,18 +415,16 @@ fn parse_file(
         loop {
             let raw: RawNameEntry = read_struct(buf, name_off, "FILE_LAYOUT_NAME_ENTRY")?;
             let name_len = raw.file_name_length.get();
-            // NTFS single-component name limit: 255 UTF-16 code units = 510
-            // bytes. `FileNameLength` is a u32; without this cap a corrupt
-            // buffer of over-long, 24-byte-spaced overlapping name entries
-            // amplifies retained memory quadratically (OOM-aborting the daemon
-            // instead of cleanly scheduling a rescan). Cap before allocating.
-            const MAX_NAME_BYTES: u32 = 510;
-            if name_len > MAX_NAME_BYTES {
+            // `FileNameLength` is a u32; without this cap a corrupt buffer of
+            // over-long, 24-byte-spaced overlapping name entries amplifies
+            // retained memory quadratically (OOM-aborting the daemon instead
+            // of cleanly scheduling a rescan). Cap before allocating.
+            if name_len as usize > MAX_NAME_UTF16_BYTES {
                 return Err(LayoutWalkError::NameTooLong {
                     what: "FILE_LAYOUT_NAME_ENTRY.FileName",
                     offset: name_off,
                     len: name_len,
-                    max: MAX_NAME_BYTES,
+                    max: MAX_NAME_UTF16_BYTES as u32,
                 });
             }
             if !name_len.is_multiple_of(2) {
@@ -983,6 +1007,38 @@ mod tests {
         );
     }
 
+    /// Every file entry may point its `FirstNameOffset` at one shared chain,
+    /// so a corrupt buffer of N entries and M names yielded N x M names:
+    /// about 286M from 1 MiB, and the allocation aborted the daemon.
+    #[test]
+    fn file_entries_sharing_one_name_chain_error() {
+        let bare = |frn| LayoutFileFixture {
+            frn,
+            attributes: 0x20,
+            names: vec![],
+            info: None,
+            streams: vec![],
+        };
+        let named = LayoutFileFixture {
+            names: vec![LayoutNameFixture::primary(5, "a"); 4],
+            ..bare(4)
+        };
+        // Entries at 16, 56, 96 and 136; the last one's four 26-byte names
+        // start at 176, so the buffer is 280 bytes and holds at most 11 names.
+        let mut buf = build_layout_buffer(&[bare(1), bare(2), bare(3), named]);
+        for entry in [16, 56, 96] {
+            patch_u32(&mut buf, entry + 24, (176 - entry) as u32);
+        }
+        assert_eq!(
+            walk_layout_buffer(&buf),
+            Err(LayoutWalkError::TooManyNames {
+                count: 12,
+                max: 11,
+                len: 280,
+            })
+        );
+    }
+
     #[test]
     fn legacy_zero_extra_info_length_still_yields_mtime() {
         // Pre-RS5: ExtraInfoLength was a Reserved field, always 0, with all
@@ -1067,6 +1123,29 @@ mod tests {
             let expected: Vec<LayoutFile> =
                 files.iter().map(LayoutFileFixture::expected).collect();
             prop_assert_eq!(parsed, expected);
+        }
+
+        /// Layout buffers come from the disk, so any bytes can arrive. A
+        /// corrupt buffer must give an error, not a panic that ends the
+        /// metadata pass. Random patches rarely make file entries share one
+        /// name chain, so the name count check here is only a backstop;
+        /// `file_entries_sharing_one_name_chain_error` pins it.
+        #[test]
+        fn corrupted_buffers_error_instead_of_panicking(
+            files in prop::collection::vec(arb_file(), 1..4),
+            patches in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..8),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let mut buf = build_layout_buffer(&files);
+            let len = buf.len();
+            for (at, byte) in &patches {
+                buf[at.index(len)] = *byte;
+            }
+            buf.truncate(cut.index(len + 1));
+            if let Ok(parsed) = walk_layout_buffer(&buf) {
+                let names: usize = parsed.iter().map(|f| f.names.len()).sum();
+                prop_assert!(names <= buf.len() / 24, "{names} names in {} bytes", buf.len());
+            }
         }
     }
 }

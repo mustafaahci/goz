@@ -225,6 +225,49 @@ fn parent_slot_reuse_never_leaks_the_stale_chain() {
     );
 }
 
+/// After `optimize_storage` the FRN map is a `Vec` indexed by record number,
+/// and `set` grew it to any record number a journal record named. A corrupt
+/// record near 2^48 asked for a petabyte and the failed allocation aborted the
+/// daemon; a record or a parent far past the MFT still made the map huge.
+#[test]
+fn far_record_number_does_not_grow_the_dense_map() {
+    let files: Vec<_> = (0..200)
+        .map(|i| create(frn(100 + i), root_frn(), &format!("{i}.txt"), false))
+        .collect();
+    let mut idx = index_from_enum(&files);
+    idx.optimize_storage();
+    assert_eq!(idx.memory().frn_map_kind, "dense");
+
+    // A new record a little past the end is how a real MFT grows.
+    idx.apply_batch(&[create(frn(1_000), root_frn(), "near.txt", false)]);
+    assert_eq!(idx.memory().frn_map_kind, "dense");
+
+    // 2^24 records would be a 64 MiB map: small enough that the unfixed code
+    // fails this assertion instead of aborting.
+    let far = frn(1 << 24);
+    idx.apply_batch(&[create(far, root_frn(), "far.txt", false)]);
+    assert!(
+        idx.memory().frn_map.allocated < 1 << 20,
+        "{:?}",
+        idx.memory().frn_map
+    );
+    assert_eq!(idx.memory().frn_map_kind, "sparse");
+
+    // Every entry is still found, the far ones included, and a far parent
+    // gets its placeholder like any other.
+    let top = frn((1 << 48) - 1);
+    idx.apply_batch(&[
+        create(top, root_frn(), "top.txt", false),
+        create(frn(1_001), frn(1 << 40), "child.txt", false),
+    ]);
+    assert_eq!(path_of_frn(&idx, far).as_deref(), Some("far.txt"));
+    assert_eq!(path_of_frn(&idx, top).as_deref(), Some("top.txt"));
+    assert_eq!(path_of_frn(&idx, frn(1_000)).as_deref(), Some("near.txt"));
+    assert_eq!(path_of_frn(&idx, frn(100)).as_deref(), Some("0.txt"));
+    assert!(idx.head_of(frn(1 << 40)).is_some());
+    assert!(idx.dir_index_matches_rebuild());
+}
+
 #[test]
 fn double_apply_equals_single_apply() {
     let mut once = index_from_enum(&[create(frn(100), root_frn(), "dir", true)]);

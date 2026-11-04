@@ -986,6 +986,10 @@ impl EntryTable {
     }
 }
 
+/// How many records past twice its length a dense [`FrnMap`] still grows to
+/// before [`FrnMap::set`] switches it to the sparse backing.
+const DENSE_GROWTH_SLACK: u64 = 1 << 16;
+
 /// Maps a 48-bit MFT record number to its chain-head [`EntryIdx`].
 ///
 /// Keyed by record number (not the full FRN) so slot reuse is detectable:
@@ -1009,8 +1013,8 @@ impl FrnMap {
     }
 
     /// A dense map pre-sized for record numbers in `0..capacity`. `capacity` is
-    /// only a sizing hint: `set` grows the `Vec` for a larger record number and
-    /// `get` bounds-checks.
+    /// only a sizing hint: `set` grows the `Vec` for a larger record number, or
+    /// goes sparse for a far one, and `get` bounds-checks.
     pub fn dense(capacity: usize) -> Self {
         FrnMap::Dense(vec![NIL; capacity])
     }
@@ -1023,8 +1027,18 @@ impl FrnMap {
         }
     }
 
+    /// Maps `record` to `idx`. A dense map switches to the sparse backing for
+    /// a record number far past its end: a real MFT grows a little at a time,
+    /// but a corrupt journal record can carry any 48-bit number, and growing
+    /// the `Vec` to it would abort the daemon on a failed allocation.
     #[inline]
     pub fn set(&mut self, record: u64, idx: EntryIdx) {
+        if let FrnMap::Dense(v) = self
+            && record > v.len() as u64 * 2 + DENSE_GROWTH_SLACK
+        {
+            let records = v.iter().enumerate().filter(|&(_, &i)| i != NIL);
+            *self = FrnMap::Sparse(records.map(|(r, &i)| (r as u64, i)).collect());
+        }
         match self {
             FrnMap::Dense(v) => {
                 let r = record as usize;
@@ -1065,7 +1079,8 @@ impl FrnMap {
     ///
     /// Called once per volume when it goes live: bootstrap has seen every
     /// record by then, so `max key` is the true bound, and `set` still grows
-    /// the Vec if the journal later mints a higher record number.
+    /// the Vec if the journal later mints a higher record number (or goes
+    /// back to sparse if that number is far past the end).
     pub fn densify_if_smaller(&mut self) {
         let FrnMap::Sparse(m) = self else { return };
         let Some(&max) = m.keys().max() else { return };
