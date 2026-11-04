@@ -247,8 +247,8 @@ struct Candidate {
     idx: EntryIdx,
     /// The key the page's sort asks for, filled by [`order`]: the name's rank
     /// key for a name sort, the parent folder's rank and the name's rank
-    /// packed together for a path sort (see [`path_keys`]), the size for a
-    /// size sort, the order-preserving image of the mtime for a date sort.
+    /// packed together for a path sort (see [`path_keys`]), [`size_key`] for
+    /// a size sort, [`mtime_key`] for a date sort.
     /// Candidates used to carry kind, size, date, an
     /// optional path and a `fold(parent) + NUL + fold(name)` key string each,
     /// ~300 MB under the index lock for a 100-row page of a broad path sort.
@@ -835,22 +835,47 @@ fn order(index: &VolumeIndex, candidates: &mut [Candidate], sort: SortSpec, end:
         SortKey::Path => path_keys(index, candidates),
         SortKey::Size => {
             for c in candidates.iter_mut() {
-                c.key = index.entry(c.idx).size().unwrap_or(0);
+                c.key = size_key(index.entry(c.idx).size(), sort.dir);
             }
         }
         SortKey::DateModified => {
             for c in candidates.iter_mut() {
-                c.key = mtime_key(index.entry(c.idx).mtime());
+                c.key = mtime_key(index.entry(c.idx).mtime(), sort.dir);
             }
         }
     }
     order_top(index, candidates, sort, end);
 }
 
-/// Maps an mtime to a `u64` that orders like the `i64`, unknown lowest (as
-/// `unwrap_or(i64::MIN)` ordered it), so a date sort compares one integer.
-fn mtime_key(mtime: Option<i64>) -> u64 {
-    (mtime.unwrap_or(i64::MIN) as u64) ^ (1 << 63)
+/// The key a size sort in direction `dir` orders an entry of `size` by. An
+/// entry with no size, a folder or a file not read yet, comes after every
+/// entry with one, whichever way the sort runs. The engine and the daemon's
+/// merge of several volumes key by this one function.
+pub fn size_key(size: Option<u64>, dir: SortDir) -> u64 {
+    // The index stores an unknown size as `u64::MAX`, so a known one is below.
+    unknown_last(size, dir)
+}
+
+/// The key a date sort in direction `dir` orders an entry of `mtime` by:
+/// the mtime as a `u64` in the same order, an unknown one last, as in
+/// [`size_key`].
+pub fn mtime_key(mtime: Option<i64>, dir: SortDir) -> u64 {
+    // Flipping the sign bit orders an `i64` as a `u64`. The index stores an
+    // unknown date as `i64::MIN`, so a known one maps to 1 or more, and one
+    // less keeps it below `u64::MAX`.
+    unknown_last(mtime.map(|t| ((t as u64) ^ (1 << 63)) - 1), dir)
+}
+
+/// `known`, below `u64::MAX`, as a key that orders like it, or for no value
+/// the key that sorts last in `dir`: the largest ascending, and the smallest
+/// descending, since [`cmp_candidate`] reverses a descending comparison.
+fn unknown_last(known: Option<u64>, dir: SortDir) -> u64 {
+    match (known, dir) {
+        (Some(k), SortDir::Asc) => k,
+        (Some(k), SortDir::Desc) => k + 1,
+        (None, SortDir::Asc) => u64::MAX,
+        (None, SortDir::Desc) => 0,
+    }
 }
 
 /// Keys a path sort with the parent folder's rank in the high half and the
@@ -1866,6 +1891,104 @@ mod tests {
                 assert_eq!(paths, expected, "{query} {key:?}");
                 assert_eq!(out.total, expected.len() as u64, "{query} {key:?}");
             }
+        }
+    }
+
+    /// The dated sample plus an empty file and a file never read, whose size
+    /// and date are both unknown.
+    fn unknowns_index() -> VolumeIndex {
+        use crate::query::dates::tests::ft;
+        let (mut idx, _) = dated_index();
+        idx.insert_enum(&enum_rec(frn(105), NTFS_ROOT_FRN, "empty.txt", false));
+        idx.set_stat(frn(105), 0, ft("2026-11-03T00:00:00"));
+        idx.insert_enum(&enum_rec(frn(106), NTFS_ROOT_FRN, "unread.bin", false));
+        idx
+    }
+
+    /// A size or date sort lists the entries that have the value first, an
+    /// empty file and a file dated 1601 among them, then those without it, a
+    /// folder's size and a file not read yet, in either direction; a limited
+    /// page is the start of that list.
+    #[test]
+    fn unknown_sizes_and_dates_sort_last_in_either_direction() {
+        let idx = unknowns_index();
+        let parsed = parse_query("").unwrap();
+        let sizes = (
+            &[
+                "empty.txt",
+                r"docs\notes.txt",
+                r"docs\sub\Report.PDF",
+                "photo.JPG",
+            ][..],
+            &["docs", r"docs\sub", "unread.bin"][..],
+        );
+        let dates = (
+            &[
+                "photo.JPG",
+                r"docs\notes.txt",
+                "empty.txt",
+                "docs",
+                r"docs\sub\Report.PDF",
+            ][..],
+            &[r"docs\sub", "unread.bin"][..],
+        );
+        for (key, (known, unknown)) in [(SortKey::Size, sizes), (SortKey::DateModified, dates)] {
+            for dir in [SortDir::Asc, SortDir::Desc] {
+                let mut want = known.to_vec();
+                let mut last = unknown.to_vec();
+                if dir == SortDir::Desc {
+                    want.reverse();
+                    last.reverse();
+                }
+                want.extend(last);
+                let sort = SortSpec { key, dir };
+                for k in 0..=want.len() {
+                    let out = run_query(&idx, r"C:\", &parsed, None, sort, 0, Some(k as u32));
+                    let got: Vec<String> = out
+                        .hits
+                        .iter()
+                        .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                        .collect();
+                    assert_eq!(got, want[..k], "{key:?} {dir:?} -n {k}");
+                }
+            }
+        }
+    }
+
+    /// The keys keep the known values in the sort's order and the unknown
+    /// one after all of them, at the ends of each range too: an empty file,
+    /// the largest size the index can hold, the first and last dates.
+    #[test]
+    fn size_and_date_keys_put_the_unknown_after_every_known_value() {
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            // Where a key lands in the listing: a descending sort reverses
+            // the comparison.
+            let place = |key: u64| match dir {
+                SortDir::Asc => i128::from(key),
+                SortDir::Desc => -i128::from(key),
+            };
+            let sizes = [0, 1, u64::MAX - 1].map(|s| place(size_key(Some(s), dir)));
+            let dates = [i64::MIN + 1, -1, 0, 1, i64::MAX].map(|t| place(mtime_key(Some(t), dir)));
+            for places in [&sizes[..], &dates[..]] {
+                let ascending = places.windows(2).all(|w| w[0] < w[1]);
+                let descending = places.windows(2).all(|w| w[0] > w[1]);
+                assert!(
+                    if dir == SortDir::Asc {
+                        ascending
+                    } else {
+                        descending
+                    },
+                    "{dir:?}"
+                );
+            }
+            assert!(
+                sizes.iter().all(|&p| p < place(size_key(None, dir))),
+                "{dir:?}"
+            );
+            assert!(
+                dates.iter().all(|&p| p < place(mtime_key(None, dir))),
+                "{dir:?}"
+            );
         }
     }
 

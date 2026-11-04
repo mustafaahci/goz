@@ -20,7 +20,7 @@ use goz_core::proto::{
     MAX_CLIENT_FRAME, MAX_SERVER_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame,
     patch_results_header, push_item, push_results_header,
 };
-use goz_core::query::{HitRef, parse_query_at, resolve_scope, run_query_refs};
+use goz_core::query::{HitRef, mtime_key, parse_query_at, resolve_scope, run_query_refs, size_key};
 use goz_core::types::{EntryIdx, SortDir, SortKey, SortSpec};
 use goz_winfs::{PipeSecurity, build_pipe_security};
 use rustc_hash::FxHashMap;
@@ -889,17 +889,11 @@ fn cmp_heads(
     let by_name = || ia.folded_name(ha.idx).cmp(ib.folded_name(hb.idx));
     let base = match sort.key {
         SortKey::Name => by_name(),
-        SortKey::Size => ia
-            .entry(ha.idx)
-            .size()
-            .unwrap_or(0)
-            .cmp(&ib.entry(hb.idx).size().unwrap_or(0))
+        SortKey::Size => size_key(ia.entry(ha.idx).size(), sort.dir)
+            .cmp(&size_key(ib.entry(hb.idx).size(), sort.dir))
             .then_with(by_name),
-        SortKey::DateModified => ia
-            .entry(ha.idx)
-            .mtime()
-            .unwrap_or(i64::MIN)
-            .cmp(&ib.entry(hb.idx).mtime().unwrap_or(i64::MIN))
+        SortKey::DateModified => mtime_key(ia.entry(ha.idx).mtime(), sort.dir)
+            .cmp(&mtime_key(ib.entry(hb.idx).mtime(), sort.dir))
             .then_with(by_name),
         SortKey::Path => {
             runs[a].ensure_head_key(ia, vols[a].mount_prefix());
@@ -1769,6 +1763,62 @@ mod tests {
                         "{key:?}/{dir:?}: -n {limit} covers the set and must equal no limit"
                     );
                 }
+            }
+        }
+    }
+
+    /// Files at the volume root, each with its size and date, both `value`,
+    /// or neither when `value` is `None`, as a file not read yet.
+    fn dated_files(files: &[(u64, &str, Option<u64>)]) -> VolumeIndex {
+        let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        for &(frn, name, value) in files {
+            let mut rec = dir_record(frn, NTFS_ROOT_FRN.0, name);
+            rec.attributes = 0;
+            index.insert_enum(&rec);
+            if let Some(v) = value {
+                index.set_stat(Frn(frn), v, v as i64);
+            }
+        }
+        index
+    }
+
+    /// The merge keys a size or date sort as the engine does: a value not
+    /// read yet goes after every volume's known ones, in either direction,
+    /// instead of meeting the other volume's rows as a 0. One volume's values
+    /// lie between the other's, so the merge compares every head.
+    #[test]
+    fn size_and_date_sorts_merge_volumes_with_unknowns_last() {
+        use goz_core::types::SortDir;
+        let vols = set(&[
+            volume(
+                r"C:\",
+                dated_files(&[(200, "c10.log", Some(10)), (201, "cnone.log", None)]),
+                VolumePhase::Live,
+            ),
+            volume(
+                r"D:\",
+                dated_files(&[(200, "d5.log", Some(5)), (201, "d20.log", Some(20))]),
+                VolumePhase::Live,
+            ),
+        ]);
+        for key in [SortKey::Size, SortKey::DateModified] {
+            for (dir, want) in [
+                (
+                    SortDir::Asc,
+                    [r"D:\d5.log", r"C:\c10.log", r"D:\d20.log", r"C:\cnone.log"],
+                ),
+                (
+                    SortDir::Desc,
+                    [r"D:\d20.log", r"C:\c10.log", r"D:\d5.log", r"C:\cnone.log"],
+                ),
+            ] {
+                let mut q = query("log");
+                q.sort = SortSpec { key, dir };
+                assert_eq!(
+                    paths(&encode_query_binary(&vols, q)),
+                    want,
+                    "{key:?} {dir:?}"
+                );
             }
         }
     }

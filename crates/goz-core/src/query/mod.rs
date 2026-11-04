@@ -18,8 +18,8 @@ pub use crate::fold;
 
 pub use dates::{DateFilter, LocalClock};
 pub use engine::{
-    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, resolve_scope, run_query,
-    run_query_refs,
+    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, mtime_key, resolve_scope, run_query,
+    run_query_refs, size_key,
 };
 pub use parse::{
     Filters, Kind, ParsedQuery, QueryError, SizeRange, Wildcard, parse_query, parse_query_at,
