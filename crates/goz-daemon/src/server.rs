@@ -639,10 +639,10 @@ fn targets(volumes: &VolumeSet, scope: &Option<String>) -> Vec<(Arc<VolumeState>
     match scope {
         None => volumes.iter().map(|v| (v.clone(), VolScope::All)).collect(),
         Some(path) => {
-            let Some(vol) = volumes
+            let Some((vol, at)) = volumes
                 .iter()
-                .filter(|v| starts_with_ci(path, v.mount_prefix()))
-                .max_by_key(|v| v.mount_prefix().len())
+                .filter_map(|v| scope_under(path, v.mount_prefix()).map(|at| (v, at)))
+                .max_by_key(|&(_, at)| at)
             else {
                 return Vec::new();
             };
@@ -653,13 +653,33 @@ fn targets(volumes: &VolumeSet, scope: &Option<String>) -> Vec<(Arc<VolumeState>
             // path: the scope cache would fail validation and re-walk the tree
             // on every keystroke, with correct results and no other symptom.
             // Trimming also lets both spellings share one cache entry.
-            let raw = &path.as_bytes()[vol.mount_prefix().len()..];
+            let raw = &path.as_bytes()[at..];
+            let start = raw
+                .iter()
+                .position(|&b| b != b'\\' && b != b'/')
+                .unwrap_or(raw.len());
             let end = raw
                 .iter()
                 .rposition(|&b| b != b'\\' && b != b'/')
-                .map_or(0, |i| i + 1);
-            vec![(vol.clone(), VolScope::Rel(raw[..end].to_vec()))]
+                .map_or(start, |i| i + 1);
+            vec![(vol.clone(), VolScope::Rel(raw[start..end].to_vec()))]
         }
+    }
+}
+
+/// Where the part of `path` below the volume mounted at `prefix` starts, or
+/// `None` when `path` is not on that volume. The prefix carries its closing
+/// separator (`C:\mnt\usb\`), which a path that names the mount folder itself
+/// lacks (`C:\mnt\usb`), so the comparison drops it and asks for a folder
+/// boundary instead: `C:\mnt\usbstick` is not below `C:\mnt\usb\`.
+fn scope_under(path: &str, prefix: &str) -> Option<usize> {
+    let folder = prefix.trim_end_matches(['\\', '/']);
+    if !starts_with_ci(path, folder) {
+        return None;
+    }
+    match path.as_bytes().get(folder.len()) {
+        None | Some(b'\\' | b'/') => Some(folder.len()),
+        Some(_) => None,
     }
 }
 
@@ -1130,6 +1150,24 @@ mod tests {
             result_paths(&vols, scoped("System32", r"C:\mnt\usb\Windows")),
             [r"C:\mnt\usb\Windows\System32"]
         );
+
+        // The mount folder itself, as `std::path::absolute` spells it, with no
+        // closing separator: the whole mounted volume, not the outer one's
+        // empty mount point. A longer name beside it is still the outer volume.
+        for scope in [r"C:\mnt\usb", r"C:\mnt\usb\", r"c:\MNT\USB"] {
+            let picked = targets(&vols, &Some(scope.to_string()));
+            assert!(Arc::ptr_eq(&picked[0].0, &mounted), "{scope}");
+            assert!(
+                matches!(&picked[0].1, VolScope::Rel(rel) if rel.is_empty()),
+                "{scope}"
+            );
+        }
+        assert_eq!(
+            result_paths(&vols, scoped("System32", r"C:\mnt\usb")),
+            [r"C:\mnt\usb\Windows\System32"]
+        );
+        let beside = targets(&vols, &Some(r"C:\mnt\usbstick".to_string()));
+        assert_eq!(beside[0].0.mount_prefix(), r"C:\");
     }
 
     /// A volume is served from the moment it is found, before its first build:
