@@ -832,7 +832,17 @@ impl Supervised {
                 let _ = io_tx.send(goz_winfs::current_thread_io_handle());
                 let outcome = goz_winfs::open_volume(&state.guid)
                     .map_err(|e| std::io::Error::other(format!("opening the volume: {e}")))
-                    .and_then(|handle| tail::spawn(state, handle));
+                    .and_then(|handle| tail::spawn(state.clone(), handle));
+                // A volume with no index says why now, not when the next scan
+                // collects this outcome, up to 30 s later, as a volume that
+                // failed at startup always did.
+                if let Err(e) = &outcome
+                    && !state.indexed.load(Ordering::Acquire)
+                {
+                    *state.phase.write() = VolumePhase::Failed {
+                        reason: e.to_string(),
+                    };
+                }
                 if let Err(returned) = result_tx.send(outcome) {
                     // The supervisor stopped listening (teardown abandoned
                     // this worker). A tail built anyway must not run
@@ -1083,6 +1093,12 @@ mod tests {
                 VolumePhase::Failed { reason } if reason.starts_with("opening the volume"))
         };
         let s = &mut fleet.supervised[0];
+        // The worker reports the failure itself, before any scan polls it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !opening_failed() {
+            assert!(Instant::now() < deadline, "got {:?}", *state.phase.read());
+            std::thread::sleep(Duration::from_millis(5));
+        }
         settle_start(s);
         assert!(opening_failed(), "got {:?}", *state.phase.read());
         assert_eq!(s.revive_attempts, 0, "the first start is free");
