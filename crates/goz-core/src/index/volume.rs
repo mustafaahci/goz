@@ -1419,6 +1419,19 @@ impl VolumeIndex {
         }
     }
 
+    /// The live entries directly in `dir`, in no particular order. Cost is the
+    /// folder's size, not the volume's.
+    pub(crate) fn children(&self, dir: EntryIdx) -> impl Iterator<Item = EntryIdx> + '_ {
+        let mut cur = self.entries.first_child(dir);
+        std::iter::from_fn(move || {
+            (cur != NIL).then(|| {
+                let child = cur;
+                cur = self.entries.next_child(child);
+                child
+            })
+        })
+    }
+
     /// Depth-first walk of every live entry strictly under `root` (the scope
     /// directory itself is not yielded, matching `in_scope` semantics). Cost
     /// is proportional to the SUBTREE, not the volume: this is what makes a
