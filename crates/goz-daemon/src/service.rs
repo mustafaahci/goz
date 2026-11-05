@@ -33,8 +33,7 @@ use crate::{run, server};
 use goz_core::proto::SERVICE_NAME;
 
 const DISPLAY_NAME: &str = "goz file index";
-const DESCRIPTION: &str =
-    "Indexes NTFS volumes (MFT + USN journal) for instant file search in arsivle.";
+const DESCRIPTION: &str = "Indexes NTFS volumes (MFT + USN journal) for instant file search.";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 /// How often a start or a stop under way reports a fresh checkpoint.
