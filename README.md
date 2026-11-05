@@ -79,6 +79,8 @@ goz --status
 
 `--json` prints one object: `total` (every match), `items`, `more` (true when `-n` left matches out), `volumes_incomplete`, `metadata_pending` and `generation`.
 
+With `-size` and `-dm` the listing shows `es.exe`'s console columns: the size right-aligned, with your regional digit grouping, then the date as local `YYYY-MM-DDTHH:MM:SS`, then the path.
+
 `goz -h` (or `-?`) prints a quick help and `goz --help` the full reference: every switch, the search syntax and the exit codes. `goz --version` prints the client's version and `goz --server-version` the running daemon's. None of them needs the daemon except `--server-version`.
 
 `dm:` (or `datemodified:`) takes `today`, `yesterday`, `thisweek`, `lastweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear`, a year, month or day (`2024`, `2024-05`, `2024-05-01`), or a duration back from now (`7days`, `last2hours`, `3months`), each optionally after `<`, `<=`, `>` or `>=`, or two of them as a range `2024-01-01..2024-03-31`. Days run between midnights in the machine's time zone, a week starts on the first day of the week of the service's regional format, and a file whose date goz has not read yet matches only `dm:unknown`.

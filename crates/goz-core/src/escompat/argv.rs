@@ -75,9 +75,10 @@ pub struct EsPlan {
     /// `-n` / `-max-results` value: return only the top N results after
     /// sorting. `None` means unlimited.
     pub limit: Option<u32>,
-    /// Optional CSV columns from `-size` / `-dm` / `-date-modified`, in flag
-    /// order with es dedupe semantics (a repeated flag moves its column to
-    /// the end). `Filename` is always emitted last and is not listed here.
+    /// Optional columns of the plain listing and the CSV, from `-size` /
+    /// `-dm` / `-date-modified`, in flag order with es dedupe semantics (a
+    /// repeated flag moves its column to the end). `Filename` is always
+    /// emitted last and is not listed here.
     pub columns: Vec<EsColumn>,
     /// Result order. Defaults to name-ascending (es with no `-sort` flag);
     /// unsuffixed sort switches use es's per-key default direction.
@@ -346,7 +347,7 @@ pub(super) const SWITCHES: &[Switch] = &[
         spelling: names(&["size"], &[], SwitchAction::Column(EsColumn::Size)),
         group: Group::Output,
         quick: false,
-        help: "Add a Size column to the CSV",
+        help: "Add a Size column",
     },
     Switch {
         spelling: names(
@@ -356,7 +357,7 @@ pub(super) const SWITCHES: &[Switch] = &[
         ),
         group: Group::Output,
         quick: false,
-        help: "Add a Date Modified column to the CSV",
+        help: "Add a Date Modified column",
     },
     Switch {
         spelling: names(&["utf8-bom"], &[], SwitchAction::Utf8Bom),

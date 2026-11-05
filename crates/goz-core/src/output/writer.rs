@@ -8,14 +8,16 @@
 use super::Row;
 use super::csv::{CsvOptions, write_csv_preamble, write_csv_row};
 use super::json::Json;
+use super::plain::{PlainOptions, write_plain_row};
 use crate::proto::QueryResults;
 use crate::types::EsColumn;
 
 /// What the output is.
 #[derive(Clone, Debug)]
 pub enum Format {
-    /// One path per line, each ending in LF.
-    Plain,
+    /// One line per result, ending in LF: the path, after es's console
+    /// cells when `-size` or `-dm` asks for them.
+    Plain(PlainOptions),
     /// es's `-export-csv` bytes.
     Csv(CsvOptions),
     /// One object for the whole result set, in the bytes
@@ -37,7 +39,7 @@ pub struct ResultWriter<D> {
 
 #[derive(Debug)]
 enum State {
-    Plain,
+    Plain(PlainOptions),
     Csv {
         opts: CsvOptions,
         /// Whether the byte order mark and header are written.
@@ -50,7 +52,7 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
     /// A writer of `format` that formats dates with `date`.
     pub fn new(format: Format, date: D) -> Self {
         let state = match format {
-            Format::Plain => State::Plain,
+            Format::Plain(opts) => State::Plain(opts),
             Format::Csv(opts) => State::Csv {
                 opts,
                 started: false,
@@ -65,32 +67,17 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
     /// the head of the JSON object.
     pub fn page(&mut self, page: &QueryResults, out: &mut Vec<u8>) {
         match &mut self.state {
-            State::Plain => {
-                for item in &page.items {
-                    out.extend_from_slice(item.path.as_bytes());
-                    out.push(b'\n');
-                }
-            }
+            State::Plain(opts) => each_row(page, &opts.columns, &mut self.date, |row| {
+                write_plain_row(opts, row, out);
+            }),
             State::Csv { opts, started } => {
                 if !*started {
                     write_csv_preamble(opts, out);
                     *started = true;
                 }
-                let wants_date = opts.columns.contains(&EsColumn::DateModified);
-                for item in &page.items {
-                    let date = if wants_date {
-                        item.mtime_ft.map(&mut self.date)
-                    } else {
-                        None
-                    };
-                    let row = Row {
-                        path: &item.path,
-                        size: item.size,
-                        mtime: date.as_deref(),
-                        is_dir: item.is_dir,
-                    };
-                    write_csv_row(opts, &row, out);
-                }
+                each_row(page, &opts.columns, &mut self.date, |row| {
+                    write_csv_row(opts, row, out);
+                });
             }
             State::Json(json) => json.page(page, out),
         }
@@ -100,7 +87,7 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
     /// the CSV preamble when no page came.
     pub fn finish(self, out: &mut Vec<u8>) {
         match self.state {
-            State::Plain => {}
+            State::Plain(_) => {}
             State::Csv { opts, started } => {
                 if !started {
                     write_csv_preamble(&opts, out);
@@ -108,6 +95,30 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
             }
             State::Json(mut json) => json.tail(out),
         }
+    }
+}
+
+/// Hands each item of `page` to `write` as a [`Row`], its date formatted
+/// by `date` only when `columns` shows one.
+fn each_row(
+    page: &QueryResults,
+    columns: &[EsColumn],
+    date: &mut impl FnMut(i64) -> String,
+    mut write: impl FnMut(&Row<'_>),
+) {
+    let wants_date = columns.contains(&EsColumn::DateModified);
+    for item in &page.items {
+        let mtime = if wants_date {
+            item.mtime_ft.map(&mut *date)
+        } else {
+            None
+        };
+        write(&Row {
+            path: &item.path,
+            size: item.size,
+            mtime: mtime.as_deref(),
+            is_dir: item.is_dir,
+        });
     }
 }
 
@@ -304,7 +315,11 @@ mod tests {
             ..CsvOptions::default()
         });
         for (format, after_first, after_second) in [
-            (Format::Plain, &b"C:\\a\n"[..], &b"C:\\b\n"[..]),
+            (
+                Format::Plain(PlainOptions::default()),
+                &b"C:\\a\n"[..],
+                &b"C:\\b\n"[..],
+            ),
             (
                 csv,
                 b"\xEF\xBB\xBFSize,Date Modified,Filename\r\n1,d7,\"C:\\a\"\r\n",

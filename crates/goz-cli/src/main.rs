@@ -3,7 +3,8 @@
 //! Parses arguments with the es.exe-compatible rules from
 //! `goz-core::escompat`, talks to the running daemon over `\\.\pipe\goz-v1`,
 //! and writes results as an es-compatible CSV (`-export-csv`), JSON (`--json`),
-//! or a plain path list (default), or only their number
+//! or a plain listing of paths after es's console columns (default), or only
+//! their number
 //! (`-get-result-count`) or the summed size of their files
 //! (`-get-total-size`). The help and version switches print to stdout
 //! without contacting the daemon.
@@ -100,7 +101,9 @@ use win::execute;
 mod win {
     use super::client::{Client, ClientError};
     use goz_core::escompat::{EsPlan, Exit, VERSION_LINE};
-    use goz_core::output::{CsvOptions, Format, ResultWriter, filetime_to_unix_ms};
+    use goz_core::output::{
+        CsvOptions, DigitGrouping, Format, PlainOptions, ResultWriter, filetime_to_unix_ms,
+    };
     use goz_core::proto::{PROTO_VERSION, QueryRequest, QueryResults, Request, Response};
     use goz_core::types::{EsColumn, SortSpec};
     use std::io::Write;
@@ -227,7 +230,7 @@ mod win {
     }
 
     /// Writes the results to the export file as CSV, or to stdout as JSON or
-    /// one path per line, a page at a time as the pages arrive, so the
+    /// a line per result, a page at a time as the pages arrive, so the
     /// client's memory stays at one page and the first rows show at once. A
     /// failure partway leaves what was written, and the exit code says the
     /// output is incomplete.
@@ -245,12 +248,26 @@ mod win {
                 columns: plan.columns.clone(),
             }),
             None if plan.json => Format::Json { limit: plan.limit },
-            None => Format::Plain,
+            None => Format::Plain(PlainOptions {
+                columns: plan.columns.clone(),
+                grouping: if plan.columns.contains(&EsColumn::Size) {
+                    // es groups the sizes it prints as the user's
+                    // regional format says.
+                    let locale = goz_winfs::number_format();
+                    DigitGrouping::from_locale(
+                        locale.thousand_separator.as_deref(),
+                        locale.grouping.as_deref(),
+                    )
+                } else {
+                    DigitGrouping::es_default()
+                },
+            }),
         };
-        // Local time, ISO 8601, so the JavaScript consumer's `new Date()`
-        // parses it regardless of locale. The time zone is resolved once,
-        // and only when a date is shown.
-        let want_date = export_file.is_some() && plan.columns.contains(&EsColumn::DateModified);
+        // Local time, ISO 8601 (es's `-date-format 1`), so the JavaScript
+        // consumer's `new Date()` parses it regardless of locale. The time
+        // zone is resolved once, and only when a date is shown.
+        let want_date = !matches!(format, Format::Json { .. })
+            && plan.columns.contains(&EsColumn::DateModified);
         let tz = want_date.then(jiff::tz::TimeZone::system);
         let date = |ft| {
             tz.as_ref()
