@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// One matched entry. The daemon prepends the volume mount prefix to `path`
 /// and formats `mtime` for display.
@@ -248,12 +248,13 @@ fn term_admits(term: &[u8], prefix: &[u8]) -> bool {
 /// match set costs tens of MB rather than hundreds. Everything else (name,
 /// parent, kind, size, date) is read from the index when a comparison or the
 /// page needs it.
+#[derive(Clone, Copy)]
 struct Candidate {
     idx: EntryIdx,
-    /// The key the page's sort asks for, filled by [`order`]: the name's rank
-    /// key for a name sort, the parent folder's rank and the name's rank
-    /// packed together for a path sort (see [`path_keys`]), [`size_key`] for
-    /// a size sort, [`mtime_key`] for a date sort.
+    /// The key the page's sort asks for, filled by [`entry_key`] or, for a
+    /// path sort, [`path_keys`]: the name's rank key for a name sort, the
+    /// parent folder's rank and the name's rank packed together for a path
+    /// sort, [`size_key`] for a size sort, [`mtime_key`] for a date sort.
     /// Candidates used to carry kind, size, date, an
     /// optional path and a `fold(parent) + NUL + fold(name)` key string each,
     /// ~300 MB under the index lock for a 100-row page of a broad path sort.
@@ -341,8 +342,10 @@ pub fn run_query_refs(
 /// interned), counts matches from each name's refcount, and pages by walking
 /// the matched names in name order and their same-name chains. No sort runs,
 /// and a 100-row page of a broad query leaves as soon as 100 entries have
-/// been walked. Everything else takes the candidate path: scan, order, slice.
-/// `fast` exists for the test that holds the two paths equal.
+/// been walked. A bounded page sorted by an entry key keeps only its best
+/// rows as it scans (see [`top_k_refs`]). Everything else takes the
+/// candidate path: scan, order, slice. `fast` exists for the tests that hold
+/// these paths equal to the candidate path.
 #[allow(clippy::too_many_arguments)]
 fn page_refs(
     index: &VolumeIndex,
@@ -370,6 +373,12 @@ fn page_refs(
             refs,
             total_size,
         };
+    }
+    if fast
+        && let Some(limit) = limit
+        && top_k_applies(index, parsed, &compiled, scope, sort, offset, Some(limit))
+    {
+        return top_k_refs(index, parsed, &compiled, sort, offset, limit, sum_sizes);
     }
     let mut candidates = scan(index, parsed, &compiled, scope);
     let total = candidates.len() as u64;
@@ -782,6 +791,171 @@ fn name_level_refs(
     refs
 }
 
+/// The most rows a page can end at to be gathered by [`top_k_refs`]: each
+/// thread holds up to twice this many candidates, and past it collecting
+/// every match and sorting once costs less.
+const TOP_K_MAX: usize = 10_000;
+
+/// Whether the page `[offset, offset + limit)` of `parsed` can be gathered
+/// by [`top_k_refs`], the key `sort` asks for being one entry key: a name,
+/// size or date sort of an unscoped query that a prefilter drives, with no
+/// path to test and no entry without one.
+#[allow(clippy::too_many_arguments)]
+fn top_k_applies(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    scope: Option<EntryIdx>,
+    sort: SortSpec,
+    offset: u32,
+    limit: Option<u32>,
+) -> bool {
+    sort.key != SortKey::Path
+        && limit.is_some_and(|l| (offset as usize).saturating_add(l as usize) <= TOP_K_MAX)
+        && scope.is_none()
+        && !parsed.match_case
+        && compiled.prefilter.is_some()
+        && compiled.volume_admits
+        && !compiled.tests_paths(parsed)
+        && !index.may_have_unpresentable()
+}
+
+/// How many candidates a buffer of [`top_k_refs`] has room for at first.
+const BEST_ROOM: usize = 4096;
+
+/// The best candidates one thread of [`top_k_refs`] was offered.
+struct Best {
+    kept: Vec<Candidate>,
+    /// The worst candidate kept at the last prune: one that sorts after it
+    /// can no longer be among the best `want` this buffer was offered.
+    cutoff: Option<Candidate>,
+}
+
+/// The page `[offset, offset + limit)` of a query [`top_k_applies`] to,
+/// gathered without collecting every match: the names are matched in chunks
+/// across cores, as in [`match_names`], and each thread keeps the best
+/// `offset + limit` entries of the chunks it ran, pruning back to them each
+/// time its buffer holds twice as many. The buffers are allocated by the
+/// caller, one per thread rather than per chunk, with room for at most
+/// [`BEST_ROOM`] candidates, so a rare term asking for a long page reserves
+/// little; a buffer whose chunks match more grows on its thread, up to twice
+/// [`TOP_K_MAX`]. Every match is still counted, and summed
+/// when `sum_sizes` asks, so the totals are the scan's, and the page is the
+/// scan's too: the same candidates, ordered by the same comparator.
+#[allow(clippy::too_many_arguments)]
+fn top_k_refs(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    sort: SortSpec,
+    offset: u32,
+    limit: u32,
+    sum_sizes: bool,
+) -> RefOutcome {
+    use rayon::prelude::*;
+    let needle = compiled.prefilter.as_deref().unwrap_or_default();
+    let want = offset as usize + limit as usize;
+    let names = index.name_count();
+    let per = chunk_words(names);
+    let chunks = names.div_ceil(per * 64);
+    let bests: Vec<Mutex<Best>> = (0..chunks.min(name_threads()))
+        .map(|_| {
+            Mutex::new(Best {
+                kept: Vec::with_capacity((2 * want).min(BEST_ROOM)),
+                cutoff: None,
+            })
+        })
+        .collect();
+    let cmp = |a: &Candidate, b: &Candidate| cmp_candidate(index, sort, a, b);
+    let scan_chunk = |i: usize| -> (u64, u64) {
+        // A thread runs one chunk at a time and calls into no pool while it
+        // does, so its buffer is free unless there are fewer buffers than
+        // threads.
+        let slot = rayon::current_thread_index().unwrap_or(0) % bests.len();
+        let mut best = bests[slot].lock().unwrap_or_else(PoisonError::into_inner);
+        let Best { kept, cutoff } = &mut *best;
+        let mut cp_buf = CodePointBuf::new();
+        let mut ext_scratch = Vec::new();
+        let mut scope_memo = FxHashMap::default();
+        let mut dir_paths = FxHashMap::default();
+        let mut no_folders = None;
+        let (mut count, mut size) = (0u64, 0u64);
+        for_each_prefilter_hit_in(index, needle, chunk_ids(i, per, names), |id| {
+            if !compiled.prefilter_decides_name
+                && !name_matches(index, parsed, compiled, id, &mut cp_buf, &mut ext_scratch)
+            {
+                return;
+            }
+            for idx in index.name_chain(id) {
+                if index.is_synthetic(idx) {
+                    continue;
+                }
+                let Some(mut c) = evaluate(
+                    index,
+                    parsed,
+                    compiled,
+                    idx,
+                    None,
+                    &mut scope_memo,
+                    &mut dir_paths,
+                    &mut no_folders,
+                    true,
+                    &mut cp_buf,
+                    &mut ext_scratch,
+                ) else {
+                    continue;
+                };
+                count += 1;
+                if sum_sizes {
+                    size = size.saturating_add(files_size(index, std::iter::once(idx)));
+                }
+                if want == 0 {
+                    continue;
+                }
+                c.key = entry_key(index, sort, idx);
+                if kept.len() == 2 * want {
+                    kept.select_nth_unstable_by(want - 1, cmp);
+                    kept.truncate(want);
+                    *cutoff = Some(kept[want - 1]);
+                }
+                if cutoff.is_some_and(|cut| cmp(&c, &cut).is_gt()) {
+                    continue;
+                }
+                kept.push(c);
+            }
+        });
+        (count, size)
+    };
+    let (total, total_size) = on_name_pool(chunks, || {
+        (0..chunks)
+            .into_par_iter()
+            .map(scan_chunk)
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1.saturating_add(b.1)))
+    });
+    let bests: Vec<Best> = bests
+        .into_iter()
+        .map(|best| best.into_inner().unwrap_or_else(PoisonError::into_inner))
+        .collect();
+    let mut kept: Vec<Candidate> = Vec::with_capacity(bests.iter().map(|b| b.kept.len()).sum());
+    for best in &bests {
+        kept.extend_from_slice(&best.kept);
+    }
+    drop(bests);
+    let (start, end) = page_bounds(total as usize, offset, Some(limit));
+    order_top(index, &mut kept, sort, end);
+    RefOutcome {
+        total,
+        refs: kept[start..end]
+            .iter()
+            .map(|c| HitRef {
+                idx: c.idx,
+                frn: index.entry(c.idx).frn(),
+            })
+            .collect(),
+        total_size: sum_sizes.then_some(total_size),
+    }
+}
+
 /// A folder-scoped query walks the scope's subtree instead of scanning the
 /// whole volume, so a Downloads-sized scope costs the same on any disk: the
 /// old path cost ~300 ms on a broad query over 3.9M entries because every
@@ -1013,28 +1187,29 @@ fn page_bounds(n: usize, offset: u32, limit: Option<u32>) -> (usize, usize) {
 /// `sort`, in order (see [`order_top`]). A path sort first ranks each distinct
 /// parent directory; no candidate carries a key string.
 fn order(index: &VolumeIndex, candidates: &mut [Candidate], sort: SortSpec, end: usize) {
+    if sort.key == SortKey::Path {
+        path_keys(index, candidates);
+    } else {
+        for c in candidates.iter_mut() {
+            c.key = entry_key(index, sort, c.idx);
+        }
+    }
+    order_top(index, candidates, sort, end);
+}
+
+/// The key a name, size or date sort orders entry `idx` by. A path sort's
+/// keys need every candidate's folder ranked first, which [`path_keys`]
+/// does, so a path sort is never asked here.
+fn entry_key(index: &VolumeIndex, sort: SortSpec, idx: EntryIdx) -> u64 {
     match sort.key {
         // Two integers per comparison instead of two folded names: see
         // `NameStore::rank_key`. Names still waiting outside the order get a
         // key between their neighbours, and ties fall back to the bytes.
-        SortKey::Name => {
-            for c in candidates.iter_mut() {
-                c.key = index.name_rank_key(index.name_id(c.idx));
-            }
-        }
-        SortKey::Path => path_keys(index, candidates),
-        SortKey::Size => {
-            for c in candidates.iter_mut() {
-                c.key = size_key(index.entry(c.idx).size(), sort.dir);
-            }
-        }
-        SortKey::DateModified => {
-            for c in candidates.iter_mut() {
-                c.key = mtime_key(index.entry(c.idx).mtime(), sort.dir);
-            }
-        }
+        SortKey::Name => index.name_rank_key(index.name_id(idx)),
+        SortKey::Size => size_key(index.entry(idx).size(), sort.dir),
+        SortKey::DateModified => mtime_key(index.entry(idx).mtime(), sort.dir),
+        SortKey::Path => 0,
     }
-    order_top(index, candidates, sort, end);
 }
 
 /// The key a size sort in direction `dir` orders an entry of `size` by. An
@@ -1737,10 +1912,10 @@ fn cmp_candidate(
     b: &Candidate,
 ) -> core::cmp::Ordering {
     // Folded names are precomputed, so these are cheap byte compares; `key`
-    // holds whatever `order` filled for this sort. The idx tiebreak makes the
+    // holds what `entry_key` or `path_keys` gave for this sort. The idx tiebreak makes the
     // order total, so an unstable sort is deterministic.
     let by_name = || index.folded_name(a.idx).cmp(index.folded_name(b.idx));
-    let _ = sort.key; // every key orders the same way: `order` filled `key`
+    let _ = sort.key; // every key orders the same way: `key` was filled for it
     let base = a
         .key
         .cmp(&b.key)
@@ -3620,6 +3795,118 @@ mod tests {
             let idx = random_volume(&entries, order_at, cycle);
             let parsed = parse_query(query).unwrap();
             prop_assert_eq!(path_pages_differ(&idx, &parsed), None);
+        }
+    }
+
+    /// Name `i` of the fast-path corpus: pairs that fold alike (`e3.txt` and
+    /// `E3.TXT`), and enough names to split into many chunks.
+    fn corpus_name(i: usize) -> String {
+        let n = i / 4;
+        match i % 4 {
+            0 => format!("e{n}.txt"),
+            1 => format!("E{n}.TXT"),
+            2 => format!("a{n}.md"),
+            _ => format!("zz{n}"),
+        }
+    }
+
+    const FAST_QUERIES: [&str; 12] = [
+        "e",
+        "E1",
+        "a",
+        ".txt",
+        "*.md",
+        "ext:txt",
+        "file:e",
+        "folder:a",
+        "e size:>10",
+        "zz size:<20",
+        "x",
+        "",
+    ];
+
+    const SORT_KEYS: [SortKey; 4] = [
+        SortKey::Name,
+        SortKey::Size,
+        SortKey::DateModified,
+        SortKey::Path,
+    ];
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        /// The name-level pass and the bounded top-k page exactly like the
+        /// candidate path, with the same total and summed size, for every
+        /// sort and slice, over random indexes whose names split into many
+        /// chunks, fold alike, repeat, join the order late, or lose their
+        /// last entry, with sizes and dates known or not.
+        #[test]
+        fn fast_paths_page_like_the_candidates(
+            files in prop::collection::vec(
+                (
+                    0usize..320,
+                    0usize..4,
+                    any::<bool>(),
+                    prop::option::of(0u64..40),
+                    prop::option::of(1i64..40),
+                ),
+                1..300,
+            ),
+            late in prop::collection::vec(0usize..320, 0..24),
+            gone in prop::collection::vec(any::<prop::sample::Index>(), 0..12),
+            query in 0usize..FAST_QUERIES.len(),
+            key in 0usize..SORT_KEYS.len(),
+            desc in any::<bool>(),
+            offset in 0u32..24,
+            limit in prop::option::of(0u32..40),
+        ) {
+            let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+            let dirs = [NTFS_ROOT_FRN, frn(10), frn(11), frn(12)];
+            for (i, &d) in dirs[1..].iter().enumerate() {
+                idx.insert_enum(&enum_rec(d, NTFS_ROOT_FRN, &format!("dir{i}"), true));
+            }
+            for (n, &(name, dir, is_dir, size, mtime)) in files.iter().enumerate() {
+                let f = frn(1000 + n as u64);
+                idx.insert_enum(&enum_rec(f, dirs[dir], &corpus_name(name), is_dir));
+                if size.is_some() || mtime.is_some() {
+                    idx.set_stat(f, size.unwrap_or(u64::MAX), mtime.unwrap_or(i64::MIN));
+                }
+            }
+            idx.optimize_storage();
+            // Interned after the order was built, so they wait unranked.
+            let late: Vec<ParsedUsnRecord> = late
+                .iter()
+                .enumerate()
+                .map(|(n, &name)| {
+                    enum_rec(frn(5000 + n as u64), NTFS_ROOT_FRN, &corpus_name(name), false)
+                })
+                .collect();
+            idx.apply_batch(&late);
+            // Files only, so no entry is left without a parent.
+            let gone: Vec<ParsedUsnRecord> = gone
+                .iter()
+                .map(|g| {
+                    let f = frn(1000 + g.index(files.len()) as u64);
+                    let mut r = enum_rec(f, NTFS_ROOT_FRN, "", false);
+                    r.reason = USN_REASON_FILE_DELETE;
+                    r
+                })
+                .collect();
+            idx.apply_batch(&gone);
+            prop_assert!(!idx.may_have_unpresentable());
+
+            let parsed = parse_query(FAST_QUERIES[query]).unwrap();
+            let dir = if desc { SortDir::Desc } else { SortDir::Asc };
+            let sort = SortSpec { key: SORT_KEYS[key], dir };
+            // A count alone, as `-get-result-count` asks, and a single row.
+            for (offset, limit) in [(offset, limit), (0, Some(0)), (0, Some(1))] {
+                let fast = page_refs(&idx, r"C:\", &parsed, None, sort, offset, limit, true, true);
+                let slow = page_refs(&idx, r"C:\", &parsed, None, sort, offset, limit, true, false);
+                prop_assert_eq!(fast.total, slow.total);
+                prop_assert_eq!(fast.total_size, slow.total_size);
+                let fast: Vec<EntryIdx> = fast.refs.iter().map(|r| r.idx).collect();
+                let slow: Vec<EntryIdx> = slow.refs.iter().map(|r| r.idx).collect();
+                prop_assert_eq!(fast, slow);
+            }
         }
     }
 }
