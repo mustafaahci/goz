@@ -60,9 +60,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// loop. A client that connects during the pause waits for it, not longer: the
 /// next instance already exists.
 const CONNECT_RETRY_PAUSE: Duration = Duration::from_millis(10);
-/// At most one log line per this period for failed connects. It counts the
-/// failures since the last line, so the service log cannot grow with them.
-const CONNECT_WARN_EVERY: Duration = Duration::from_secs(60);
+/// At most one log line per this period for failed connects, and one for
+/// clients dropped at [`MAX_CONNECTIONS`]. Each line counts the events since
+/// the last, so a local user cannot grow the service log with them.
+const WARN_EVERY: Duration = Duration::from_secs(60);
 /// A results page ends once its frame passes this many bytes, half the
 /// client's [`MAX_SERVER_FRAME`]. One row is at most `MAX_PATH_HOPS` names of
 /// up to 255 UTF-16 units each, about 3 MiB, so the row that crosses the budget
@@ -118,8 +119,11 @@ async fn accept_loop(
         ready();
     }
     let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let mut connect_failures = 0u64;
-    let mut last_connect_warning: Option<Instant> = None;
+    let mut connect_failures = Throttle::new(WARN_EVERY);
+    let mut dropped_clients = Throttle::new(WARN_EVERY);
+    // A line is due at a burst's first event; this logs the rest of it.
+    let mut flush = tokio::time::interval(WARN_EVERY);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(pipe = PIPE_NAME, "query server listening");
     loop {
         tokio::select! {
@@ -129,15 +133,8 @@ async fn accept_loop(
                     // here stopped the server for every user until the next
                     // boot. The new instance is created before the old one
                     // drops, so the pipe always has a listener.
-                    connect_failures += 1;
-                    if last_connect_warning.is_none_or(|t| t.elapsed() >= CONNECT_WARN_EVERY) {
-                        tracing::warn!(
-                            error = %e,
-                            failures = connect_failures,
-                            "pipe connect failed; still listening"
-                        );
-                        connect_failures = 0;
-                        last_connect_warning = Some(Instant::now());
+                    if let Some(failures) = connect_failures.hit(Instant::now()) {
+                        tracing::warn!(error = %e, failures, "pipe connect failed; still listening");
                     }
                     server = create_instance(&security, false)?;
                     tokio::time::sleep(CONNECT_RETRY_PAUSE).await;
@@ -168,23 +165,91 @@ async fn accept_loop(
                         });
                     }
                     Err(_) => {
-                        tracing::warn!(max = MAX_CONNECTIONS, "connection limit reached; dropping client");
+                        if let Some(dropped) = dropped_clients.hit(Instant::now()) {
+                            tracing::warn!(
+                                max = MAX_CONNECTIONS,
+                                dropped,
+                                "connection limit reached; dropping clients"
+                            );
+                        }
                         drop(connected); // closes/disconnects this pipe instance
                     }
                 }
             }
+            _ = flush.tick() => {
+                log_counted(&mut connect_failures, &mut dropped_clients);
+            }
             _ = tokio::signal::ctrl_c() => {
+                log_counted(&mut connect_failures, &mut dropped_clients);
                 tracing::info!("Ctrl+C received; shutting down");
                 return Ok(());
             }
             changed = shutdown.changed() => {
                 // Err = all senders dropped; either way, honour the stop.
                 if changed.is_err() || *shutdown.borrow() {
+                    log_counted(&mut connect_failures, &mut dropped_clients);
                     tracing::info!("stop requested; shutting down");
                     return Ok(());
                 }
             }
         }
+    }
+}
+
+/// Logs what the accept loop's throttles counted since their last lines.
+fn log_counted(connect_failures: &mut Throttle, dropped_clients: &mut Throttle) {
+    let now = Instant::now();
+    if let Some(failures) = connect_failures.flush(now) {
+        tracing::warn!(failures, "pipe connect failed; still listening");
+    }
+    if let Some(dropped) = dropped_clients.flush(now) {
+        tracing::warn!(
+            max = MAX_CONNECTIONS,
+            dropped,
+            "connection limit reached; dropping clients"
+        );
+    }
+}
+
+/// Counts repeated events and lets one log line through per period: one at
+/// the first event, then one per [`Throttle::flush`] for the rest.
+struct Throttle {
+    period: Duration,
+    since_line: u64,
+    last_line: Option<Instant>,
+}
+
+impl Throttle {
+    fn new(period: Duration) -> Self {
+        Self {
+            period,
+            since_line: 0,
+            last_line: None,
+        }
+    }
+
+    /// Counts one event at `now`. Returns the events since the last line,
+    /// this one included, when a line is due.
+    fn hit(&mut self, now: Instant) -> Option<u64> {
+        self.since_line += 1;
+        if self
+            .last_line
+            .is_some_and(|t| now.duration_since(t) < self.period)
+        {
+            return None;
+        }
+        self.last_line = Some(now);
+        Some(std::mem::take(&mut self.since_line))
+    }
+
+    /// The events counted since the last line, for a line at `now`, or
+    /// `None` when there are none.
+    fn flush(&mut self, now: Instant) -> Option<u64> {
+        if self.since_line == 0 {
+            return None;
+        }
+        self.last_line = Some(now);
+        Some(std::mem::take(&mut self.since_line))
     }
 }
 
@@ -2300,5 +2365,28 @@ mod tests {
         }
         let pages = results(&encode_query_binary(&vols, scoped("inside", r"C:\proj")));
         assert_eq!(pages[0].total, 1, "the new proj's file is found");
+    }
+
+    /// One line goes through per period and says how many events it covers,
+    /// so a flood of dropped clients costs the log a line or two a minute,
+    /// and a flush reports the end of a burst without waiting for another.
+    #[test]
+    fn a_throttle_lets_one_line_through_per_period() {
+        use super::Throttle;
+        use std::time::{Duration, Instant};
+
+        let mut throttle = Throttle::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert_eq!(throttle.hit(t0), Some(1));
+        assert_eq!(throttle.hit(t0 + Duration::from_secs(1)), None);
+        assert_eq!(throttle.hit(t0 + Duration::from_secs(59)), None);
+        assert_eq!(throttle.hit(t0 + Duration::from_secs(60)), Some(3));
+        assert_eq!(throttle.hit(t0 + Duration::from_secs(61)), None);
+        // A flush reports what the line before it left out, once.
+        assert_eq!(throttle.flush(t0 + Duration::from_secs(62)), Some(1));
+        assert_eq!(throttle.flush(t0 + Duration::from_secs(63)), None);
+        // The flushed line starts the next period.
+        assert_eq!(throttle.hit(t0 + Duration::from_secs(121)), None);
+        assert_eq!(throttle.hit(t0 + Duration::from_secs(122)), Some(2));
     }
 }
