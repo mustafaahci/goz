@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "goz-cli"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "goz-core",
  "goz-winfs",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "goz-core"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "criterion",
  "hashbrown",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "goz-daemon"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "goz-winfs"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "windows-sys",
 ]
