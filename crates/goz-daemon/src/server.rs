@@ -295,24 +295,43 @@ async fn handle_connection(
                 // QUERY_PAGE_BACKLOG pages are in flight, and encoding
                 // overlaps the pipe writes instead of preceding them.
                 Ok(Request::Query(q)) => {
+                    let received = Instant::now();
+                    let shape = QueryShape::of(&q);
                     let vols = volumes.current();
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(QUERY_PAGE_BACKLOG);
                     let encoder = tokio::task::spawn_blocking(move || {
+                        let queued = received.elapsed();
                         // A failed send means the receiver is gone (client
                         // vanished or write error): stop encoding.
-                        stream_query_binary(&vols, q, &mut |page| tx.blocking_send(page).is_ok());
+                        let timing = stream_query_binary(&vols, q, &mut |page| {
+                            tx.blocking_send(page).is_ok()
+                        });
+                        (queued, timing)
                     });
                     let mut write_err: Option<std::io::Error> = None;
+                    let mut writing = Duration::ZERO;
+                    let mut first_written = None;
                     while let Some(page) = rx.recv().await {
+                        let write = Instant::now();
                         if let Err(e) = write_reply(server, &page).await {
                             write_err = Some(e);
                             break;
                         }
+                        writing += write.elapsed();
+                        first_written.get_or_insert_with(|| received.elapsed());
                     }
                     // Closing the channel unblocks a still-encoding task; it
                     // aborts at its next emit.
                     drop(rx);
-                    encoder.await.context("query task panicked")?;
+                    let (queued, timing) = encoder.await.context("query task panicked")?;
+                    log_query(
+                        &shape,
+                        &timing,
+                        queued,
+                        first_written,
+                        writing,
+                        received.elapsed(),
+                    );
                     if let Some(e) = write_err {
                         return Err(e.into());
                     }
@@ -357,7 +376,7 @@ async fn write_reply(server: &mut NamedPipeServer, bytes: &[u8]) -> std::io::Res
 #[cfg(test)]
 fn encode_query_binary(volumes: &VolumeSet, q: QueryRequest) -> Vec<u8> {
     let mut out = Vec::new();
-    stream_query_binary(volumes, q, &mut |page| {
+    let _ = stream_query_binary(volumes, q, &mut |page| {
         out.extend_from_slice(&page);
         true
     });
@@ -383,9 +402,13 @@ fn stream_query_binary(
     volumes: &VolumeSet,
     q: QueryRequest,
     emit: &mut dyn FnMut(Vec<u8>) -> bool,
-) {
+) -> QueryTiming {
+    let mut timing = QueryTiming::default();
+    let parsing = Instant::now();
     // Read as the query arrives, so its `dm:` dates count from now.
-    let parsed = match parse_query_at(&q.query, q.match_case, &MachineClock::read()) {
+    let parsed = parse_query_at(&q.query, q.match_case, &MachineClock::read());
+    timing.parse = parsing.elapsed();
+    let parsed = match parsed {
         Ok(p) => p,
         Err(e) => {
             let mut out = Vec::new();
@@ -397,7 +420,7 @@ fn stream_query_binary(
                 &mut out,
             );
             let _ = emit(out);
-            return;
+            return timing;
         }
     };
 
@@ -421,7 +444,10 @@ fn stream_query_binary(
         }
         // Resolve the scope and run the query under ONE read guard, so a
         // concurrent rescan cannot swap the index between the two steps.
+        let waiting = Instant::now();
         let index = vol.index.read();
+        timing.lock_wait += waiting.elapsed();
+        let matching = Instant::now();
         let scope_entry = match scope {
             VolScope::All => None,
             VolScope::Rel(rel) => match resolve_scope_cached(vol, &index, rel, parsed.match_case) {
@@ -444,6 +470,8 @@ fn stream_query_binary(
             q.want_total_size,
         );
         drop(index);
+        timing.matching += matching.elapsed();
+        timing.volumes += 1;
         total += outcome.total;
         if let (Some(sum), Some(size)) = (total_size.as_mut(), outcome.total_size) {
             *sum = sum.saturating_add(size);
@@ -473,7 +501,10 @@ fn stream_query_binary(
         // (the order every query uses, so readers never wait on each other in
         // a cycle), and released before the page is handed off, since `emit`
         // may block on the pipe.
+        let waiting = Instant::now();
         let guards: Vec<IndexGuard<'_>> = vols.iter().map(|v| v.index.read()).collect();
+        timing.page_lock_wait += waiting.elapsed();
+        let building = Instant::now();
         // Frame = 4-byte LE length placeholder + payload, both backfilled once
         // the rows are in (the count is known only then). ~96 bytes/row covers
         // a typical path + fields without a mid-page regrow.
@@ -532,10 +563,100 @@ fn stream_query_binary(
         patch_results_header(&mut out[header_at..], more, count);
         let payload_len = (out.len() - 4) as u32;
         out[0..4].copy_from_slice(&payload_len.to_le_bytes());
-        if !emit(out) || !more {
-            return;
+        timing.rows += building.elapsed();
+        timing.pages += 1;
+        timing.rows_sent += u64::from(count);
+        timing.total = total;
+        let handing = Instant::now();
+        let handed = emit(out);
+        timing.handoff += handing.elapsed();
+        if !handed || !more {
+            return timing;
         }
     }
+}
+
+/// Where one query's time went inside [`stream_query_binary`]: an `Instant`
+/// read per step, logged by [`log_query`].
+#[derive(Debug, Default)]
+struct QueryTiming {
+    /// Parsing the query text.
+    parse: Duration,
+    /// Waiting for each searched volume's read lock before matching.
+    lock_wait: Duration,
+    /// Resolving the scope, matching and ordering, under those locks.
+    matching: Duration,
+    /// Waiting for the read locks each page is built under.
+    page_lock_wait: Duration,
+    /// Building and encoding the rows of every page.
+    rows: Duration,
+    /// Handing pages to the pipe writer, which waits when the client reads
+    /// slower than gozd encodes.
+    handoff: Duration,
+    /// Volumes searched.
+    volumes: u32,
+    pages: u32,
+    rows_sent: u64,
+    /// Matches, whatever the limit.
+    total: u64,
+}
+
+/// What a query asked for, as far as its log line says: not the query text,
+/// since the service's log is readable by every user of the machine.
+struct QueryShape {
+    query_len: usize,
+    scoped: bool,
+    sort: SortSpec,
+    limit: Option<u32>,
+}
+
+impl QueryShape {
+    fn of(q: &QueryRequest) -> Self {
+        Self {
+            query_len: q.query.len(),
+            scoped: q.scope.is_some(),
+            sort: q.sort,
+            limit: q.limit,
+        }
+    }
+}
+
+/// Logs where one query's time went, under the `gozd::query` target at
+/// debug level, which `RUST_LOG=info,gozd::query=debug` turns on. `queued`
+/// is the wait for a blocking-pool thread, `first_written` when the first
+/// page reached the pipe, `writing` the time spent writing pages to it and
+/// `all` the whole answer, each counted from when the request was read.
+fn log_query(
+    shape: &QueryShape,
+    timing: &QueryTiming,
+    queued: Duration,
+    first_written: Option<Duration>,
+    writing: Duration,
+    all: Duration,
+) {
+    let ms = |d: Duration| (d.as_secs_f64() * 100_000.0).round() / 100.0;
+    tracing::debug!(
+        target: "gozd::query",
+        query_len = shape.query_len,
+        scoped = shape.scoped,
+        sort = ?shape.sort,
+        limit = ?shape.limit,
+        volumes = timing.volumes,
+        total = timing.total,
+        rows = timing.rows_sent,
+        pages = timing.pages,
+        all_ms = ms(all),
+        first_page_ms = first_written.map(ms),
+        queued_ms = ms(queued),
+        parse_ms = ms(timing.parse),
+        lock_wait_ms = ms(timing.lock_wait),
+        match_ms = ms(timing.matching),
+        page_lock_ms = ms(timing.page_lock_wait),
+        rows_ms = ms(timing.rows),
+        handoff_ms = ms(timing.handoff),
+        write_ms = ms(writing),
+        "query answered"
+    );
 }
 
 fn handle_request(volumes: &VolumeSet, req: Request) -> Response {
@@ -2058,6 +2179,40 @@ mod tests {
         for page in &pages {
             assert_eq!(page.total_size, Some(3 * n));
         }
+    }
+
+    /// A query's timing counts what it did, so its log line can be read
+    /// against the durations: every volume searched, each page and row sent,
+    /// and every match, a limit or not.
+    #[test]
+    fn a_query_timing_counts_its_volumes_pages_and_rows() {
+        let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        index.insert_enum(&dir_record(100, NTFS_ROOT_FRN.0, "many"));
+        let n = PAGE_ROWS as u64 + 1;
+        for i in 0..n {
+            index.insert_enum(&file_record(1000 + i, 100, &format!("hit{i:05}.log")));
+        }
+        let vols = set(&[
+            volume(r"C:\", index, VolumePhase::Live),
+            live_volume(r"D:\"),
+        ]);
+        let mut emitted = 0;
+        let timing = super::stream_query_binary(&vols, query("hit"), &mut |_| {
+            emitted += 1;
+            true
+        });
+        assert_eq!(timing.volumes, 2);
+        assert_eq!(timing.pages, 2);
+        assert_eq!(emitted, 2);
+        assert_eq!(timing.rows_sent, n);
+        assert_eq!(timing.total, n);
+
+        let limited = goz_core::proto::QueryRequest {
+            limit: Some(10),
+            ..query("hit")
+        };
+        let timing = super::stream_query_binary(&vols, limited, &mut |_| true);
+        assert_eq!((timing.pages, timing.rows_sent, timing.total), (1, 10, n));
     }
 
     /// A parent cycle no record has broken makes every query pay the

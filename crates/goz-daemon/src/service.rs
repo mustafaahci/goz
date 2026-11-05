@@ -489,7 +489,13 @@ fn init_service_tracing() {
     let file = Arc::new(file);
     let _ = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+        // `RUST_LOG` in the service's environment picks what is logged, as
+        // in a console run: `info,gozd::query=debug` adds a line per query
+        // saying where its time went.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .with_writer(move || FileWriter(file.clone()))
         .try_init();
 }

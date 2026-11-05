@@ -85,6 +85,13 @@ With `-size` and `-dm` the listing shows `es.exe`'s console columns: the size ri
 
 `dm:` (or `datemodified:`) takes `today`, `yesterday`, `thisweek`, `lastweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear`, a year, month or day (`2024`, `2024-05`, `2024-05-01`), or a duration back from now (`7days`, `last2hours`, `3months`), each optionally after `<`, `<=`, `>` or `>=`, or two of them as a range `2024-01-01..2024-03-31`. Days run between midnights in the machine's time zone, a week starts on the first day of the week of the service's regional format, and a file whose date goz has not read yet matches only `dm:unknown`.
 
+To see where a search spends its time, set `GOZ_TIMING=1`: goz then ends with a line on stderr saying how long Windows took to start it and when it reached gozd, got its first and last page, and finished. gozd can log its side of each query, split into lock waits, matching, building rows and writing to the pipe, to `%SystemRoot%\Logs\goz\gozd.log`. The line gives the query's length, scope and sort, never its text. Turn it on from an elevated prompt, and off again by deleting the value:
+
+```
+reg add HKLM\SYSTEM\CurrentControlSet\Services\goz /v Environment /t REG_MULTI_SZ /d "RUST_LOG=info,gozd::query=debug" /f
+net stop goz && net start goz
+```
+
 ## Performance
 
 goz vs Everything 1.4.1.1032 (`es.exe` 1.1.0.30), same machine, each warm. Single substring term, `-sort name` on both, full result set, median of 6 runs after 2 warmups, interleaved. Median milliseconds; **bold** is faster.
