@@ -67,42 +67,7 @@ enum Command {
     Status,
 }
 
-/// Configure mimalloc for a long-lived cache-like process: purge freed
-/// memory back to the OS immediately instead of after a delayed tick.
-///
-/// mimalloc's default purge runs `purge_delay` ms after a free, but only on
-/// later allocator activity; an idle daemon never ticks, so the freed
-/// bootstrap transients (sparse FRN maps, enumeration buffers) stayed
-/// COMMITTED for the daemon's lifetime (~100 MB against a ~490 MB process).
-///
-/// The option indexes are the bundled mimalloc v2 enum, which the sys crate
-/// does not export. Each is verified by reading back its documented default
-/// before writing: if the layout ever shifts, the mismatch skips the write
-/// instead of flipping an arbitrary option.
-#[cfg(windows)]
-fn tune_allocator() {
-    /// v2 `mi_option_abandoned_page_purge` (default 0).
-    const ABANDONED_PAGE_PURGE: i32 = 12;
-    /// v2 `mi_option_purge_delay` in ms (default 10).
-    const PURGE_DELAY: i32 = 15;
-    // SAFETY: mi_option_get/set take no pointers and are safe at any time.
-    unsafe {
-        if libmimalloc_sys::mi_option_get(PURGE_DELAY) == 10 {
-            libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
-        }
-        if libmimalloc_sys::mi_option_get(ABANDONED_PAGE_PURGE) == 0 {
-            libmimalloc_sys::mi_option_set(ABANDONED_PAGE_PURGE, 1);
-        }
-    }
-}
-
-/// Off Windows there is no mimalloc global allocator to tune (the daemon only
-/// runs on Windows anyway), so this is a no-op that keeps `main` platform-free.
-#[cfg(not(windows))]
-fn tune_allocator() {}
-
 fn main() -> anyhow::Result<()> {
-    tune_allocator();
     let cli = Cli::parse();
     match cli.command {
         Command::Scan { query } => run_scan(query),

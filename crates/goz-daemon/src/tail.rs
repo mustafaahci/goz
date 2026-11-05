@@ -710,8 +710,7 @@ fn first_build(
     let cursor = install(state, built, journal);
     // mimalloc heaps are per thread, and this one lives on as the tail, so
     // return the build's freed transients (the 1 MiB buffer, the sparse FRN
-    // map swapped for dense, the pre-shrink slack) now. Short-lived bootstrap
-    // threads used to get the same from `abandoned_page_purge` at their exit.
+    // map swapped for dense, the pre-shrink slack) now.
     // SAFETY: mi_collect takes no pointers and is safe from any thread.
     unsafe { libmimalloc_sys::mi_collect(true) };
 
