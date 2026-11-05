@@ -28,5 +28,8 @@ windows-service.workspace = true
 mimalloc.workspace = true
 libmimalloc-sys.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

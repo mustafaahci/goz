@@ -42,12 +42,15 @@ const QUERY_PAGE_BACKLOG: usize = 4;
 /// Idle/half-open connections are dropped after this long with no request, so a
 /// connected-but-silent client cannot block a task forever. The one-shot CLI
 /// client always writes immediately after connecting, well within this window.
+/// A connection with a reply out waits [`WRITE_TIMEOUT`] instead (see
+/// [`handle_connection`]).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A client that leaves a reply page untaken this long is dropped, so one that
 /// stops reading cannot hold its result set and connection slot forever. A
 /// write returns once the pipe has buffered the page, so this bounds the wait
-/// for the page before it; [`IDLE_TIMEOUT`] covers the last one. Long, so a
-/// client that streams pages to a console its user has paused is not cut off.
+/// for the page before it, and the wait for the client's next request covers
+/// the last one. Long, so a client that streams pages to a console its user
+/// has paused is not cut off.
 /// goz's own CLI reads the whole reply before it prints and gives up after
 /// 30 s, so it never comes near this.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -262,10 +265,14 @@ async fn handle_connection(
 ) -> Result<()> {
     let mut decoder = goz_core::proto::FrameDecoder::new(MAX_CLIENT_FRAME);
     let mut read_buf = vec![0u8; 16 * 1024];
+    // Reap idle/half-open connections: a connected client that never sends a
+    // request is dropped after IDLE_TIMEOUT, freeing its task/buffer/pipe. Once
+    // a reply is out the wait is WRITE_TIMEOUT: the pipe can still hold the
+    // reply's last page, which a client streaming to a paused console takes
+    // late, and the disconnect that follows a timeout discards it.
+    let mut wait = IDLE_TIMEOUT;
     loop {
-        // Reap idle/half-open connections: a connected client that never sends a
-        // request is dropped after IDLE_TIMEOUT, freeing its task/buffer/pipe.
-        let n = match tokio::time::timeout(IDLE_TIMEOUT, server.read(&mut read_buf)).await {
+        let n = match tokio::time::timeout(wait, server.read(&mut read_buf)).await {
             Ok(r) => r?,
             Err(_) => return Ok(()),
         };
@@ -310,6 +317,7 @@ async fn handle_connection(
                     if let Some(e) = write_err {
                         return Err(e.into());
                     }
+                    wait = WRITE_TIMEOUT;
                     continue;
                 }
                 // Hello / Status are trivial; encode inline as a tagged JSON frame.
@@ -331,6 +339,7 @@ async fn handle_connection(
                 }
             };
             write_reply(server, &out).await?;
+            wait = WRITE_TIMEOUT;
         }
     }
 }
@@ -1384,6 +1393,48 @@ mod tests {
             .collect();
         let expected: Vec<String> = (0..PAGE_ROWS).map(|i| format!("hit{i:05}.log")).collect();
         assert_eq!(names, expected, "every row arrives once, in order");
+    }
+
+    /// A connection that asks nothing is dropped after the idle timeout, but
+    /// one with a reply out waits as long as a page write may take: its last
+    /// page can sit unread in the pipe while the client writes the one before
+    /// to a paused console, and the disconnect that ends the connection would
+    /// discard it.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_left_unread_outlasts_the_idle_timeout() {
+        use super::{IDLE_TIMEOUT, WRITE_TIMEOUT, handle_connection};
+        use crate::volume_state::VolumeRegistry;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        for asks in [false, true] {
+            let name = format!(r"\\.\pipe\goz-test-{}-{asks}", std::process::id());
+            let mut server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&name)
+                .unwrap();
+            let mut client = ClientOptions::new().open(&name).unwrap();
+            server.connect().await.unwrap();
+            if asks {
+                let mut frame = Vec::new();
+                goz_core::proto::encode_request(&Request::Status, &mut frame);
+                client.write_all(&frame).await.unwrap();
+            }
+            let started = tokio::time::Instant::now();
+            handle_connection(&mut server, Arc::new(VolumeRegistry::default()))
+                .await
+                .unwrap();
+            let waited = started.elapsed();
+            if asks {
+                assert!(waited >= WRITE_TIMEOUT, "dropped after {waited:?}");
+            } else {
+                assert!(
+                    waited >= IDLE_TIMEOUT && waited < WRITE_TIMEOUT,
+                    "{waited:?}"
+                );
+            }
+            // Open until here, so the server waited on a live client.
+            drop(client);
+        }
     }
 
     /// A taken pipe name must read as taken through the context `create_instance`
