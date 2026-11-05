@@ -327,6 +327,30 @@ fn a_name_change_asks_for_its_folder_but_not_for_removed_entries() {
     assert_eq!(outcome.needs_stat, [root_frn()]);
 }
 
+/// A live index grows by a sixteenth, not by doubling: before, journal
+/// growth past the headroom left at publish doubled every column, and the
+/// doubled blocks stayed committed for the daemon's life.
+#[test]
+fn a_live_index_grows_by_a_sixteenth() {
+    let created: Vec<ParsedUsnRecord> = (0..20_000)
+        .map(|i| create(frn(100 + i), root_frn(), &format!("f{i}"), false))
+        .collect();
+    let mut idx = index_from_enum(&created);
+    idx.optimize_storage();
+    let more: Vec<ParsedUsnRecord> = (0..2_000)
+        .map(|i| create(frn(20_100 + i), root_frn(), &format!("new{i}"), false))
+        .collect();
+    idx.apply_batch(&more);
+    let m = idx.memory();
+    for (what, c) in [
+        ("entries", m.entries),
+        ("folded names", m.arena_folded),
+        ("frn map", m.frn_map),
+    ] {
+        assert!(c.allocated * 10 <= c.used * 11, "{what}: {c:?}");
+    }
+}
+
 // -- hard links ----------------------------------------------------------
 
 use crate::layout::LayoutFile;

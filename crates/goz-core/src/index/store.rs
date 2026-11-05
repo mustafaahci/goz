@@ -115,6 +115,12 @@ pub(crate) struct NameStore {
     /// Ranked ids that died since the last merge: each widens the probes a
     /// query's binary search makes around it, so they count toward a merge.
     dead_ranked: usize,
+    /// Set once the buffers are trimmed for a live index (see
+    /// [`Self::shrink_with_headroom`]): from then on the arenas and the
+    /// per-name tables grow by a sixteenth, not by doubling (see
+    /// [`room_for`]). The intern table is a hash table and keeps doubling its
+    /// buckets.
+    settled: bool,
 }
 
 /// A name not (yet) in the order.
@@ -129,8 +135,36 @@ fn hash_bytes(b: &[u8]) -> u64 {
 
 /// Shrinks a Vec to its length plus ~1.6% headroom (see
 /// `NameStore::shrink_with_headroom` for why never to exact-fit).
-fn shrink_vec<T>(v: &mut Vec<T>) {
-    v.shrink_to(v.len() + v.len() / 64 + 64);
+fn shrink_vec<T: Clone>(v: &mut Vec<T>) {
+    shrink_to_room(v, v.len() + v.len() / 64 + 64);
+}
+
+/// Shrinks `v` to room for `room` items by copying it into an allocation of
+/// that size. `shrink_to` would not return the memory: mimalloc reallocates a
+/// block in place when the new size is at least half of it, so a column that
+/// had just doubled past 2^22 entries kept the whole doubled block committed.
+fn shrink_to_room<T: Clone>(v: &mut Vec<T>, room: usize) {
+    if v.capacity() > room {
+        let mut fresh = Vec::with_capacity(room);
+        fresh.extend_from_slice(v);
+        *v = fresh;
+    }
+}
+
+/// The least a settled buffer grows by, so a small one does not regrow every
+/// few appends.
+const GROW_MIN: usize = 1024;
+
+/// Makes room for `more` items at the end of `v`, growing it by a sixteenth
+/// of its length instead of doubling. A buffer of a settled index (one the
+/// journal now changes a little at a time) used to double on the first
+/// append past its headroom and keep the doubled block for the daemon's
+/// life; this costs a copy of it now and then, for at most a sixteenth of
+/// slack.
+fn room_for<T>(v: &mut Vec<T>, more: usize) {
+    if v.capacity() - v.len() < more {
+        v.reserve_exact((v.len() / 16).max(more).max(GROW_MIN));
+    }
 }
 
 /// `NameStore::folded_bytes_of` over explicit tables, for closures that sort
@@ -186,17 +220,23 @@ impl NameStore {
             folded_bytes.len() <= u16::MAX as usize,
             "folded name exceeds 64 KiB"
         );
-        let folded = Self::push(&mut self.folded, &folded_bytes);
+        let folded = Self::push(&mut self.folded, &folded_bytes, self.settled);
         let raw = if folded_bytes.as_slice() == name {
             NameRef {
                 off: folded.off | RAW_IN_FOLDED,
                 len: folded.len,
             }
         } else {
-            Self::push(&mut self.raw, name)
+            Self::push(&mut self.raw, name, self.settled)
         };
 
         let id = self.pairs.len() as NameId;
+        if self.settled {
+            room_for(&mut self.pairs, 1);
+            room_for(&mut self.refcount, 1);
+            room_for(&mut self.head, 1);
+            room_for(&mut self.rank_of, 1);
+        }
         self.pairs.push(NamePair { raw, folded });
         self.refcount.push(1);
         self.head.push(NIL);
@@ -215,7 +255,12 @@ impl NameStore {
         id
     }
 
-    fn push(buf: &mut Vec<u8>, bytes: &[u8]) -> NameRef {
+    /// Appends `bytes` and their NUL separator to an arena, growing it as a
+    /// settled buffer when `settled` (see [`room_for`]).
+    fn push(buf: &mut Vec<u8>, bytes: &[u8], settled: bool) -> NameRef {
+        if settled {
+            room_for(buf, bytes.len() + 1);
+        }
         let off = buf.len() as u32;
         buf.extend_from_slice(bytes);
         buf.push(0);
@@ -338,14 +383,14 @@ impl NameStore {
                 continue;
             }
             let pair = self.pairs[i];
-            let folded = Self::push(&mut c.folded, self.folded_bytes_of(i as NameId));
+            let folded = Self::push(&mut c.folded, self.folded_bytes_of(i as NameId), false);
             let raw = if pair.raw.off & RAW_IN_FOLDED != 0 {
                 NameRef {
                     off: folded.off | RAW_IN_FOLDED,
                     len: folded.len,
                 }
             } else {
-                Self::push(&mut c.raw, self.raw_bytes_of(pair))
+                Self::push(&mut c.raw, self.raw_bytes_of(pair), false)
             };
             c.remap[i] = c.pairs.len() as NameId;
             c.pairs.push(NamePair { raw, folded });
@@ -621,8 +666,10 @@ impl NameStore {
     /// exactly its length doubles its whole allocation on the very next
     /// journal append, which un-does the shrink for the daemon's lifetime.
     /// The headroom absorbs live churn instead (tens of thousands of new
-    /// names on a large volume before any buffer regrows).
+    /// names on a large volume before any buffer regrows), and past it the
+    /// buffers grow by a sixteenth (see [`room_for`]).
     pub(crate) fn shrink_with_headroom(&mut self) {
+        self.settled = true;
         shrink_vec(&mut self.raw);
         shrink_vec(&mut self.folded);
         shrink_vec(&mut self.pairs);
@@ -757,6 +804,10 @@ pub(crate) struct EntryTable {
     prev_child: Vec<EntryIdx>,
     free: Vec<EntryIdx>,
     live: usize,
+    /// Set once the columns are trimmed for a live index (see
+    /// [`Self::shrink_with_headroom`]): from then on they grow by a
+    /// sixteenth, not by doubling (see [`room_for`]).
+    settled: bool,
 }
 
 impl EntryTable {
@@ -794,6 +845,9 @@ impl EntryTable {
             self.prev_child[i] = NIL;
             idx
         } else {
+            if self.settled {
+                self.make_room();
+            }
             let idx = self.frn.len() as EntryIdx;
             self.frn.push(frn);
             self.parent.push(parent);
@@ -966,10 +1020,29 @@ impl EntryTable {
             + ComponentBytes::of_vec(&self.free)
     }
 
+    /// Room for one more slot in every column, each grown as a settled
+    /// buffer (see [`room_for`]).
+    fn make_room(&mut self) {
+        room_for(&mut self.frn, 1);
+        room_for(&mut self.parent, 1);
+        room_for(&mut self.name_id, 1);
+        room_for(&mut self.flags, 1);
+        room_for(&mut self.size, 1);
+        room_for(&mut self.mtime, 1);
+        room_for(&mut self.next_link, 1);
+        room_for(&mut self.next_same, 1);
+        room_for(&mut self.prev_same, 1);
+        room_for(&mut self.first_child, 1);
+        room_for(&mut self.next_child, 1);
+        room_for(&mut self.prev_child, 1);
+    }
+
     /// Returns Vec-doubling slack to the OS, keeping ~1.6% headroom so live
-    /// churn does not re-double every column (see
-    /// `NameStore::shrink_with_headroom`). Called once post-bootstrap.
+    /// churn does not regrow every column at once (see
+    /// `NameStore::shrink_with_headroom`), and past it the columns grow by a
+    /// sixteenth (see [`room_for`]). Called once post-bootstrap.
     pub(crate) fn shrink_with_headroom(&mut self) {
+        self.settled = true;
         shrink_vec(&mut self.frn);
         shrink_vec(&mut self.parent);
         shrink_vec(&mut self.name_id);
@@ -1043,6 +1116,9 @@ impl FrnMap {
             FrnMap::Dense(v) => {
                 let r = record as usize;
                 if r >= v.len() {
+                    // A dense map exists only once a volume is live, so it
+                    // grows as a settled buffer: `resize` alone doubles.
+                    room_for(v, r + 1 - v.len());
                     v.resize(r + 1, NIL);
                 }
                 v[r] = idx;
@@ -1096,6 +1172,15 @@ impl FrnMap {
         }
     }
 
+    /// Returns a dense map's slack to the allocator. It grows by a sixteenth
+    /// (see [`room_for`]), so an exact fit does not double on the next
+    /// record.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        if let FrnMap::Dense(v) = self {
+            shrink_to_room(v, v.len());
+        }
+    }
+
     /// A short label for diagnostics ("dense" / "sparse").
     pub fn kind(&self) -> &'static str {
         match self {
@@ -1122,5 +1207,71 @@ impl FrnMap {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GROW_MIN, room_for, shrink_to_room};
+
+    /// A full buffer grows by a sixteenth of its length, or by `GROW_MIN` when
+    /// that is more, and one with room left does not grow.
+    #[test]
+    fn a_settled_buffer_grows_by_a_sixteenth() {
+        let mut big: Vec<u32> = vec![0; 64_000];
+        room_for(&mut big, 1);
+        assert_eq!(big.capacity(), 64_000 + 4_000);
+
+        let mut small: Vec<u32> = vec![0; 10];
+        room_for(&mut small, 1);
+        assert_eq!(small.capacity(), 10 + GROW_MIN);
+
+        let mut roomy: Vec<u32> = Vec::with_capacity(100);
+        roomy.push(1);
+        room_for(&mut roomy, 1);
+        assert_eq!(roomy.capacity(), 100);
+    }
+
+    /// A trimmed buffer is a new allocation of exactly the room asked for,
+    /// holding the same items. It must move: shrunk in place, mimalloc kept
+    /// the whole old block committed.
+    #[test]
+    fn a_trimmed_buffer_holds_only_its_room() {
+        let mut v: Vec<u32> = Vec::with_capacity(1 << 20);
+        v.extend(0..1000);
+        let old = v.as_ptr();
+        shrink_to_room(&mut v, 1100);
+        assert_ne!(v.as_ptr(), old, "trimmed in place");
+        assert_eq!(v.capacity(), 1100);
+        assert!(v.iter().copied().eq(0..1000));
+    }
+
+    /// A settled store grows its per-name tables and both arenas by a
+    /// sixteenth past the publish headroom. The names differ from their
+    /// folded form, so the raw arena is written too.
+    #[test]
+    fn a_settled_store_grows_by_a_sixteenth() {
+        let mut names = super::NameStore::default();
+        for i in 0..20_000 {
+            names.intern(format!("F{i}.TXT").as_bytes());
+        }
+        names.shrink_with_headroom();
+        for i in 0..2_000 {
+            names.intern(format!("New{i}.TXT").as_bytes());
+        }
+        let check = |names: &super::NameStore, stage: &str| {
+            let tables = [
+                ("pairs", names.pairs.len(), names.pairs.capacity()),
+                ("refcount", names.refcount.len(), names.refcount.capacity()),
+                ("head", names.head.len(), names.head.capacity()),
+                ("rank_of", names.rank_of.len(), names.rank_of.capacity()),
+                ("raw", names.raw.len(), names.raw.capacity()),
+                ("folded", names.folded.len(), names.folded.capacity()),
+            ];
+            for (what, len, cap) in tables {
+                assert!(cap * 10 <= len * 11, "{stage} {what}: len {len} cap {cap}");
+            }
+        };
+        check(&names, "grown");
     }
 }

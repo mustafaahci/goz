@@ -1226,20 +1226,17 @@ impl VolumeIndex {
     }
 
     /// Returns growth slack (Vec doubling, hash-map overshoot) to the
-    /// allocator, keeping ~1.6% headroom so post-publish journal churn does
-    /// not immediately re-double every column. Called once when a volume goes
-    /// live: bootstrap grows every component by doubling, so up to half the
-    /// allocation at that moment is slack that would otherwise be pinned for
-    /// the daemon's lifetime.
+    /// allocator, keeping ~1.6% headroom for post-publish journal churn, and
+    /// settles the Vec buffers so that past it they grow by a sixteenth
+    /// instead of doubling; the hash tables keep power-of-two buckets. Called once when a volume goes live: bootstrap grows
+    /// every component by doubling, so up to half the allocation at that
+    /// moment is slack that would otherwise be pinned for the daemon's
+    /// lifetime.
     pub fn shrink_to_fit(&mut self) {
         self.entries.shrink_with_headroom();
         self.names.shrink_with_headroom();
         self.dir_children.shrink_to_fit();
-        if let FrnMap::Dense(v) = &mut self.by_frn {
-            // Dense map growth is resize-to-record-number, not doubling, so
-            // exact fit is safe here.
-            v.shrink_to_fit();
-        }
+        self.by_frn.shrink_to_fit();
     }
 
     /// One-shot storage optimization for a freshly built volume: swap the
