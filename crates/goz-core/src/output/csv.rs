@@ -18,7 +18,11 @@
 //!   interior `"` doubled; with `-no-double-quote` es downgrades to
 //!   quote-only-when-needed (field contains `,`, `"`, CR, or LF;
 //!   `_es_should_quote`, cli.c:1707-1718), which this writer matches.
+//!
+//! [`write_csv_preamble`] and [`write_csv_row`] are the two halves of
+//! [`write_csv`], so a caller can write the rows page by page.
 
+use super::Row;
 use crate::types::EsColumn;
 
 /// Options controlling the CSV byte stream, mirroring es.exe's flags.
@@ -50,31 +54,24 @@ impl Default for CsvOptions {
     }
 }
 
-/// One result row, borrowed from the caller.
-#[derive(Clone, Debug)]
-pub struct CsvRow<'a> {
-    /// Full path and name; folders must carry no trailing backslash (the
-    /// caller's responsibility: the writer never adds or strips one).
-    pub path: &'a str,
-    /// Size in bytes; `None` = unknown → empty field.
-    pub size: Option<u64>,
-    /// Preformatted modification time (the CLI formats local time); `None`
-    /// → empty field. Written verbatim, never quoted.
-    pub mtime: Option<&'a str>,
-    /// Directories always get an empty `Size` field (empty size ⇒ directory
-    /// in the es contract), regardless of `size`.
-    pub is_dir: bool,
-}
-
 /// Serializes `rows` as es-compatible CSV, appending raw bytes to `out`.
 ///
 /// Infallible: writes to an in-memory buffer and every row shape is
 /// representable. See the module docs for the exact byte contract.
 pub fn write_csv<'a>(
     opts: &CsvOptions,
-    rows: impl IntoIterator<Item = CsvRow<'a>>,
+    rows: impl IntoIterator<Item = Row<'a>>,
     out: &mut Vec<u8>,
 ) {
+    write_csv_preamble(opts, out);
+    for row in rows {
+        write_csv_row(opts, &row, out);
+    }
+}
+
+/// Appends what comes before the first row: the byte order mark and the
+/// header row, each when `opts` asks for it.
+pub fn write_csv_preamble(opts: &CsvOptions, out: &mut Vec<u8>) {
     if opts.bom {
         out.extend_from_slice(b"\xEF\xBB\xBF");
     }
@@ -85,31 +82,31 @@ pub fn write_csv<'a>(
         }
         out.extend_from_slice(b"Filename\r\n");
     }
-    for row in rows {
-        for &col in &opts.columns {
-            match col {
-                EsColumn::Size => {
-                    if !row.is_dir
-                        && let Some(size) = row.size
-                    {
-                        out.extend_from_slice(size.to_string().as_bytes());
-                    }
-                }
-                EsColumn::DateModified => {
-                    if let Some(mtime) = row.mtime {
-                        out.extend_from_slice(mtime.as_bytes());
-                    }
+}
+
+/// Appends one record, CRLF included.
+pub fn write_csv_row(opts: &CsvOptions, row: &Row<'_>, out: &mut Vec<u8>) {
+    for &col in &opts.columns {
+        match col {
+            EsColumn::Size => {
+                if let Some(size) = row.file_size() {
+                    out.extend_from_slice(size.to_string().as_bytes());
                 }
             }
-            out.push(b',');
+            EsColumn::DateModified => {
+                if let Some(mtime) = row.mtime {
+                    out.extend_from_slice(mtime.as_bytes());
+                }
+            }
         }
-        if opts.double_quote || needs_quoting(row.path) {
-            write_quoted(row.path, out);
-        } else {
-            out.extend_from_slice(row.path.as_bytes());
-        }
-        out.extend_from_slice(b"\r\n");
+        out.push(b',');
     }
+    if opts.double_quote || needs_quoting(row.path) {
+        write_quoted(row.path, out);
+    } else {
+        out.extend_from_slice(row.path.as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
 }
 
 /// es's CSV header display names (cli.c:303-320) for the columns we emit.
@@ -153,8 +150,8 @@ mod tests {
         }
     }
 
-    fn file<'a>(path: &'a str, size: u64, mtime: &'static str) -> CsvRow<'a> {
-        CsvRow {
+    fn file<'a>(path: &'a str, size: u64, mtime: &'static str) -> Row<'a> {
+        Row {
             path,
             size: Some(size),
             mtime: Some(mtime),
@@ -162,7 +159,7 @@ mod tests {
         }
     }
 
-    fn write(opts: &CsvOptions, rows: Vec<CsvRow<'_>>) -> Vec<u8> {
+    fn write(opts: &CsvOptions, rows: Vec<Row<'_>>) -> Vec<u8> {
         let mut out = Vec::new();
         write_csv(opts, rows, &mut out);
         out
@@ -195,19 +192,19 @@ mod tests {
         // Directories get an empty Size even when a size is present, and
         // when it is None; a file with size None is also empty.
         let rows = vec![
-            CsvRow {
+            Row {
                 path: "C:\\proj\\sub",
                 size: None,
                 mtime: Some("2026-07-12T09:01:00"),
                 is_dir: true,
             },
-            CsvRow {
+            Row {
                 path: "C:\\proj\\sized-dir",
                 size: Some(4096),
                 mtime: None,
                 is_dir: true,
             },
-            CsvRow {
+            Row {
                 path: "C:\\proj\\unknown.bin",
                 size: None,
                 mtime: None,
@@ -455,7 +452,7 @@ mod tests {
             let mut out = Vec::new();
             write_csv(
                 &opts,
-                rows.iter().map(|(path, size, mtime, is_dir)| CsvRow {
+                rows.iter().map(|(path, size, mtime, is_dir)| Row {
                     path,
                     size: *size,
                     mtime: mtime.as_deref(),

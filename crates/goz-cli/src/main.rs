@@ -100,7 +100,7 @@ use win::execute;
 mod win {
     use super::client::{Client, ClientError};
     use goz_core::escompat::{EsPlan, Exit, VERSION_LINE};
-    use goz_core::output::{CsvOptions, CsvRow, filetime_to_unix_ms, write_csv};
+    use goz_core::output::{CsvOptions, Format, ResultWriter, filetime_to_unix_ms};
     use goz_core::proto::{PROTO_VERSION, QueryRequest, QueryResults, Request, Response};
     use goz_core::types::{EsColumn, SortSpec};
     use std::io::Write;
@@ -149,10 +149,7 @@ mod win {
                 );
                 return Err(Exit::Untrusted.into());
             }
-            Err(ClientError::Protocol(m)) => {
-                eprintln!("goz: {m}");
-                return Err(Exit::Protocol.into());
-            }
+            Err(error) => return Err(request_failed(error)),
         };
 
         if plan.server_version {
@@ -162,48 +159,135 @@ mod win {
             return status(&mut connection);
         }
 
-        let request = Request::Query(build_query(&plan));
-        let results = match connection.request(&request) {
-            Ok(Response::Results(r)) => r,
-            Ok(Response::Error { message, .. }) => {
-                eprintln!("goz: {message}");
-                return Err(Exit::BadParam.into());
-            }
-            Ok(_) => {
-                eprintln!("goz: unexpected reply from daemon");
-                return Err(Exit::Protocol.into());
-            }
-            Err(error) => return Err(request_failed(error)),
-        };
-
-        if results.volumes_incomplete {
-            eprintln!(
-                "goz: warning: some volumes are still indexing or unavailable; results may be incomplete"
-            );
+        let query = build_query(&plan);
+        if !plan.result_count && !plan.total_size {
+            return stream(&plan, &mut connection, query, export_file);
         }
 
+        // A count or a total size comes in one page with no rows.
+        let mut warning = IncompleteWarning::default();
+        let mut head = None;
+        connection
+            .query(query, |page| {
+                warning.check(&page);
+                head.get_or_insert(page);
+                Ok::<(), ClientError>(())
+            })
+            .map_err(request_failed)?;
+        let results = head.expect("a query that succeeds delivers a page");
         if plan.result_count {
             return number_only(&plan, results.total, export_file);
         }
-        if plan.total_size {
-            // A gozd predating the field ignores the ask; 0 would be a lie.
-            let Some(size) = results.total_size else {
-                eprintln!(
-                    "goz: the running gozd does not report total sizes; restart the goz service to run the installed version"
-                );
-                return Err(Exit::Protocol.into());
-            };
-            if results.metadata_pending {
-                eprintln!(
-                    "goz: warning: some file sizes are not read yet; the total leaves them out"
-                );
-            }
-            if size == u64::MAX {
-                eprintln!("goz: warning: the total is at least {size} bytes, the most goz reports");
-            }
-            return number_only(&plan, size, export_file);
+        // A gozd predating the field ignores the ask; 0 would be a lie.
+        let Some(size) = results.total_size else {
+            eprintln!(
+                "goz: the running gozd does not report total sizes; restart the goz service to run the installed version"
+            );
+            return Err(Exit::Protocol.into());
+        };
+        if results.metadata_pending {
+            eprintln!("goz: warning: some file sizes are not read yet; the total leaves them out");
         }
-        emit(&plan, &results, export_file)
+        if size == u64::MAX {
+            eprintln!("goz: warning: the total is at least {size} bytes, the most goz reports");
+        }
+        number_only(&plan, size, export_file)
+    }
+
+    /// Why a streamed search stopped before its last page.
+    enum Stop {
+        /// The daemon's reply failed.
+        Client(ClientError),
+        /// A page could not be written out.
+        Output(std::io::Error),
+    }
+
+    impl From<ClientError> for Stop {
+        fn from(e: ClientError) -> Self {
+            Self::Client(e)
+        }
+    }
+
+    /// The warning that volumes are still indexing, printed once, when the
+    /// first page that says so arrives and before its rows.
+    #[derive(Default)]
+    struct IncompleteWarning {
+        printed: bool,
+    }
+
+    impl IncompleteWarning {
+        fn check(&mut self, page: &QueryResults) {
+            if page.volumes_incomplete && !self.printed {
+                self.printed = true;
+                eprintln!(
+                    "goz: warning: some volumes are still indexing or unavailable; results may be incomplete"
+                );
+            }
+        }
+    }
+
+    /// Writes the results to the export file as CSV, or to stdout as JSON or
+    /// one path per line, a page at a time as the pages arrive, so the
+    /// client's memory stays at one page and the first rows show at once. A
+    /// failure partway leaves what was written, and the exit code says the
+    /// output is incomplete.
+    fn stream(
+        plan: &EsPlan,
+        connection: &mut Client,
+        query: QueryRequest,
+        export_file: Option<std::fs::File>,
+    ) -> Result<ExitCode, ExitCode> {
+        let format = match &export_file {
+            Some(_) => Format::Csv(CsvOptions {
+                bom: plan.bom,
+                header: plan.header,
+                double_quote: plan.double_quote,
+                columns: plan.columns.clone(),
+            }),
+            None if plan.json => Format::Json,
+            None => Format::Plain,
+        };
+        // Local time, ISO 8601, so the JavaScript consumer's `new Date()`
+        // parses it regardless of locale. The time zone is resolved once,
+        // and only when a date is shown.
+        let want_date = export_file.is_some() && plan.columns.contains(&EsColumn::DateModified);
+        let tz = want_date.then(jiff::tz::TimeZone::system);
+        let date = |ft| {
+            tz.as_ref()
+                .map_or_else(String::new, |tz| format_date_local(ft, tz))
+        };
+        let mut writer = ResultWriter::new(format, date);
+
+        // A plain page ends in LF, so stdout's LineWriter hands it on in one
+        // write; of a JSON page it keeps back only the part after the last LF.
+        let (mut out, to): (Box<dyn Write>, &str) = match export_file {
+            Some(file) => (Box::new(file), "export CSV"),
+            None => (Box::new(std::io::stdout().lock()), "results"),
+        };
+        let mut warning = IncompleteWarning::default();
+        let mut buf = Vec::new();
+        let fetched = connection.query(query, |page| {
+            warning.check(&page);
+            buf.clear();
+            writer.page(&page, &mut buf);
+            out.write_all(&buf).map_err(Stop::Output)
+        });
+        match fetched {
+            Ok(()) => {}
+            Err(Stop::Output(e)) => return Err(super::output_failed(&e, to)),
+            Err(Stop::Client(e)) => {
+                // Keep the pages already written: the exit code marks them
+                // incomplete.
+                let _ = out.flush();
+                return Err(request_failed(e));
+            }
+        }
+        buf.clear();
+        writer.finish(&mut buf);
+        if let Err(e) = out.write_all(&buf).and_then(|()| out.flush()) {
+            return Err(super::output_failed(&e, to));
+        }
+        Ok(ExitCode::SUCCESS)
     }
 
     fn build_query(plan: &EsPlan) -> QueryRequest {
@@ -249,54 +333,6 @@ mod win {
         }
     }
 
-    fn emit(
-        plan: &EsPlan,
-        results: &QueryResults,
-        export_file: Option<std::fs::File>,
-    ) -> Result<ExitCode, ExitCode> {
-        if let Some(mut file) = export_file {
-            let bytes = render_csv(plan, results);
-            if let Err(e) = file.write_all(&bytes) {
-                return Err(super::output_failed(&e, "export CSV"));
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
-
-        if plan.json {
-            match serde_json::to_string_pretty(results) {
-                Ok(s) => {
-                    // A locked writeln! instead of println!, which panics on any
-                    // stdout write error.
-                    let stdout = std::io::stdout();
-                    let mut out = stdout.lock();
-                    if let Err(e) = writeln!(out, "{s}").and_then(|()| out.flush()) {
-                        return Err(super::output_failed(&e, "results"));
-                    }
-                }
-                Err(e) => {
-                    eprintln!("goz: JSON encoding failed: {e}");
-                    return Err(Exit::Protocol.into());
-                }
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
-
-        // Default: one path per line. StdoutLock is a LineWriter (it flushes on every
-        // newline), so wrap it in a BufWriter to batch a large result set into a few
-        // writes.
-        let stdout = std::io::stdout();
-        let mut out = std::io::BufWriter::new(stdout.lock());
-        for item in &results.items {
-            if let Err(e) = writeln!(out, "{}", item.path) {
-                return Err(super::output_failed(&e, "results"));
-            }
-        }
-        if let Err(e) = out.flush() {
-            return Err(super::output_failed(&e, "results"));
-        }
-        Ok(ExitCode::SUCCESS)
-    }
-
     /// `-get-result-count` and `-get-total-size`: the number alone, on stdout
     /// or, as es writes it, in the export file after its byte order mark.
     fn number_only(
@@ -316,41 +352,6 @@ mod win {
             return Err(super::output_failed(&e, "export CSV"));
         }
         Ok(ExitCode::SUCCESS)
-    }
-
-    /// Renders the results as an es-compatible CSV.
-    fn render_csv(plan: &EsPlan, results: &QueryResults) -> Vec<u8> {
-        let opts = CsvOptions {
-            bom: plan.bom,
-            header: plan.header,
-            double_quote: plan.double_quote,
-            columns: plan.columns.clone(),
-        };
-
-        // Pre-format dates (CsvRow borrows them). Local time, ISO-8601, so the
-        // JavaScript consumer's `new Date()` parses it regardless of locale. Resolve
-        // the system time zone ONCE (it is loop-invariant) instead of per row.
-        let want_date = plan.columns.contains(&EsColumn::DateModified);
-        let tz = want_date.then(jiff::tz::TimeZone::system);
-        let dates: Vec<Option<String>> = results
-            .items
-            .iter()
-            .map(|it| {
-                tz.as_ref()
-                    .and_then(|tz| it.mtime_ft.map(|ft| format_date_local(ft, tz)))
-            })
-            .collect();
-
-        let rows = results.items.iter().zip(&dates).map(|(it, date)| CsvRow {
-            path: &it.path,
-            size: it.size,
-            mtime: date.as_deref(),
-            is_dir: it.is_dir,
-        });
-
-        let mut out = Vec::new();
-        write_csv(&opts, rows, &mut out);
-        out
     }
 
     /// Formats a Windows FILETIME as local `YYYY-MM-DDTHH:MM:SS` in `tz` (resolved
@@ -412,6 +413,10 @@ mod win {
             ClientError::Protocol(m) => {
                 eprintln!("goz: {m}");
                 Exit::Protocol.into()
+            }
+            ClientError::Refused(m) => {
+                eprintln!("goz: {m}");
+                Exit::BadParam.into()
             }
             ClientError::Unreachable => {
                 eprintln!("{ES_NOT_RUNNING}");

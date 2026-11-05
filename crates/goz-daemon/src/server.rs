@@ -50,9 +50,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// write returns once the pipe has buffered the page, so this bounds the wait
 /// for the page before it, and the wait for the client's next request covers
 /// the last one. Long, so a client that streams pages to a console its user
-/// has paused is not cut off.
-/// goz's own CLI reads the whole reply before it prints and gives up after
-/// 30 s, so it never comes near this.
+/// has paused is not cut off. goz's own CLI streams pages to its output, so a
+/// paused console or reader holds the reply here.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Pause after a failed pipe connect before listening again. A connect fails
 /// only on an unexpected `ConnectNamedPipe` error (a client that closed before

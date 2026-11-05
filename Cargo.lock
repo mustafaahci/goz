@@ -406,7 +406,6 @@ dependencies = [
  "goz-winfs",
  "jiff",
  "mimalloc",
- "serde_json",
 ]
 
 [[package]]

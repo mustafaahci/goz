@@ -8,7 +8,9 @@ use std::fmt;
 use std::io;
 use std::time::{Duration, Instant};
 
-use goz_core::proto::{FrameDecoder, MAX_SERVER_FRAME, Response, decode_response_frame};
+use goz_core::proto::{
+    FrameDecoder, MAX_SERVER_FRAME, QueryResults, Response, decode_response_frame,
+};
 
 /// How long the daemon may stay silent before the client gives up, so a
 /// wedged but alive daemon cannot hang it forever. It counts from the start
@@ -40,8 +42,12 @@ pub(crate) enum ReplyError {
     Closed,
     /// Reading the pipe failed.
     Read(io::Error),
-    /// The daemon sent a frame the client cannot decode.
+    /// The daemon sent a frame the client cannot decode, or one that does
+    /// not answer the request.
     Malformed(String),
+    /// The daemon answered a query with an error, such as a query it cannot
+    /// parse.
+    Refused(String),
 }
 
 impl fmt::Display for ReplyError {
@@ -50,7 +56,7 @@ impl fmt::Display for ReplyError {
             Self::Silent => f.write_str("daemon did not reply in time"),
             Self::Closed => f.write_str("daemon closed the connection"),
             Self::Read(e) => e.fmt(f),
-            Self::Malformed(m) => f.write_str(m),
+            Self::Malformed(m) | Self::Refused(m) => f.write_str(m),
         }
     }
 }
@@ -108,12 +114,39 @@ impl Replies {
             deadline = io.now() + READ_DEADLINE;
         }
     }
+
+    /// Reads a query's reply, handing each results page to `page` as it
+    /// arrives, until the last. The first error `page` returns stops the
+    /// reading there, so a reader that went away costs no further page.
+    pub(crate) fn query<E: From<ReplyError>>(
+        &mut self,
+        io: &mut impl PipeIo,
+        mut page: impl FnMut(QueryResults) -> Result<(), E>,
+    ) -> Result<(), E> {
+        loop {
+            match self.next(io)? {
+                Response::Results(results) => {
+                    let more = results.more;
+                    page(results)?;
+                    if !more {
+                        return Ok(());
+                    }
+                }
+                Response::Error { message, .. } => {
+                    return Err(ReplyError::Refused(message).into());
+                }
+                _ => {
+                    return Err(ReplyError::Malformed("unexpected reply from daemon".into()).into());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use goz_core::proto::encode_response_frame;
+    use goz_core::proto::{ProtoError, encode_response_frame};
     use std::collections::VecDeque;
 
     /// What the fake pipe does next.
@@ -190,9 +223,39 @@ mod tests {
     }
 
     fn frame(n: usize) -> Step {
+        bytes(&reply(n))
+    }
+
+    fn bytes(reply: &Response) -> Step {
         let mut bytes = Vec::new();
-        encode_response_frame(&reply(n), &mut bytes);
+        encode_response_frame(reply, &mut bytes);
         Step::Bytes(bytes)
+    }
+
+    /// Results page `n` of three, told apart by its generation.
+    fn results(n: u64) -> Step {
+        bytes(&Response::Results(QueryResults {
+            total: 3,
+            items: Vec::new(),
+            more: n < 2,
+            volumes_incomplete: false,
+            metadata_pending: false,
+            generation: n,
+            total_size: None,
+        }))
+    }
+
+    /// Why a test query stopped.
+    #[derive(Debug)]
+    enum Stop {
+        Reply(ReplyError),
+        Page(io::Error),
+    }
+
+    impl From<ReplyError> for Stop {
+        fn from(e: ReplyError) -> Self {
+            Self::Reply(e)
+        }
     }
 
     /// Ten replies, each after half the deadline of silence, take 150 s in
@@ -271,6 +334,60 @@ mod tests {
         assert!(
             matches!(&malformed, Err(ReplyError::Malformed(m)) if m.contains("tag 9")),
             "{malformed:?}"
+        );
+    }
+
+    /// Every page reaches the caller in order, and the last one ends the
+    /// reading: what follows it stays unread.
+    #[test]
+    fn a_query_hands_over_each_page_until_the_last() {
+        let mut io = Scripted::new(vec![results(0), results(1), results(2), frame(9)]);
+        let mut seen = Vec::new();
+        let done = Replies::new().query(&mut io, |page| {
+            seen.push(page.generation);
+            Ok::<(), Stop>(())
+        });
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(seen, [0, 1, 2]);
+        assert_eq!(io.steps.len(), 1);
+    }
+
+    /// A page that cannot be written out stops the query at once: its
+    /// error comes back, and the pages after it stay unread.
+    #[test]
+    fn a_failed_page_stops_the_query() {
+        let mut io = Scripted::new(vec![results(0), results(1), results(2)]);
+        let mut calls = 0;
+        let stopped = Replies::new().query(&mut io, |_| {
+            calls += 1;
+            Err(Stop::Page(io::ErrorKind::BrokenPipe.into()))
+        });
+        assert!(
+            matches!(&stopped, Err(Stop::Page(e)) if e.kind() == io::ErrorKind::BrokenPipe),
+            "{stopped:?}"
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(io.steps.len(), 2);
+    }
+
+    /// An error frame for a query is gozd refusing it, which exits 4; any
+    /// other reply that is not a page is malformed, which exits 7.
+    #[test]
+    fn an_error_frame_is_a_refusal() {
+        let refusal = bytes(&Response::Error {
+            code: ProtoError::BadQuery,
+            message: "unbalanced quote".into(),
+        });
+        let refused =
+            Replies::new().query(&mut Scripted::new(vec![refusal]), |_| Ok::<(), Stop>(()));
+        assert!(
+            matches!(&refused, Err(Stop::Reply(ReplyError::Refused(m))) if m == "unbalanced quote"),
+            "{refused:?}"
+        );
+        let odd = Replies::new().query(&mut Scripted::new(vec![frame(0)]), |_| Ok::<(), Stop>(()));
+        assert!(
+            matches!(&odd, Err(Stop::Reply(ReplyError::Malformed(m))) if m == "unexpected reply from daemon"),
+            "{odd:?}"
         );
     }
 }

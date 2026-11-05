@@ -7,9 +7,9 @@ use std::io::{self, Read, Write};
 use std::os::windows::io::AsHandle;
 use std::time::{Duration, Instant};
 
-use goz_core::proto::{PIPE_NAME, QueryResults, Request, Response, encode_request};
+use goz_core::proto::{PIPE_NAME, QueryRequest, QueryResults, Request, Response, encode_request};
 
-use crate::reply::{PipeIo, Replies};
+use crate::reply::{PipeIo, Replies, ReplyError};
 
 /// Opening the pipe with an anonymous impersonation level (`SECURITY_ANONYMOUS`,
 /// value 0, so only the SQOS-present bit is set) prevents a rogue server that
@@ -27,6 +27,8 @@ pub(crate) enum ClientError {
     Untrusted,
     /// The daemon replied with something malformed or timed out.
     Protocol(String),
+    /// The daemon refused the query, with its reason.
+    Refused(String),
 }
 
 pub(crate) struct Client {
@@ -103,41 +105,54 @@ impl Client {
         })
     }
 
-    /// Sends one request and reads the framed response.
-    ///
-    /// A `Results` response may span multiple frames (the daemon pages large
-    /// result sets, setting `more` on all but the last); these are accumulated
-    /// transparently into a single [`Response::Results`]. Each wait gives up
-    /// once the daemon has been silent for the deadline [`Replies`] keeps.
+    /// Sends a request answered in one frame, such as `Hello` or `Status`,
+    /// and reads that frame. The wait gives up once the daemon has been
+    /// silent for the deadline [`Replies`] keeps.
     pub(crate) fn request(&mut self, req: &Request) -> Result<Response, ClientError> {
+        self.send(req)?;
+        Ok(self.replies.next(&mut Pipe(&self.pipe))?)
+    }
+
+    /// Runs a search, handing each results page to `page` as it arrives, so
+    /// the client holds one page at a time however many match. It ends after
+    /// the last page, or at the first error, `page`'s own included; a query
+    /// gozd refuses ends in [`ClientError::Refused`].
+    pub(crate) fn query<E: From<ClientError>>(
+        &mut self,
+        q: QueryRequest,
+        mut page: impl FnMut(QueryResults) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.send(&Request::Query(q))?;
+        self.replies
+            .query(&mut Pipe(&self.pipe), |p| page(p).map_err(Relay))
+            .map_err(|Relay(e)| e)
+    }
+
+    fn send(&mut self, req: &Request) -> Result<(), ClientError> {
         let mut out = Vec::new();
         encode_request(req, &mut out);
         self.pipe
             .write_all(&out)
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+            .map_err(|e| ClientError::Protocol(e.to_string()))
+    }
+}
 
-        let mut merged: Option<QueryResults> = None;
-        loop {
-            let reply = self
-                .replies
-                .next(&mut Pipe(&self.pipe))
-                .map_err(|e| ClientError::Protocol(e.to_string()))?;
-            match reply {
-                Response::Results(page) => {
-                    let more = page.more;
-                    match &mut merged {
-                        None => merged = Some(page),
-                        Some(acc) => acc.items.extend(page.items),
-                    }
-                    if !more {
-                        let mut done = merged.take().expect("at least one Results page");
-                        done.more = false;
-                        return Ok(Response::Results(done));
-                    }
-                }
-                other => return Ok(other),
-            }
+impl From<ReplyError> for ClientError {
+    fn from(e: ReplyError) -> Self {
+        match e {
+            ReplyError::Refused(message) => Self::Refused(message),
+            other => Self::Protocol(other.to_string()),
         }
+    }
+}
+
+/// The error of a [`Client::query`] page on its way through
+/// [`Replies::query`], which carries the reply's own errors the same way.
+struct Relay<E>(E);
+
+impl<E: From<ClientError>> From<ReplyError> for Relay<E> {
+    fn from(e: ReplyError) -> Self {
+        Self(ClientError::from(e).into())
     }
 }
 
