@@ -18,6 +18,8 @@
 //! shows it rather than hiding it. A file that is gone is left to its delete
 //! record.
 
+use std::collections::hash_map::Entry;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -37,6 +39,7 @@ use goz_winfs::{
     ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE,
     JournalInfo, VolumeHandle, read_usn_journal, stat_file,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bootstrap::{self, JournalSetup};
 use crate::pulse::TailPulse;
@@ -483,34 +486,36 @@ fn reconcile_links(
     if frns.is_empty() {
         return;
     }
-    let mut walked: Vec<(Frn, Vec<Vec<u16>>)> = Vec::new();
     let mut dropped = 0u64;
-
-    for &frn in frns {
-        // Teardown must not wait behind a long walk batch: each iteration is
-        // a blocking open, and dozens on a slow disk outlast the teardown
+    // Reason bits accumulate over an open-close window, so one hard-link
+    // change is listed once per record of its window: walk each file once.
+    let walks = walk_each_once(frns, |frn| {
+        // Teardown must not wait behind a long walk batch: each walk is a
+        // blocking open, and dozens on a slow disk outlast the teardown
         // deadline. The daemon is exiting; the results would never be served.
         if stop.load(Ordering::Relaxed) {
-            return;
+            return ControlFlow::Break(());
         }
         // Per-file progress IS liveness: without the stamp, a long batch on
         // a slow disk reads as a stale beat, which delays the supervisor's
         // budget refund and inches toward a spurious stall verdict.
         pulse.beat();
-        let links = match goz_winfs::link_paths(handle, frn.0) {
-            Ok(Some(l)) if !l.is_empty() => l,
+        ControlFlow::Continue(match goz_winfs::link_paths(handle, frn.0) {
+            Ok(Some(l)) if !l.is_empty() => Some(l),
             // Gone: its delete record removes it. (A walk always holds the
             // name it started from, so an empty set never reaches here.)
-            Ok(_) => continue,
+            Ok(_) => None,
             Err(e) => {
                 tracing::debug!(volume = %state.mount_prefix(), frn = frn.0, error = %e, "link walk failed");
                 dropped += 1;
-                continue;
+                None
             }
-        };
-
-        walked.push((frn, links));
-    }
+        })
+    });
+    let ControlFlow::Continue(walks) = walks else {
+        return;
+    };
+    let walked = in_batch_order(frns, &walks);
 
     if walked.is_empty() && dropped == 0 {
         return;
@@ -524,23 +529,56 @@ fn reconcile_links(
     }
 }
 
+/// A file's hard links, as volume-relative UTF-16 paths.
+type LinkPaths = Vec<Vec<u16>>;
+
+/// Calls `walk` once for each distinct FRN in `frns`, in the order first
+/// seen, and keeps what each walk found: its links, or `None` when the file
+/// is gone or the walk failed. Stops at the first `Break`.
+fn walk_each_once(
+    frns: &[Frn],
+    mut walk: impl FnMut(Frn) -> ControlFlow<(), Option<LinkPaths>>,
+) -> ControlFlow<(), FxHashMap<Frn, Option<LinkPaths>>> {
+    let mut walks = FxHashMap::default();
+    for &frn in frns {
+        if let Entry::Vacant(slot) = walks.entry(frn) {
+            slot.insert(walk(frn)?);
+        }
+    }
+    ControlFlow::Continue(walks)
+}
+
+/// The links found for `frns`, in the batch's order with its repeats, leaving
+/// out files that are gone or whose walk failed. A repeat resolves its folders
+/// again after the reconciles before it, see [`apply_link_walks`].
+fn in_batch_order<'a>(
+    frns: &[Frn],
+    walks: &'a FxHashMap<Frn, Option<LinkPaths>>,
+) -> Vec<(Frn, &'a [Vec<u16>])> {
+    frns.iter()
+        .filter_map(|&frn| Some((frn, walks.get(&frn)?.as_deref()?)))
+        .collect()
+}
+
 /// Reconciles each walked FRN to its link set, resolving the links' folders
 /// by path just before that FRN's own reconcile. One reconcile can reclaim a
 /// record's previous tenant, and a folder resolved before it ran could be that
 /// tenant, freed and handed to another entry by the time a later reconcile
-/// used it. Returns how many FRNs were skipped because a folder is not
-/// indexed: reconciling to a partial set would delete the links it could not
-/// resolve.
-fn apply_link_walks(index: &mut VolumeIndex, walked: &[(Frn, Vec<Vec<u16>>)]) -> u64 {
-    let mut dropped = 0u64;
-    'walks: for (frn, links) in walked {
+/// used it; an FRN listed again after such a reconcile resolves its folders
+/// anew, which puts its links back in the folder that is really there.
+/// Returns how many FRNs were left unreconciled because a folder is not
+/// indexed, each counted once: reconciling to a partial set would delete the
+/// links it could not resolve.
+fn apply_link_walks(index: &mut VolumeIndex, walked: &[(Frn, &[Vec<u16>])]) -> u64 {
+    let mut unreconciled = FxHashSet::default();
+    'walks: for &(frn, links) in walked {
         let mut targets = Vec::with_capacity(links.len());
         for wide in links {
             let mut bytes = Vec::new();
             let lossy = !goz_core::wtf8::from_utf16(wide, &mut bytes);
             let (dir, name) = split_parent(&bytes);
             let Some(parent) = resolve_scope(index, dir, false) else {
-                dropped += 1;
+                unreconciled.insert(frn);
                 continue 'walks;
             };
             targets.push(LinkTarget {
@@ -549,12 +587,12 @@ fn apply_link_walks(index: &mut VolumeIndex, walked: &[(Frn, Vec<Vec<u16>>)]) ->
             });
         }
         if targets.is_empty() {
-            dropped += 1;
+            unreconciled.insert(frn);
             continue;
         }
-        index.reconcile_links(*frn, &targets);
+        index.reconcile_links(frn, &targets);
     }
-    dropped
+    unreconciled.len() as u64
 }
 
 /// Splits a volume-relative path into (parent dir, file name) at the last
@@ -887,7 +925,8 @@ fn mark_failed(state: &VolumeState, reason: RescanReason, detail: &str) {
 mod tests {
     use super::{
         DEGRADE_AFTER, ESCALATE_AFTER, JOURNAL_WAIT_MAX, REASON_MASK, RETRY_BACKOFF_MAX,
-        RETRY_BACKOFF_MIN, apply_link_walks, install, wait_for_journal,
+        RETRY_BACKOFF_MIN, apply_link_walks, in_batch_order, install, wait_for_journal,
+        walk_each_once,
     };
     use crate::bootstrap::{BuiltIndex, JournalSetup};
     use crate::pulse::TailPulse;
@@ -898,6 +937,7 @@ mod tests {
     use goz_core::usn::ops_for;
     use goz_core::usn::record::ParsedUsnRecord;
     use parking_lot::{Mutex, RwLock};
+    use std::ops::ControlFlow;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -1109,9 +1149,10 @@ mod tests {
         ]);
         let wide = |p: &str| p.encode_utf16().collect::<Vec<u16>>();
 
+        let (f1_links, f2_links) = (vec![wide(r"\f1.txt")], vec![wide(r"\d\x.txt")]);
         let dropped = apply_link_walks(
             &mut index,
-            &[(f1, vec![wide(r"\f1.txt")]), (f2, vec![wide(r"\d\x.txt")])],
+            &[(f1, f1_links.as_slice()), (f2, f2_links.as_slice())],
         );
 
         assert_eq!(dropped, 0);
@@ -1120,6 +1161,107 @@ mod tests {
         let mut path = Vec::new();
         index.path_of(index.head_of(f2).unwrap(), &mut path);
         assert_eq!(path, br"d\x.txt");
+    }
+
+    /// One hard-link change is listed once per record of its open-close
+    /// window. Each file is walked once, in the order first seen, and a stop
+    /// ends the walks.
+    #[test]
+    fn each_file_is_walked_once() {
+        let (a, b) = (Frn(400 | 1 << 48), Frn(401 | 1 << 48));
+        let mut asked = Vec::new();
+        let walks = walk_each_once(&[a, b, a, b, a], |frn| {
+            asked.push(frn);
+            ControlFlow::Continue(None)
+        });
+        assert_eq!(asked, [a, b]);
+        assert!(matches!(walks, ControlFlow::Continue(w) if w.len() == 2));
+
+        let mut asked = Vec::new();
+        let walks = walk_each_once(&[a, b, a], |frn| {
+            asked.push(frn);
+            ControlFlow::Break(())
+        });
+        assert_eq!(asked, [a]);
+        assert!(walks.is_break());
+    }
+
+    /// The walked links keep the batch's order and repeats, without the files
+    /// that are gone.
+    #[test]
+    fn walked_links_keep_the_batch_order() {
+        let (a, b, c) = (Frn(400 | 1 << 48), Frn(401 | 1 << 48), Frn(402 | 1 << 48));
+        let a_links = vec![vec![b'a' as u16]];
+        let c_links = vec![vec![b'c' as u16]];
+        let walks = rustc_hash::FxHashMap::from_iter([
+            (a, Some(a_links.clone())),
+            (b, None),
+            (c, Some(c_links.clone())),
+        ]);
+        assert_eq!(
+            in_batch_order(&[a, b, c, a], &walks),
+            [
+                (a, a_links.as_slice()),
+                (c, c_links.as_slice()),
+                (a, a_links.as_slice())
+            ]
+        );
+    }
+
+    /// A file listed again after another file's reconcile resolves its folders
+    /// anew. Here the first pass puts the file's links in a stale `d` whose
+    /// record the other file then takes over, which sends them to lost+found,
+    /// and only the second pass puts them back in the `d` that is there.
+    #[test]
+    fn a_file_listed_again_is_applied_again() {
+        let root = NTFS_ROOT_FRN;
+        let frn = |record: u64, seq: u64| Frn((seq << 48) | record);
+        let (d_old, d_new) = (frn(100, 3), frn(300, 1));
+        let (taker, file) = (frn(100, 4), frn(400, 1));
+        let mut index = VolumeIndex::new(root, FrnMap::sparse());
+        index.apply_batch(&[
+            created(d_old, root, "d", true),
+            created(d_new, root, "d", true),
+            created(file, d_new, "x.txt", false),
+        ]);
+        let wide = |p: &str| p.encode_utf16().collect::<Vec<u16>>();
+        let file_links = vec![wide(r"\d\x.txt"), wide(r"\d\y.txt")];
+        let taker_links = vec![wide(r"\f1.txt")];
+
+        let dropped = apply_link_walks(
+            &mut index,
+            &[
+                (file, file_links.as_slice()),
+                (taker, taker_links.as_slice()),
+                (file, file_links.as_slice()),
+            ],
+        );
+
+        assert_eq!(dropped, 0);
+        let mut link = index.head_of(file).expect("the file is indexed");
+        let mut paths = Vec::new();
+        while link != goz_core::types::NIL {
+            let mut path = Vec::new();
+            index.path_of(link, &mut path);
+            paths.push(String::from_utf8(path).unwrap());
+            link = index.entry(link).next_link();
+        }
+        paths.sort();
+        assert_eq!(paths, [r"d\x.txt", r"d\y.txt"]);
+    }
+
+    /// A file whose links name a folder the index lacks is counted once as
+    /// not reconciled, however often the batch lists it.
+    #[test]
+    fn an_unreconciled_file_is_counted_once() {
+        let file = Frn(400 | 1 << 48);
+        let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let links: Vec<Vec<u16>> = vec![r"\missing\x.txt".encode_utf16().collect()];
+        let dropped = apply_link_walks(
+            &mut index,
+            &[(file, links.as_slice()), (file, links.as_slice())],
+        );
+        assert_eq!(dropped, 1);
     }
 
     /// A rescan publishes the flags of the index it built, not the ones its
