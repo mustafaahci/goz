@@ -40,6 +40,8 @@ mod pipe_sd;
 #[cfg(windows)]
 mod pipe_trust;
 #[cfg(windows)]
+mod process;
+#[cfg(windows)]
 mod service;
 #[cfg(windows)]
 mod time_zone;
@@ -94,6 +96,9 @@ pub use pipe_sd::{PipeSecurity, build_pipe_security};
 
 #[cfg(windows)]
 pub use pipe_trust::{pipe_bytes_available, pipe_server_is_trusted};
+
+#[cfg(windows)]
+pub use process::process_age;
 
 #[cfg(windows)]
 pub use service::{ServiceState, service_state};

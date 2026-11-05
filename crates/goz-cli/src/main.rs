@@ -29,6 +29,8 @@ mod not_running;
 mod reply;
 #[cfg(any(windows, test))]
 mod status;
+#[cfg(windows)]
+mod timing;
 
 use goz_core::escompat::{Command, Exit, VERSION_LINE, help, parse_argv};
 use std::ffi::OsString;
@@ -100,6 +102,7 @@ use win::execute;
 #[cfg(windows)]
 mod win {
     use super::client::{Client, ClientError};
+    use super::timing::Timing;
     use goz_core::escompat::{EsPlan, Exit, VERSION_LINE};
     use goz_core::output::{
         CsvOptions, DigitGrouping, Format, PlainOptions, ResultWriter, filetime_to_unix_ms,
@@ -108,6 +111,7 @@ mod win {
     use goz_core::types::{EsColumn, SortSpec};
     use std::io::Write;
     use std::process::ExitCode;
+    use std::time::Instant;
 
     /// es's line for a missing Everything, kept verbatim for consumers that
     /// grep stderr.
@@ -115,13 +119,21 @@ mod win {
         "Error 8: Everything IPC window not found. Please make sure Everything is running.";
 
     pub(crate) fn execute(plan: EsPlan) -> ExitCode {
-        match run(plan) {
+        // With `GOZ_TIMING` set, stderr gets where this run spent its time.
+        let mut timing = std::env::var_os("GOZ_TIMING")
+            .filter(|v| !v.is_empty())
+            .map(|_| Timing::new(goz_winfs::process_age(), Instant::now()));
+        let code = match run(plan, &mut timing) {
             Ok(code) => code,
             Err(code) => code,
+        };
+        if let Some(timing) = &timing {
+            eprint!("{}", timing.report());
         }
+        code
     }
 
-    fn run(plan: EsPlan) -> Result<ExitCode, ExitCode> {
+    fn run(plan: EsPlan, timing: &mut Option<Timing>) -> Result<ExitCode, ExitCode> {
         // Create the export file up front (es semantics): a later daemon-unreachable
         // failure then leaves the observable artifact, a 0-byte file + exit 8.
         let export_file = match &plan.export_csv {
@@ -154,6 +166,9 @@ mod win {
             }
             Err(error) => return Err(request_failed(error)),
         };
+        if let Some(timing) = timing.as_mut() {
+            timing.connected();
+        }
 
         if plan.server_version {
             return server_version(&mut connection);
@@ -164,7 +179,7 @@ mod win {
 
         let query = build_query(&plan);
         if !plan.result_count && !plan.total_size {
-            return stream(&plan, &mut connection, query, export_file);
+            return stream(&plan, &mut connection, query, export_file, timing);
         }
 
         // A count or a total size comes in one page with no rows.
@@ -173,6 +188,9 @@ mod win {
         connection
             .query(query, |page| {
                 warning.check(&page);
+                if let Some(timing) = timing.as_mut() {
+                    timing.page(page.items.len());
+                }
                 head.get_or_insert(page);
                 Ok::<(), ClientError>(())
             })
@@ -239,6 +257,7 @@ mod win {
         connection: &mut Client,
         query: QueryRequest,
         export_file: Option<std::fs::File>,
+        timing: &mut Option<Timing>,
     ) -> Result<ExitCode, ExitCode> {
         let format = match &export_file {
             Some(_) => Format::Csv(CsvOptions {
@@ -287,7 +306,11 @@ mod win {
             warning.check(&page);
             buf.clear();
             writer.page(&page, &mut buf);
-            out.write_all(&buf).map_err(Stop::Output)
+            out.write_all(&buf).map_err(Stop::Output)?;
+            if let Some(timing) = timing.as_mut() {
+                timing.page(page.items.len());
+            }
+            Ok(())
         });
         match fetched {
             Ok(()) => {}
