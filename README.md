@@ -77,6 +77,8 @@ goz --status
 
 `goz` accepts a subset of `es.exe` flags (`-path`, `-n` / `-max-results`, the `-sort` family, `-size`, `-dm`, `-export-csv`, the CSV-shape switches, `-get-result-count` and `-get-total-size`) and matches `es.exe`'s exit codes. Unsupported switches exit `6`, the same as `es.exe`. A size or date sort lists the entries without that value last, whichever way it runs: folders, since goz keeps no folder sizes, and files whose size or date is not read yet.
 
+`--json` prints one object: `total` (every match), `items`, `more` (true when `-n` left matches out), `volumes_incomplete`, `metadata_pending` and `generation`.
+
 `goz -h` (or `-?`) prints a quick help and `goz --help` the full reference: every switch, the search syntax and the exit codes. `goz --version` prints the client's version and `goz --server-version` the running daemon's. None of them needs the daemon except `--server-version`.
 
 `dm:` (or `datemodified:`) takes `today`, `yesterday`, `thisweek`, `lastweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear`, a year, month or day (`2024`, `2024-05`, `2024-05-01`), or a duration back from now (`7days`, `last2hours`, `3months`), each optionally after `<`, `<=`, `>` or `>=`, or two of them as a range `2024-01-01..2024-03-31`. Days run between midnights in the machine's time zone, a week starts on the first day of the week of the service's regional format, and a file whose date goz has not read yet matches only `dm:unknown`.

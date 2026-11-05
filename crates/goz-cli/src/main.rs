@@ -244,7 +244,7 @@ mod win {
                 double_quote: plan.double_quote,
                 columns: plan.columns.clone(),
             }),
-            None if plan.json => Format::Json,
+            None if plan.json => Format::Json { limit: plan.limit },
             None => Format::Plain,
         };
         // Local time, ISO 8601, so the JavaScript consumer's `new Date()`

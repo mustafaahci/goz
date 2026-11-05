@@ -7,14 +7,21 @@
 //! deeper by adding four spaces after each LF: serde_json escapes every
 //! control character inside a string, so each raw LF is between tokens.
 //! The tail holds the rest of the fields.
+//!
+//! `more` is the one field whose meaning differs from the wire's: there it
+//! says another page follows, here that `-n` left matches out.
 
 use crate::proto::{QueryResults, ResultItem};
 
 /// Where the `--json` object stands between pages.
 #[derive(Debug, Default)]
 pub(super) struct Json {
+    /// The `-n` the query ran with.
+    limit: Option<u32>,
     /// Whether the head is written.
     started: bool,
+    /// Every match, the first page's: every page repeats it.
+    total: u64,
     /// Whether an item is written, so the next one needs a comma.
     any_item: bool,
     /// Any page's, so one incomplete volume is never lost.
@@ -30,11 +37,20 @@ pub(super) struct Json {
 }
 
 impl Json {
+    /// The object of a query that ran with `-n` as `limit`.
+    pub(super) fn new(limit: Option<u32>) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+
     /// Appends the head on the first page, then the page's items.
     pub(super) fn page(&mut self, page: &QueryResults, out: &mut Vec<u8>) {
         if !self.started {
-            self.head(page.total, out);
+            self.total = page.total;
             self.total_size = page.total_size;
+            self.head(out);
         }
         self.volumes_incomplete |= page.volumes_incomplete;
         self.metadata_pending |= page.metadata_pending;
@@ -44,11 +60,17 @@ impl Json {
         }
     }
 
-    /// Appends the tail, with `more` as given, and an LF.
-    pub(super) fn tail(&mut self, more: bool, out: &mut Vec<u8>) {
+    /// Appends the tail and an LF.
+    ///
+    /// `more` is whether the limit left matches out, from the totals alone.
+    /// Counting the items instead would misread the rows the daemon drops
+    /// while paging, a file deleted since the scan or one without a full
+    /// path, as matches left out.
+    pub(super) fn tail(&mut self, out: &mut Vec<u8>) {
         if !self.started {
-            self.head(0, out);
+            self.head(out);
         }
+        let more = self.limit.is_some_and(|n| self.total > u64::from(n));
         out.extend_from_slice(if self.any_item { b"\n  ]" } else { b"]" });
         out.extend_from_slice(
             format!(
@@ -64,9 +86,11 @@ impl Json {
         out.extend_from_slice(b"\n}\n");
     }
 
-    fn head(&mut self, total: u64, out: &mut Vec<u8>) {
+    fn head(&mut self, out: &mut Vec<u8>) {
         self.started = true;
-        out.extend_from_slice(format!("{{\n  \"total\": {total},\n  \"items\": [").as_bytes());
+        out.extend_from_slice(
+            format!("{{\n  \"total\": {},\n  \"items\": [", self.total).as_bytes(),
+        );
     }
 
     fn item(&mut self, item: &ResultItem, out: &mut Vec<u8>) {

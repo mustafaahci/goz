@@ -20,8 +20,9 @@ pub enum Format {
     Csv(CsvOptions),
     /// One object for the whole result set, in the bytes
     /// `serde_json::to_string_pretty` gives a [`QueryResults`] holding every
-    /// item, then an LF.
-    Json,
+    /// item, then an LF. Its `more` says whether `limit`, the query's `-n`,
+    /// left matches out.
+    Json { limit: Option<u32> },
 }
 
 /// Writes results pages in one [`Format`].
@@ -54,7 +55,7 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
                 opts,
                 started: false,
             },
-            Format::Json => State::Json(Json::default()),
+            Format::Json { limit } => State::Json(Json::new(limit)),
         };
         Self { state, date }
     }
@@ -105,7 +106,7 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
                     write_csv_preamble(&opts, out);
                 }
             }
-            State::Json(mut json) => json.tail(false, out),
+            State::Json(mut json) => json.tail(out),
         }
     }
 }
@@ -273,7 +274,7 @@ mod tests {
             cuts in prop::collection::vec(0..12usize, 0..4),
         ) {
             let pages = paged(&header, &items, &cuts);
-            let out = String::from_utf8(written(Format::Json, &pages)).unwrap();
+            let out = String::from_utf8(written(Format::Json { limit: None }, &pages)).unwrap();
             prop_assert_eq!(out, pretty(&header, &items));
         }
     }
@@ -319,7 +320,7 @@ mod tests {
             assert_eq!(out, after_second);
         }
 
-        let mut writer = ResultWriter::new(Format::Json, date);
+        let mut writer = ResultWriter::new(Format::Json { limit: None }, date);
         let mut out = Vec::new();
         writer.page(&first, &mut out);
         let head = String::from_utf8(out).unwrap();
@@ -331,7 +332,43 @@ mod tests {
     /// With no page at all, `--json` still prints a whole object.
     #[test]
     fn json_with_no_page_is_an_empty_object() {
-        let out = String::from_utf8(written(Format::Json, &[])).unwrap();
+        let out = String::from_utf8(written(Format::Json { limit: None }, &[])).unwrap();
         assert_eq!(out, pretty(&page(0, Vec::new(), false), &[]));
+    }
+
+    /// The `--json` object for `pages` of a query run with `limit`.
+    fn json(limit: Option<u32>, pages: &[QueryResults]) -> serde_json::Value {
+        serde_json::from_slice(&written(Format::Json { limit }, pages)).unwrap()
+    }
+
+    /// `more` says whether `-n` left matches out, from the totals alone:
+    /// never without a limit, and with one only when more match than it
+    /// lets through.
+    #[test]
+    fn json_more_says_whether_the_limit_left_matches_out() {
+        for (total, limit, more) in [
+            (5, None, false),
+            (5, Some(5), false),
+            (5, Some(6), false),
+            (5, Some(4), true),
+            (5, Some(0), true),
+            (0, Some(0), false),
+        ] {
+            let object = json(limit, &[page(total, Vec::new(), false)]);
+            assert_eq!(object["more"], more, "total {total}, limit {limit:?}");
+        }
+    }
+
+    /// Rows the daemon drops while paging, a file deleted since the scan or
+    /// one without a full path, are not matches `-n` left out.
+    #[test]
+    fn json_more_ignores_rows_dropped_while_paging() {
+        let items = (0..3)
+            .map(|i| item(&format!(r"C:\{i}"), None, None, false))
+            .collect();
+        let object = json(None, &[page(5, items, false)]);
+        assert_eq!(object["total"], 5);
+        assert_eq!(object["items"].as_array().map(Vec::len), Some(3));
+        assert_eq!(object["more"], false);
     }
 }
