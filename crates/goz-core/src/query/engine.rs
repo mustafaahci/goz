@@ -469,6 +469,11 @@ fn name_matches(
 /// each name it is in, and finding the rest only to drop them was most of the
 /// pass.
 fn for_each_prefilter_hit(index: &VolumeIndex, needle: &[u8], mut f: impl FnMut(NameId)) {
+    // No name holds a NUL, but one separates each name from the next, so a
+    // needle holding a NUL could only match across names.
+    if needle.contains(&0) {
+        return;
+    }
     let driver = memmem::Finder::new(needle);
     let hay = index.folded_bytes();
     let pairs = index.name_pairs();
@@ -1767,6 +1772,8 @@ mod tests {
     /// Each live name holding the needle is reported once, however often it
     /// holds it, in id order, and a name right after a match or after a dead
     /// name is still found: the same names a check of every live name gives.
+    /// A needle holding a NUL matches no name, though the separators and a
+    /// dead name's zeroed bytes hold NULs.
     #[test]
     fn the_prefilter_reports_each_matching_name_once() {
         let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
@@ -1779,7 +1786,7 @@ mod tests {
         let mut gone = enum_rec(frn(105), NTFS_ROOT_FRN, "Gone.e", false);
         gone.reason = USN_REASON_FILE_DELETE;
         idx.apply_batch(&[gone]);
-        for needle in [&b"e"[..], b"ee", b"zz", b"the end", b"q"] {
+        for needle in [&b"e"[..], b"ee", b"zz", b"the end", b"q", b"\0", b"e\0b"] {
             let mut hits = Vec::new();
             for_each_prefilter_hit(&idx, needle, |id| hits.push(id));
             let every: Vec<NameId> = (0..idx.name_count() as NameId)
