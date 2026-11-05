@@ -579,7 +579,7 @@ fn stream_query_binary(
         push_results_header(
             &mut out,
             total,
-            0, // generation: unused by the CLI, matches the prior wire
+            0, // generation: always 0, see `QueryResults::generation`
             false,
             volumes_incomplete,
             metadata_pending,

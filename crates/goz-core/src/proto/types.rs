@@ -123,7 +123,9 @@ pub struct QueryResults {
     /// `true` → size/mtime enrichment has not finished; requested metadata
     /// columns may still be `None`.
     pub metadata_pending: bool,
-    /// Index generation the results were computed against.
+    /// Always 0, kept so the wire and `--json` keep their shape. A query can
+    /// span volumes that each have their own generation, so no one number
+    /// could say whether its results are still current.
     pub generation: u64,
     /// The summed size in bytes of every matching file, regardless of
     /// paging, when [`QueryRequest::want_total_size`] asked for it; `None`
