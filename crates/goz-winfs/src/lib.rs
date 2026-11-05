@@ -34,6 +34,8 @@ mod journal;
 #[cfg(windows)]
 mod links;
 #[cfg(windows)]
+mod number_format;
+#[cfg(windows)]
 mod pipe_sd;
 #[cfg(windows)]
 mod pipe_trust;
@@ -58,6 +60,8 @@ pub use cancel_io::{ThreadIoHandle, cancel_synchronous_io, current_thread_io_han
 pub use clock::awake_time;
 #[cfg(windows)]
 pub use device_notify::{DeviceEvent, DeviceNotification};
+#[cfg(windows)]
+pub use number_format::{NumberFormat, number_format};
 #[cfg(windows)]
 pub use time_zone::{TimeZone, first_day_of_week};
 #[cfg(windows)]
