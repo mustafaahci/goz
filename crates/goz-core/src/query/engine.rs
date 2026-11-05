@@ -18,6 +18,8 @@ use memchr::memmem;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::ops::Range;
+use std::sync::OnceLock;
 
 /// One matched entry. The daemon prepends the volume mount prefix to `path`
 /// and formats `mtime` for display.
@@ -340,7 +342,7 @@ pub fn run_query_refs(
 /// the matched names in name order and their same-name chains. No sort runs,
 /// and a 100-row page of a broad query leaves as soon as 100 entries have
 /// been walked. Everything else takes the candidate path: scan, order, slice.
-/// `allow_name_level` exists for the test that holds the two paths equal.
+/// `fast` exists for the test that holds the two paths equal.
 #[allow(clippy::too_many_arguments)]
 fn page_refs(
     index: &VolumeIndex,
@@ -351,31 +353,18 @@ fn page_refs(
     offset: u32,
     limit: Option<u32>,
     sum_sizes: bool,
-    allow_name_level: bool,
+    fast: bool,
 ) -> RefOutcome {
     let compiled = CompiledQuery::new(parsed, mount_prefix);
     // A scope at the root admits every entry with a path, as no scope does,
     // so it goes: kept, it would bar the name-level path, and `-path C:\ e`
     // ran three times slower than `e`.
     let scope = scope.filter(|&s| s != index.root());
-    if allow_name_level
-        && sort.key == SortKey::Name
-        && is_name_level(index, parsed, &compiled, scope)
-    {
-        let mut cp_buf = CodePointBuf::new();
-        let mut ext_scratch = Vec::new();
-        let (matched, total) = match_names(index, parsed, &compiled, &mut cp_buf, &mut ext_scratch);
-        let total_size = sum_sizes.then(|| {
-            files_size(
-                index,
-                matched
-                    .iter()
-                    .flat_map(|&id| index.name_chain(id))
-                    .filter(|&e| !index.is_synthetic(e)),
-            )
-        });
+    if fast && sort.key == SortKey::Name && is_name_level(index, parsed, &compiled, scope) {
+        let (matched, total) = match_names(index, parsed, &compiled);
+        let total_size = sum_sizes.then(|| names_files_size(index, &matched));
         let (start, end) = page_bounds(total as usize, offset, limit);
-        let refs = name_level_refs(index, matched, sort.dir, start, end);
+        let refs = name_level_refs(index, &matched, sort.dir, start, end);
         return RefOutcome {
             total,
             refs,
@@ -468,30 +457,43 @@ fn name_matches(
 /// the end of that name: a short needle like `e` occurs about three times in
 /// each name it is in, and finding the rest only to drop them was most of the
 /// pass.
-fn for_each_prefilter_hit(index: &VolumeIndex, needle: &[u8], mut f: impl FnMut(NameId)) {
+fn for_each_prefilter_hit(index: &VolumeIndex, needle: &[u8], f: impl FnMut(NameId)) {
+    for_each_prefilter_hit_in(index, needle, 0..index.name_count(), f);
+}
+
+/// [`for_each_prefilter_hit`] over the names with ids in `ids`. The arena
+/// holds the names in id order, so their bytes are one stretch of it, and a
+/// match cannot run past a name's end into the next range.
+fn for_each_prefilter_hit_in(
+    index: &VolumeIndex,
+    needle: &[u8],
+    ids: Range<usize>,
+    mut f: impl FnMut(NameId),
+) {
     // No name holds a NUL, but one separates each name from the next, so a
     // needle holding a NUL could only match across names.
-    if needle.contains(&0) {
+    if needle.contains(&0) || ids.is_empty() {
         return;
     }
     let driver = memmem::Finder::new(needle);
-    let hay = index.folded_bytes();
     let pairs = index.name_pairs();
-    if pairs.is_empty() {
-        return;
-    }
-    let mut cursor = 0usize;
+    let hay = index.folded_bytes();
+    let hay = &hay[..pairs
+        .get(ids.end)
+        .map_or(hay.len(), |p| p.folded.off as usize)];
+    let mut cursor = ids.start;
     let mut seeded = false;
-    let mut at = 0usize;
+    let mut at = pairs[ids.start].folded.off as usize;
     while let Some(rel) = hay.get(at..).and_then(|rest| driver.find(rest)) {
         let pos = at + rel;
         if !seeded {
-            cursor = pairs
-                .partition_point(|p| p.folded.off as usize <= pos)
-                .saturating_sub(1);
+            cursor = ids.start
+                + pairs[ids.clone()]
+                    .partition_point(|p| p.folded.off as usize <= pos)
+                    .saturating_sub(1);
             seeded = true;
         } else {
-            while cursor + 1 < pairs.len() && pairs[cursor + 1].folded.off as usize <= pos {
+            while cursor + 1 < ids.end && pairs[cursor + 1].folded.off as usize <= pos {
                 cursor += 1;
             }
         }
@@ -503,118 +505,260 @@ fn for_each_prefilter_hit(index: &VolumeIndex, needle: &[u8], mut f: impl FnMut(
     }
 }
 
-/// Every distinct name matching `parsed`, in id order, and the number of
-/// live non-synthetic entries bearing them. The count comes from each name's
-/// refcount, which is its chain length, so no entry is touched; the three
-/// names synthetic entries can bear are walked instead.
+/// A pass over the names splits them into chunks of at least this many,
+/// which run across cores, and one this small runs as a single chunk. Tests
+/// use one 64-id word, so that small indexes split too.
+const CHUNK_NAMES_MIN: usize = if cfg!(test) { 64 } else { 1 << 15 };
+
+/// How many 64-id words of a name set each chunk of a pass over `names`
+/// names covers: about four chunks per thread, so a chunk dense in matches
+/// does not hold the others up, and none below [`CHUNK_NAMES_MIN`].
+fn chunk_words(names: usize) -> usize {
+    names
+        .div_ceil(64)
+        .div_ceil(name_threads() * 4)
+        .max(CHUNK_NAMES_MIN / 64)
+}
+
+/// The pool the passes over the names run their chunks on. Rayon's global
+/// pool also runs the long sorts, of every match of a broad unlimited query
+/// or of a rebuilt name order, and a pass queued behind one of them held its
+/// caller's read lock, and so the volume's journal tail, for as long. `None`
+/// when the pool's threads could not start: the passes then use the global
+/// pool.
+fn name_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("goz-names-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// How many threads run the chunks of a pass over the names.
+fn name_threads() -> usize {
+    name_pool().map_or_else(rayon::current_num_threads, |pool| {
+        pool.current_num_threads()
+    })
+}
+
+/// Runs `pass`, a pass over `chunks` chunks of the names, on [`name_pool`],
+/// or on the calling thread when there is one chunk, so a small volume's
+/// query never waits for a pool.
+fn on_name_pool<R: Send>(chunks: usize, pass: impl FnOnce() -> R + Send) -> R {
+    match name_pool() {
+        Some(pool) if chunks > 1 => pool.install(pass),
+        _ => pass(),
+    }
+}
+
+/// The name ids that chunk `i` of a pass over `names` names covers, each
+/// chunk being `per` 64-id words.
+fn chunk_ids(i: usize, per: usize, names: usize) -> Range<usize> {
+    (i * per * 64).min(names)..((i + 1) * per * 64).min(names)
+}
+
+/// A set of name ids, one bit per id.
+struct NameSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl NameSet {
+    fn contains(&self, id: NameId) -> bool {
+        self.words[id as usize / 64] & (1 << (id % 64)) != 0
+    }
+
+    /// The ids in the set, ascending.
+    fn ids(&self) -> impl Iterator<Item = NameId> + '_ {
+        word_ids(0, &self.words)
+    }
+}
+
+/// The ids whose bits are set in `words`, the first word holding ids from
+/// `base` on, ascending.
+fn word_ids(base: usize, words: &[u64]) -> impl Iterator<Item = NameId> + '_ {
+    words.iter().enumerate().flat_map(move |(w, &word)| {
+        let mut word = word;
+        std::iter::from_fn(move || {
+            if word == 0 {
+                return None;
+            }
+            let bit = word.trailing_zeros() as usize;
+            word &= word - 1;
+            Some((base + w * 64 + bit) as NameId)
+        })
+    })
+}
+
+/// How many live entries, synthetic ones aside, bear name `id`: its refcount,
+/// which is its chain length, so no entry is touched, except for the three
+/// names synthetic entries can bear, whose chains are walked.
+fn entries_bearing(index: &VolumeIndex, id: NameId) -> u64 {
+    if index.name_may_bear_synthetic(id) {
+        index
+            .name_chain(id)
+            .filter(|&e| !index.is_synthetic(e))
+            .count() as u64
+    } else {
+        u64::from(index.name_refcount(id))
+    }
+}
+
+/// Every distinct name matching `parsed`, and the number of live
+/// non-synthetic entries bearing them (see [`entries_bearing`]).
+///
+/// The names are matched in chunks across cores. Each chunk sets bits in its
+/// own words of a set the caller allocated, and frees what it allocates
+/// itself: a buffer freed by another thread than the one that allocated it
+/// stays committed in that thread's heap, and the pool's threads never exit.
 fn match_names(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
     compiled: &CompiledQuery,
-    cp_buf: &mut CodePointBuf,
-    ext_scratch: &mut Vec<u8>,
-) -> (Vec<NameId>, u64) {
-    let mut ids: Vec<NameId> = Vec::new();
-    let mut verify = true;
-    if !parsed.match_case
-        && let Some(needle) = compiled.prefilter.as_deref()
-    {
-        for_each_prefilter_hit(index, needle, |id| ids.push(id));
-        verify = !compiled.prefilter_decides_name;
-    } else {
-        // Case-sensitive, or no literal to drive the arena scan: every live
-        // name is tested. Dead names are zero-filled and have no entries.
-        ids.extend((0..index.name_count() as NameId).filter(|&id| index.name_refcount(id) > 0));
-    }
-    let mut matched = Vec::with_capacity(ids.len());
-    let mut total = 0u64;
-    for id in ids {
-        if verify && !name_matches(index, parsed, compiled, id, cp_buf, ext_scratch) {
-            continue;
-        }
-        total += if index.name_may_bear_synthetic(id) {
-            index
-                .name_chain(id)
-                .filter(|&e| !index.is_synthetic(e))
-                .count() as u64
-        } else {
-            u64::from(index.name_refcount(id))
-        };
-        matched.push(id);
-    }
-    (matched, total)
+) -> (NameSet, u64) {
+    use rayon::prelude::*;
+    let names = index.name_count();
+    let per = chunk_words(names);
+    let needle = compiled.prefilter.as_deref().filter(|_| !parsed.match_case);
+    // Case-sensitive, or no literal to drive the arena scan: every live name
+    // is tested. Dead names are zero-filled and have no entries.
+    let verify = needle.is_none() || !compiled.prefilter_decides_name;
+    let mut words = vec![0u64; names.div_ceil(64)];
+    let chunks = words.len().div_ceil(per);
+    let (len, total) = on_name_pool(chunks, || {
+        words
+            .par_chunks_mut(per)
+            .enumerate()
+            .map(|(i, words)| {
+                let ids = chunk_ids(i, per, names);
+                let base = ids.start;
+                let mut cp_buf = CodePointBuf::new();
+                let mut ext_scratch = Vec::new();
+                let (mut len, mut total) = (0usize, 0u64);
+                let mut mark = |id: NameId| {
+                    if verify
+                        && !name_matches(index, parsed, compiled, id, &mut cp_buf, &mut ext_scratch)
+                    {
+                        return;
+                    }
+                    let at = id as usize - base;
+                    words[at / 64] |= 1 << (at % 64);
+                    len += 1;
+                    total += entries_bearing(index, id);
+                };
+                match needle {
+                    Some(needle) => for_each_prefilter_hit_in(index, needle, ids, &mut mark),
+                    None => ids
+                        .map(|id| id as NameId)
+                        .filter(|&id| index.name_refcount(id) > 0)
+                        .for_each(&mut mark),
+                }
+                (len, total)
+            })
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+    });
+    (NameSet { words, len }, total)
 }
 
-/// `matched` (any order) in name order: by folded bytes, then id. A sparse
-/// match set is sorted directly; a dense one filters the index's name order
-/// through a bitmap and merges in the few names still waiting unranked, so
-/// a broad query never sorts a million names.
-fn ordered_names(index: &VolumeIndex, mut matched: Vec<NameId>) -> Vec<NameId> {
-    let key = |id: NameId| (index.name_folded(id), id);
+/// The summed size of the files bearing a name in `matched`, as
+/// [`files_size`] counts it, chunk by chunk across cores.
+fn names_files_size(index: &VolumeIndex, matched: &NameSet) -> u64 {
+    use rayon::prelude::*;
+    let per = chunk_words(index.name_count());
+    on_name_pool(matched.words.len().div_ceil(per), || {
+        matched
+            .words
+            .par_chunks(per)
+            .enumerate()
+            .map(|(i, words)| {
+                files_size(
+                    index,
+                    word_ids(i * per * 64, words)
+                        .flat_map(|id| index.name_chain(id))
+                        .filter(|&e| !index.is_synthetic(e)),
+                )
+            })
+            .reduce(|| 0, u64::saturating_add)
+    })
+}
+
+/// The ids of `matched` in name order, by folded bytes then id, or the
+/// reverse for a descending sort, made as they are read: a broad query's
+/// first page reads a few names of the order, not all of it. A sparse set is
+/// sorted directly; a dense one is read off the index's name order and
+/// merged with the few matched names still waiting unranked, so a broad query
+/// never sorts a million names.
+fn names_in_order<'a>(
+    index: &'a VolumeIndex,
+    matched: &'a NameSet,
+    dir: SortDir,
+) -> Box<dyn Iterator<Item = NameId> + 'a> {
+    let key = move |id: NameId| (index.name_folded(id), id);
+    let desc = dir == SortDir::Desc;
     let order = index.name_order();
-    if order.is_empty() || matched.len() * 8 < order.len() {
-        matched.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
-        return matched;
-    }
-    let mut bits = vec![0u64; index.name_count().div_ceil(64)];
-    let mut waiting: Vec<NameId> = Vec::new();
-    for &id in &matched {
-        if index.name_is_ranked(id) {
-            bits[id as usize / 64] |= 1 << (id % 64);
-        } else {
-            waiting.push(id);
+    if order.is_empty() || matched.len * 8 < order.len() {
+        let mut ids: Vec<NameId> = matched.ids().collect();
+        ids.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
+        if desc {
+            ids.reverse();
         }
+        return Box::new(ids.into_iter());
     }
-    waiting.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
-    let mut ranked = order
+    let mut waiting: Vec<NameId> = index
+        .name_unranked()
         .iter()
         .copied()
-        .filter(|&id| bits[id as usize / 64] & (1 << (id % 64)) != 0)
-        .peekable();
-    let mut waiting = waiting.into_iter().peekable();
-    let mut seq = Vec::with_capacity(matched.len());
-    while let (Some(r), Some(w)) = (ranked.peek().copied(), waiting.peek().copied()) {
-        if key(w) < key(r) {
-            seq.push(w);
-            waiting.next();
-        } else {
-            seq.push(r);
-            ranked.next();
-        }
+        .filter(|&id| matched.contains(id))
+        .collect();
+    waiting.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
+    if desc {
+        waiting.reverse();
     }
-    seq.extend(ranked);
-    seq.extend(waiting);
-    seq
+    let ranked: Box<dyn Iterator<Item = NameId> + 'a> = if desc {
+        Box::new(order.iter().rev().copied())
+    } else {
+        Box::new(order.iter().copied())
+    };
+    let mut ranked = ranked.filter(move |&id| matched.contains(id)).peekable();
+    let mut waiting = waiting.into_iter().peekable();
+    Box::new(std::iter::from_fn(move || {
+        match (ranked.peek().copied(), waiting.peek().copied()) {
+            (Some(r), Some(w)) if (key(w) < key(r)) != desc => waiting.next(),
+            (Some(_), _) => ranked.next(),
+            (None, _) => waiting.next(),
+        }
+    }))
 }
 
 /// Rows `[start, end)` of a name-level query: walks the matched names in
 /// name order (reversed for a descending sort) and each name's same-name
-/// chain. Names with equal folded bytes form one group whose entries
-/// interleave by idx (descending when the sort is), exactly the
+/// chain, and stops at `end`. Names with equal folded bytes form one group
+/// whose entries interleave by idx (descending when the sort is), exactly the
 /// `(folded name, idx)` order the candidate comparator produces.
 fn name_level_refs(
     index: &VolumeIndex,
-    matched: Vec<NameId>,
+    matched: &NameSet,
     dir: SortDir,
     start: usize,
     end: usize,
 ) -> Vec<HitRef> {
-    let mut seq = ordered_names(index, matched);
-    if dir == SortDir::Desc {
-        seq.reverse();
+    if start >= end {
+        return Vec::new();
     }
+    let mut names = names_in_order(index, matched, dir).peekable();
     let mut refs = Vec::with_capacity((end - start).min(1 << 16));
     let mut group: Vec<EntryIdx> = Vec::new();
     let mut seen = 0usize;
-    let mut i = 0;
-    while i < seq.len() && seen < end {
-        let folded = index.name_folded(seq[i]);
-        let mut j = i + 1;
-        while j < seq.len() && index.name_folded(seq[j]) == folded {
-            j += 1;
-        }
+    while seen < end
+        && let Some(first) = names.next()
+    {
+        let folded = index.name_folded(first);
         group.clear();
-        for &id in &seq[i..j] {
+        group.extend(index.name_chain(first).filter(|&e| !index.is_synthetic(e)));
+        while let Some(id) = names.next_if(|&id| index.name_folded(id) == folded) {
             group.extend(index.name_chain(id).filter(|&e| !index.is_synthetic(e)));
         }
         // A chain is in link order, not idx order.
@@ -634,7 +778,6 @@ fn name_level_refs(
             }
             seen += 1;
         }
-        i = j;
     }
     refs
 }

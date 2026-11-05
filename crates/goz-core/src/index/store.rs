@@ -413,7 +413,7 @@ impl NameStore {
         &self.unranked
     }
 
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn is_ranked(&self, id: NameId) -> bool {
         self.rank_of[id as usize] != UNRANKED
     }

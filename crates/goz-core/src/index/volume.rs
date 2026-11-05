@@ -1291,9 +1291,11 @@ impl VolumeIndex {
         self.names.order()
     }
 
+    /// Ids interned since the name order was last merged, so not in it; see
+    /// `NameStore::unranked`.
     #[inline]
-    pub(crate) fn name_is_ranked(&self, id: NameId) -> bool {
-        self.names.is_ranked(id)
+    pub(crate) fn name_unranked(&self) -> &[NameId] {
+        self.names.unranked()
     }
 
     /// See `NameStore::rank_key`.
