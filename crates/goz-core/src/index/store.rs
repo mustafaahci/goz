@@ -369,13 +369,27 @@ impl NameStore {
     /// compaction and must not run while queries are blocked. The caller
     /// applies with [`Self::install_compacted`] under a brief exclusive lock.
     pub(crate) fn plan_compact(&self) -> CompactedNames {
-        let live = self.refcount.iter().filter(|&&c| c > 0).count();
+        // The live names and their bytes, separators included, so each buffer
+        // gets the room a publish leaves (see `shrink_vec`): sized from the
+        // old arenas, the raw one came up short and doubled, and the folded
+        // one kept every dead byte the compaction removed.
+        let (mut live, mut raw_bytes, mut folded_bytes) = (0usize, 0usize, 0usize);
+        for (pair, &rc) in self.pairs.iter().zip(&self.refcount) {
+            if rc > 0 {
+                live += 1;
+                folded_bytes += pair.folded.len as usize + 1;
+                if pair.raw.off & RAW_IN_FOLDED == 0 {
+                    raw_bytes += pair.raw.len as usize + 1;
+                }
+            }
+        }
+        let room = |n: usize| n + n / 64 + 64;
         let mut c = CompactedNames {
-            raw: Vec::with_capacity(self.raw.len().saturating_sub(self.garbage)),
-            folded: Vec::with_capacity(self.folded.len()),
-            pairs: Vec::with_capacity(live),
-            refcount: Vec::with_capacity(live),
-            head: Vec::with_capacity(live),
+            raw: Vec::with_capacity(room(raw_bytes)),
+            folded: Vec::with_capacity(room(folded_bytes)),
+            pairs: Vec::with_capacity(room(live)),
+            refcount: Vec::with_capacity(room(live)),
+            head: Vec::with_capacity(room(live)),
             remap: vec![NIL; self.pairs.len()],
         };
         for (i, &rc) in self.refcount.iter().enumerate() {
@@ -413,12 +427,13 @@ impl NameStore {
         // the tables change, dropping the dead. Renumbering keeps relative
         // order, so the order stays sorted.
         let renumber = |ids: &[NameId]| -> Vec<NameId> {
-            ids.iter()
-                .filter_map(|&id| {
-                    let n = c.remap[id as usize];
-                    (n != NIL).then_some(n)
-                })
-                .collect()
+            // Sized up front: a filtered `collect` grows by doubling.
+            let mut out = Vec::with_capacity(ids.len());
+            out.extend(ids.iter().filter_map(|&id| {
+                let n = c.remap[id as usize];
+                (n != NIL).then_some(n)
+            }));
+            out
         };
         self.order = renumber(&self.order);
         self.unranked = renumber(&self.unranked);
@@ -1247,14 +1262,15 @@ mod tests {
     }
 
     /// A settled store grows its per-name tables and both arenas by a
-    /// sixteenth past the publish headroom. The names differ from their
-    /// folded form, so the raw arena is written too.
+    /// sixteenth past the publish headroom, and so does a store compacted
+    /// after it settled. The names differ from their folded form, so the
+    /// raw arena is written too.
     #[test]
     fn a_settled_store_grows_by_a_sixteenth() {
         let mut names = super::NameStore::default();
-        for i in 0..20_000 {
-            names.intern(format!("F{i}.TXT").as_bytes());
-        }
+        let ids: Vec<_> = (0..20_000)
+            .map(|i| names.intern(format!("F{i}.TXT").as_bytes()))
+            .collect();
         names.shrink_with_headroom();
         for i in 0..2_000 {
             names.intern(format!("New{i}.TXT").as_bytes());
@@ -1273,5 +1289,16 @@ mod tests {
             }
         };
         check(&names, "grown");
+
+        for &id in &ids[..12_000] {
+            names.release(id);
+        }
+        let compacted = names.plan_compact();
+        names.install_compacted(compacted);
+        check(&names, "compacted");
+        for i in 0..2_000 {
+            names.intern(format!("Late{i}.TXT").as_bytes());
+        }
+        check(&names, "compacted and grown");
     }
 }
