@@ -7,6 +7,7 @@
 //! (bootstrap + tail) stays on dedicated OS threads; tokio only serves the pipe.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -20,7 +21,9 @@ use goz_core::proto::{
     MAX_CLIENT_FRAME, MAX_SERVER_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame,
     patch_results_header, push_item, push_results_header,
 };
-use goz_core::query::{HitRef, mtime_key, parse_query_at, resolve_scope, run_query_refs, size_key};
+use goz_core::query::{
+    Budget, HitRef, mtime_key, parse_query_at, resolve_scope, run_query_refs, size_key,
+};
 use goz_core::types::{EntryIdx, SortDir, SortKey, SortSpec};
 use goz_winfs::{PipeSecurity, build_pipe_security};
 use rustc_hash::FxHashMap;
@@ -71,6 +74,18 @@ const WARN_EVERY: Duration = Duration::from_secs(60);
 /// of 4 KB paths, which any local user can create, build a page the client
 /// refuses.
 const PAGE_BYTE_BUDGET: usize = MAX_SERVER_FRAME as usize / 2;
+/// The longest one query may search one volume, under its index read lock.
+/// The journal tail waits for that lock, and every later query on the volume
+/// waits behind the tail, so this bounds how long one query holds up the
+/// rest: a wildcard with no literal to scan for held a 4.6M-entry volume for
+/// minutes. Real queries search that volume in a fraction of a second, and
+/// the slowest, one that tests every full path, in about 2 s. A query past
+/// the budget is refused, well before the 30 s a client waits for a reply, so
+/// the client can say why. That margin is per volume: a query taking most of
+/// the budget on each of four or more volumes reaches the client's limit
+/// first. Making the budget query-wide would refuse such a query even when no
+/// lock is held for long.
+const SEARCH_BUDGET: Duration = Duration::from_secs(10);
 /// How often to try the pipe name again while another process holds it.
 const CLAIM_RETRY_EVERY: Duration = Duration::from_secs(2);
 /// `CreateNamedPipe` errors that mean another process already holds the name:
@@ -363,42 +378,44 @@ async fn handle_connection(
                     let received = Instant::now();
                     let shape = QueryShape::of(&q);
                     let vols = volumes.current();
+                    let cancel = Arc::new(AtomicBool::new(false));
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(QUERY_PAGE_BACKLOG);
-                    let encoder = tokio::task::spawn_blocking(move || {
-                        let queued = received.elapsed();
-                        // A failed send means the receiver is gone (client
-                        // vanished or write error): stop encoding.
-                        let timing = stream_query_binary(&vols, q, &mut |page| {
-                            tx.blocking_send(page).is_ok()
-                        });
-                        (queued, timing)
-                    });
-                    let mut write_err: Option<std::io::Error> = None;
-                    let mut writing = Duration::ZERO;
-                    let mut first_written = None;
-                    while let Some(page) = rx.recv().await {
-                        let write = Instant::now();
-                        if let Err(e) = write_reply(server, &page).await {
-                            write_err = Some(e);
-                            break;
+                    let encoder = tokio::task::spawn_blocking({
+                        let cancel = Arc::clone(&cancel);
+                        move || {
+                            let queued = received.elapsed();
+                            // A failed send means the receiver is gone (client
+                            // vanished or write error): stop encoding.
+                            let timing = stream_query_binary(
+                                &vols,
+                                q,
+                                SEARCH_BUDGET,
+                                &cancel,
+                                &mut |page| tx.blocking_send(page).is_ok(),
+                            );
+                            (queued, timing)
                         }
-                        writing += write.elapsed();
-                        first_written.get_or_insert_with(|| received.elapsed());
-                    }
+                    });
+                    let relayed =
+                        relay_pages(server, &mut rx, &mut decoder, &mut read_buf, received).await;
                     // Closing the channel unblocks a still-encoding task; it
-                    // aborts at its next emit.
+                    // aborts at its next emit, or at its next check of the
+                    // cancel while it searches.
+                    cancel.store(true, AtomicOrdering::Relaxed);
                     drop(rx);
                     let (queued, timing) = encoder.await.context("query task panicked")?;
                     log_query(
                         &shape,
                         &timing,
                         queued,
-                        first_written,
-                        writing,
+                        relayed.first_written,
+                        relayed.writing,
                         received.elapsed(),
                     );
-                    if let Some(e) = write_err {
-                        return Err(e.into());
+                    match relayed.end {
+                        RelayEnd::Done => {}
+                        RelayEnd::Gone => return Ok(()),
+                        RelayEnd::WriteFailed(e) => return Err(e.into()),
                     }
                     wait = WRITE_TIMEOUT;
                     continue;
@@ -427,6 +444,73 @@ async fn handle_connection(
     }
 }
 
+/// How [`relay_pages`] ended.
+enum RelayEnd {
+    /// Every page went out.
+    Done,
+    /// The client closed the pipe.
+    Gone,
+    /// A page could not be written.
+    WriteFailed(std::io::Error),
+}
+
+/// What [`relay_pages`] did, for the query's log line.
+struct Relayed {
+    end: RelayEnd,
+    /// The time spent writing pages to the pipe.
+    writing: Duration,
+    /// When the first page reached the pipe, from `received`.
+    first_written: Option<Duration>,
+}
+
+/// Writes each page of a reply to the client as it comes from `pages`,
+/// until the last.
+///
+/// The pipe is read meanwhile, so a client that closes it ends the reply,
+/// even one still searching, which nothing else notices before its first
+/// page. Bytes read instead are the client's next request: they wait in
+/// `decoder`, and the reading stops there. It starts only if `decoder` holds
+/// nothing: a read per reply on top of what a client already pipelined would
+/// grow it without limit. A client with more requests pending is therefore
+/// not watched for closing, and its search runs until the budget stops it,
+/// as it could by staying connected.
+async fn relay_pages(
+    server: &mut NamedPipeServer,
+    pages: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    decoder: &mut goz_core::proto::FrameDecoder,
+    read_buf: &mut [u8],
+    received: Instant,
+) -> Relayed {
+    let mut writing = Duration::ZERO;
+    let mut first_written = None;
+    let mut watching = decoder.is_empty();
+    let end = loop {
+        tokio::select! {
+            page = pages.recv() => {
+                let Some(page) = page else { break RelayEnd::Done };
+                let write = Instant::now();
+                if let Err(e) = write_reply(server, &page).await {
+                    break RelayEnd::WriteFailed(e);
+                }
+                writing += write.elapsed();
+                first_written.get_or_insert_with(|| received.elapsed());
+            }
+            read = server.read(read_buf), if watching => match read {
+                Ok(0) | Err(_) => break RelayEnd::Gone,
+                Ok(n) => {
+                    decoder.feed(&read_buf[..n]);
+                    watching = false;
+                }
+            },
+        }
+    };
+    Relayed {
+        end,
+        writing,
+        first_written,
+    }
+}
+
 /// Writes reply bytes to the client, failing with `TimedOut` when the client
 /// has not taken them within [`WRITE_TIMEOUT`].
 async fn write_reply(server: &mut NamedPipeServer, bytes: &[u8]) -> std::io::Result<()> {
@@ -441,10 +525,16 @@ async fn write_reply(server: &mut NamedPipeServer, bytes: &[u8]) -> std::io::Res
 #[cfg(test)]
 fn encode_query_binary(volumes: &VolumeSet, q: QueryRequest) -> Vec<u8> {
     let mut out = Vec::new();
-    let _ = stream_query_binary(volumes, q, &mut |page| {
-        out.extend_from_slice(&page);
-        true
-    });
+    let _ = stream_query_binary(
+        volumes,
+        q,
+        SEARCH_BUDGET,
+        &AtomicBool::new(false),
+        &mut |page| {
+            out.extend_from_slice(&page);
+            true
+        },
+    );
     out
 }
 
@@ -463,9 +553,16 @@ fn encode_query_binary(volumes: &VolumeSet, q: QueryRequest) -> Vec<u8> {
 /// dropped). Holding every hit's full path instead peaked at ~1 GB on a 3M-row
 /// export and grew with folder depth; now the set costs ~50 MB and the first
 /// page leaves after the scan and sort instead of after every path.
+///
+/// Each volume is searched for at most `search_budget` (see
+/// [`SEARCH_BUDGET`]); a query that needs longer gets an error frame instead
+/// of results. `cancel` set means the client is gone: the search stops at
+/// its next check, and nothing more is emitted.
 fn stream_query_binary(
     volumes: &VolumeSet,
     q: QueryRequest,
+    search_budget: Duration,
+    cancel: &AtomicBool,
     emit: &mut dyn FnMut(Vec<u8>) -> bool,
 ) -> QueryTiming {
     let mut timing = QueryTiming::default();
@@ -513,6 +610,7 @@ fn stream_query_binary(
         let index = vol.index.read();
         timing.lock_wait += waiting.elapsed();
         let matching = Instant::now();
+        let budget = Budget::until(matching + search_budget, cancel);
         let scope_entry = match scope {
             VolScope::All => None,
             VolScope::Rel(rel) => match resolve_scope_cached(vol, &index, rel, parsed.match_case) {
@@ -533,10 +631,30 @@ fn stream_query_binary(
             0,
             per_vol_limit,
             q.want_total_size,
+            &budget,
         );
         drop(index);
         timing.matching += matching.elapsed();
         timing.volumes += 1;
+        let Ok(outcome) = outcome else {
+            timing.stopped = true;
+            if !cancel.load(AtomicOrdering::Relaxed) {
+                let mut out = Vec::new();
+                encode_response_frame(
+                    &Response::Error {
+                        code: ProtoError::BadQuery,
+                        message: format!(
+                            "the query was stopped after searching {} for {} s, the most one query may search a volume",
+                            vol.mount_prefix(),
+                            search_budget.as_secs()
+                        ),
+                    },
+                    &mut out,
+                );
+                let _ = emit(out);
+            }
+            return timing;
+        };
         total += outcome.total;
         if let (Some(sum), Some(size)) = (total_size.as_mut(), outcome.total_size) {
             *sum = sum.saturating_add(size);
@@ -664,6 +782,9 @@ struct QueryTiming {
     rows_sent: u64,
     /// Matches, whatever the limit.
     total: u64,
+    /// Whether a volume's search ran out of its budget, or the client left
+    /// while it ran.
+    stopped: bool,
 }
 
 /// What a query asked for, as far as its log line says: not the query text,
@@ -710,6 +831,7 @@ fn log_query(
         total = timing.total,
         rows = timing.rows_sent,
         pages = timing.pages,
+        stopped = timing.stopped,
         all_ms = ms(all),
         first_page_ms = first_written.map(ms),
         queued_ms = ms(queued),
@@ -1149,8 +1271,8 @@ fn starts_with_ci(haystack: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        VolScope, build_status, encode_query_binary, handle_request, resolve_scope_cached,
-        scope_entry_valid, starts_with_ci, targets,
+        SEARCH_BUDGET, VolScope, build_status, encode_query_binary, handle_request,
+        resolve_scope_cached, scope_entry_valid, starts_with_ci, targets,
     };
     use crate::volume_state::{VolumeSet, VolumeState};
     use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
@@ -1656,14 +1778,228 @@ mod tests {
         let vols = set(&[volume(r"C:\", index, VolumePhase::Live)]);
 
         let mut emitted = 0usize;
-        super::stream_query_binary(&vols, query("hit"), &mut |_page| {
-            emitted += 1;
-            false // consumer gone after the first page
-        });
+        super::stream_query_binary(
+            &vols,
+            query("hit"),
+            SEARCH_BUDGET,
+            &AtomicBool::new(false),
+            &mut |_page| {
+                emitted += 1;
+                false // consumer gone after the first page
+            },
+        );
         assert_eq!(
             emitted, 1,
             "a dead consumer must stop the encoder after the rejected page"
         );
+    }
+
+    /// A query that runs out of its budget on a volume is refused, saying
+    /// where, never answered with the matches found so far.
+    #[test]
+    fn a_query_past_its_budget_is_refused() {
+        let vols = set(&[live_volume(r"C:\")]);
+        let mut frames = Vec::new();
+        let timing = super::stream_query_binary(
+            &vols,
+            query("*"),
+            std::time::Duration::ZERO,
+            &AtomicBool::new(false),
+            &mut |page| {
+                frames.extend_from_slice(&page);
+                true
+            },
+        );
+        assert!(timing.stopped);
+        match &decode_frames(&frames)[..] {
+            [Response::Error { code, message }] => {
+                assert_eq!(*code, ProtoError::BadQuery);
+                assert!(message.contains(r"searching C:\ for 0 s"), "{message}");
+            }
+            other => panic!("expected one error frame, got {other:?}"),
+        }
+    }
+
+    /// A query whose client is gone stops searching and sends nothing.
+    #[test]
+    fn a_query_whose_client_left_sends_nothing() {
+        let vols = set(&[live_volume(r"C:\")]);
+        let mut emitted = 0;
+        let timing = super::stream_query_binary(
+            &vols,
+            query("*"),
+            SEARCH_BUDGET,
+            &AtomicBool::new(true),
+            &mut |_| {
+                emitted += 1;
+                true
+            },
+        );
+        assert!(timing.stopped);
+        assert_eq!(emitted, 0);
+    }
+
+    /// A pipe server and a client connected to it, under a name of the test's
+    /// own.
+    async fn pipe_pair(
+        test: &str,
+    ) -> (
+        tokio::net::windows::named_pipe::NamedPipeServer,
+        tokio::net::windows::named_pipe::NamedPipeClient,
+    ) {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        let name = format!(r"\\.\pipe\goz-test-{test}-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        let client = ClientOptions::new().open(&name).unwrap();
+        server.connect().await.unwrap();
+        (server, client)
+    }
+
+    /// A client that closes its pipe while its query still searches ends the
+    /// reply at once, though no page has come to fail a write.
+    #[tokio::test]
+    async fn a_client_that_closes_its_pipe_ends_the_reply() {
+        use super::{RelayEnd, relay_pages};
+        use goz_core::proto::MAX_CLIENT_FRAME;
+        let (mut server, client) = pipe_pair("closes").await;
+        // Never sends nor closes, as a query still searching.
+        let (_searching, mut pages) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        drop(client);
+        let relayed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            relay_pages(
+                &mut server,
+                &mut pages,
+                &mut FrameDecoder::new(MAX_CLIENT_FRAME),
+                &mut [0; 64],
+                std::time::Instant::now(),
+            ),
+        )
+        .await
+        .expect("the reply ends when the client leaves");
+        assert!(matches!(relayed.end, RelayEnd::Gone));
+        assert_eq!(relayed.first_written, None);
+    }
+
+    /// What a client sends while its reply is made is its next request: it
+    /// waits in the decoder, and the reply still goes out whole. One read is
+    /// taken, and the rest wait in the pipe.
+    #[tokio::test]
+    async fn a_request_sent_during_a_reply_waits_for_it() {
+        use super::{RelayEnd, relay_pages};
+        use goz_core::proto::MAX_CLIENT_FRAME;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut server, mut client) = pipe_pair("pipelines").await;
+        let mut request = Vec::new();
+        goz_core::proto::encode_request(&Request::Status, &mut request);
+        client.write_all(&request).await.unwrap();
+        let (tx, mut pages) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let second = request.clone();
+        let driver = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            client.write_all(&second).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tx.send(b"page".to_vec()).await.unwrap();
+            client
+        });
+        let mut decoder = FrameDecoder::new(MAX_CLIENT_FRAME);
+        // A read holds one request at most.
+        let mut read_buf = vec![0; request.len()];
+        let relayed = relay_pages(
+            &mut server,
+            &mut pages,
+            &mut decoder,
+            &mut read_buf,
+            std::time::Instant::now(),
+        )
+        .await;
+        assert!(matches!(relayed.end, RelayEnd::Done));
+        assert!(relayed.first_written.is_some());
+        let mut client = driver.await.unwrap();
+        let mut page = [0; 4];
+        client.read_exact(&mut page).await.unwrap();
+        assert_eq!(&page, b"page");
+        let next = decoder.next_frame().unwrap().expect("the request waits");
+        assert_eq!(
+            goz_core::proto::decode_request(&next).unwrap(),
+            Request::Status
+        );
+        assert_eq!(decoder.next_frame().unwrap(), None, "one read was taken");
+        let n = server.read(&mut read_buf).await.unwrap();
+        assert_eq!(&read_buf[..n], &request[..], "the second waits in the pipe");
+    }
+
+    /// With requests already waiting in the decoder, a reply reads nothing
+    /// more: a read per reply, against one frame taken per reply, grew the
+    /// decoder of a client pipelining tiny queries by about 40 MB/s.
+    #[tokio::test]
+    async fn a_reply_reads_nothing_while_requests_wait() {
+        use super::{RelayEnd, relay_pages};
+        use goz_core::proto::MAX_CLIENT_FRAME;
+        use tokio::io::AsyncWriteExt;
+        let (mut server, mut client) = pipe_pair("waits").await;
+        let mut request = Vec::new();
+        goz_core::proto::encode_request(&Request::Status, &mut request);
+        client.write_all(&request).await.unwrap();
+        let mut decoder = FrameDecoder::new(MAX_CLIENT_FRAME);
+        decoder.feed(&request);
+        let (tx, mut pages) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(tx);
+        });
+        let relayed = relay_pages(
+            &mut server,
+            &mut pages,
+            &mut decoder,
+            &mut [0; 64],
+            std::time::Instant::now(),
+        )
+        .await;
+        assert!(matches!(relayed.end, RelayEnd::Done));
+        assert!(decoder.next_frame().unwrap().is_some());
+        assert_eq!(decoder.next_frame().unwrap(), None, "the pipe was read");
+    }
+
+    /// A client that sends a costly query and leaves frees the volume as soon
+    /// as the search next checks, not when its budget runs out.
+    #[tokio::test]
+    async fn a_query_whose_client_leaves_stops_searching() {
+        use super::handle_connection;
+        use crate::volume_state::VolumeRegistry;
+        use tokio::io::AsyncWriteExt;
+        let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let long = "a".repeat(240);
+        for i in 0..5000 {
+            index.insert_enum(&file_record(
+                1000 + i,
+                NTFS_ROOT_FRN.0,
+                &format!("{long}{i:05}"),
+            ));
+        }
+        let registry = Arc::new(VolumeRegistry::default());
+        registry.add(volume(r"C:\", index, VolumePhase::Live));
+        // Each term backtracks over each name about 15,000 steps, so the
+        // search would run for the whole budget.
+        let term = format!("*{}", "?".repeat(120));
+        let mut frame = Vec::new();
+        goz_core::proto::encode_request(
+            &Request::Query(query(&vec![term; 256].join(" "))),
+            &mut frame,
+        );
+        let (mut server, mut client) = pipe_pair("leaves").await;
+        client.write_all(&frame).await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(client);
+        });
+        let started = std::time::Instant::now();
+        let _: Result<(), _> = handle_connection(&mut server, registry).await;
+        let took = started.elapsed();
+        assert!(took < SEARCH_BUDGET / 2, "searched on for {took:?}");
     }
 
     /// `want_size: false` must suppress the value even when the index holds one,
@@ -1950,8 +2286,9 @@ mod tests {
                     0,
                     None,
                     false,
+                    &goz_core::query::Budget::unlimited(),
                 );
-                Run::new(out.refs)
+                Run::new(out.unwrap().refs)
             })
             .collect();
         let guards: Vec<IndexGuard<'_>> = vols.iter().map(|v| v.index.read()).collect();
@@ -2262,10 +2599,16 @@ mod tests {
             live_volume(r"D:\"),
         ]);
         let mut emitted = 0;
-        let timing = super::stream_query_binary(&vols, query("hit"), &mut |_| {
-            emitted += 1;
-            true
-        });
+        let timing = super::stream_query_binary(
+            &vols,
+            query("hit"),
+            SEARCH_BUDGET,
+            &AtomicBool::new(false),
+            &mut |_| {
+                emitted += 1;
+                true
+            },
+        );
         assert_eq!(timing.volumes, 2);
         assert_eq!(timing.pages, 2);
         assert_eq!(emitted, 2);
@@ -2276,7 +2619,13 @@ mod tests {
             limit: Some(10),
             ..query("hit")
         };
-        let timing = super::stream_query_binary(&vols, limited, &mut |_| true);
+        let timing = super::stream_query_binary(
+            &vols,
+            limited,
+            SEARCH_BUDGET,
+            &AtomicBool::new(false),
+            &mut |_| true,
+        );
         assert_eq!((timing.pages, timing.rows_sent, timing.total), (1, 10, n));
     }
 

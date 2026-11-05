@@ -16,6 +16,7 @@
 //! ready-to-use needles. A `dm:` value is resolved here too, to FILETIME
 //! bounds, against the [`LocalClock`] the query is parsed with.
 
+use super::budget::Budget;
 use super::dates::{DateFilter, LocalClock, date_filter};
 use crate::fold::fold;
 use smallvec::SmallVec;
@@ -26,11 +27,29 @@ use smallvec::SmallVec;
 /// it once, and `clear` keeps that capacity for the rest of the scan.
 pub type CodePointBuf = SmallVec<[u32; 256]>;
 
+/// Decodes `text` (WTF-8) into `buf`, cleared first, for
+/// [`Wildcard::matches_decoded`]: once per candidate, however many
+/// wildcards test it.
+pub(crate) fn decode_into(text: &[u8], buf: &mut CodePointBuf) {
+    buf.clear();
+    buf.extend(crate::wtf8::CodePoints::new(text));
+}
+
 /// A compiled wildcard pattern, matched against a whole name or, for a path
 /// wildcard, a whole full path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wildcard {
     tokens: Vec<GlobTok>,
+    /// The code points a match has at least: one per literal and `?`.
+    min_len: usize,
+    /// Whether the pattern holds a `*`. Without one, a match has exactly
+    /// `min_len` code points.
+    any_run: bool,
+    /// [`Wildcard::glob_match`] checks its budget each time the text position
+    /// it backtracks to has these low bits clear: about every
+    /// [`GLOB_STEPS_PER_CHECK`] steps, as a backtrack starts a pass of at most
+    /// one step per token.
+    check_mask: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,24 +78,93 @@ impl Wildcard {
                 other => tokens.push(GlobTok::Lit(other)),
             }
         }
-        Wildcard { tokens }
+        let runs = tokens.iter().filter(|t| **t == GlobTok::AnyRun).count();
+        Wildcard {
+            min_len: tokens.len() - runs,
+            any_run: runs > 0,
+            check_mask: (GLOB_STEPS_PER_CHECK / (tokens.len() + 1)).next_power_of_two() - 1,
+            tokens,
+        }
     }
 
-    /// Matches the whole of `name` (or of a full path), decoding its code points
-    /// into the caller's reusable `buf` (cleared first) instead of allocating
-    /// one per candidate.
-    pub fn matches_into(&self, name: &[u8], buf: &mut CodePointBuf) -> bool {
-        buf.clear();
-        buf.extend(crate::wtf8::CodePoints::new(name));
-        glob_match(&self.tokens, buf.as_slice())
+    /// Matches the whole of `text`, a name or full path that
+    /// [`decode_into`] decoded. Answers `false` once `budget` is spent, as
+    /// the query is then refused whatever this answers.
+    ///
+    /// A text that cannot fit is turned away without a walk. A match that may
+    /// take many steps checks the budget first: [`Wildcard::glob_match`] checks
+    /// only every so many, so a search of many terms over texts too short to
+    /// reach a check of its own ran seconds past its budget.
+    pub(crate) fn matches_decoded(&self, text: &[u32], budget: &Budget) -> bool {
+        let fits = if self.any_run {
+            text.len() >= self.min_len
+        } else {
+            text.len() == self.min_len
+        };
+        // Each code point the `*`s can take is a backtrack, and a pass of at
+        // most one step per token.
+        let costly = || (text.len() - self.min_len) * self.tokens.len() >= GLOB_COSTLY_STEPS;
+        fits && !(costly() && budget.check()) && self.glob_match(text, budget)
     }
 
     /// Matches the whole of `name` (WTF-8, folded iff the query is
     /// case-insensitive) against the pattern. Convenience wrapper that
-    /// allocates a one-off buffer; the hot path uses [`Wildcard::matches_into`].
+    /// allocates a one-off buffer; the search decodes each candidate once
+    /// for all its wildcards instead.
     pub fn matches(&self, name: &[u8]) -> bool {
         let mut buf = CodePointBuf::new();
-        self.matches_into(name, &mut buf)
+        decode_into(name, &mut buf);
+        self.matches_decoded(&buf, &Budget::unlimited())
+    }
+
+    /// Iterative glob match with backtracking on the last `*`. Each backtrack
+    /// starts a pass of at most one step per pattern token, so a pattern of
+    /// `k` tokens takes up to `k` steps per code point of the text: fast for
+    /// real patterns, but one built to backtrack against a long full path can
+    /// take minutes, so `budget` is checked as the backtracks add up, and a
+    /// spent one ends the match unmatched.
+    fn glob_match(&self, text: &[u32], budget: &Budget) -> bool {
+        let pat = self.tokens.as_slice();
+        let (mut ti, mut pi) = (0usize, 0usize);
+        let mut star: Option<(usize, usize)> = None; // (pattern idx after '*', text idx)
+        while ti < text.len() {
+            match pat.get(pi) {
+                Some(GlobTok::Lit(c)) if *c == text[ti] => {
+                    pi += 1;
+                    ti += 1;
+                }
+                Some(GlobTok::AnyOne) => {
+                    pi += 1;
+                    ti += 1;
+                }
+                Some(GlobTok::AnyRun) => {
+                    // A last `*` takes all that is left.
+                    if pi + 1 == pat.len() {
+                        return true;
+                    }
+                    star = Some((pi + 1, ti));
+                    pi += 1;
+                }
+                _ => {
+                    // Mismatch: backtrack to the last '*' and consume one more char.
+                    if let Some((sp, st)) = star {
+                        let next = st + 1;
+                        if next & self.check_mask == 0 && budget.check() {
+                            return false;
+                        }
+                        pi = sp;
+                        ti = next;
+                        star = Some((sp, next));
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        while let Some(GlobTok::AnyRun) = pat.get(pi) {
+            pi += 1;
+        }
+        pi == pat.len()
     }
 
     /// The longest run of literal characters in the pattern, as WTF-8 bytes
@@ -171,42 +259,15 @@ fn encode_wtf8(cp: u32, out: &mut Vec<u8>) {
     }
 }
 
-/// Iterative glob match with backtracking on `*` (linear-ish; patterns and
-/// names are short).
-fn glob_match(pat: &[GlobTok], text: &[u32]) -> bool {
-    let (mut ti, mut pi) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None; // (pattern idx after '*', text idx)
-    while ti < text.len() {
-        match pat.get(pi) {
-            Some(GlobTok::Lit(c)) if *c == text[ti] => {
-                pi += 1;
-                ti += 1;
-            }
-            Some(GlobTok::AnyOne) => {
-                pi += 1;
-                ti += 1;
-            }
-            Some(GlobTok::AnyRun) => {
-                star = Some((pi + 1, ti));
-                pi += 1;
-            }
-            _ => {
-                // Mismatch: backtrack to the last '*' and consume one more char.
-                if let Some((sp, st)) = star {
-                    pi = sp;
-                    ti = st + 1;
-                    star = Some((sp, st + 1));
-                } else {
-                    return false;
-                }
-            }
-        }
-    }
-    while let Some(GlobTok::AnyRun) = pat.get(pi) {
-        pi += 1;
-    }
-    pi == pat.len()
-}
+/// About how many steps [`Wildcard::glob_match`] takes between checks of its
+/// budget: well under a millisecond's worth.
+const GLOB_STEPS_PER_CHECK: usize = 1 << 16;
+
+/// A match that may take this many steps checks its budget before it starts.
+/// That costs a 24 ns clock read against a few microseconds of steps, and it
+/// holds what 256 terms can do to one candidate between checks to about a
+/// millisecond.
+const GLOB_COSTLY_STEPS: usize = 1 << 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -292,9 +353,9 @@ pub enum QueryError {
 
 /// The most terms one query may hold. The engine tests each candidate against
 /// every term under the volume's index read lock, so a query's cost grows with
-/// its term count; without a cap, one query from any local user holds that
-/// lock, and the journal tail waiting behind it, for minutes. Real queries use
-/// a few terms.
+/// its term count. Its [`Budget`] bounds how long it holds the lock, and this
+/// cap bounds the work on each candidate, so the budget is checked often.
+/// Real queries use a few terms.
 const MAX_QUERY_TERMS: usize = 256;
 
 /// How many terms `q` holds, as [`MAX_QUERY_TERMS`] counts them: name and path
@@ -980,8 +1041,8 @@ mod tests {
         assert!(q("   ").is_text_empty());
     }
 
-    /// Every term costs each candidate a test under the index read lock, so a
-    /// query past the cap is refused rather than holding the lock for minutes.
+    /// Every term costs each candidate a test under the index read lock, so
+    /// the cap bounds the work on each candidate between checks of the budget.
     #[test]
     fn a_query_with_more_than_the_maximum_terms_is_refused() {
         let terms = |n: usize| vec!["a"; n].join(" ");
@@ -1007,9 +1068,89 @@ mod tests {
         );
     }
 
+    /// A budget already spent, for the tests of what checks one.
+    fn with_spent_budget(test: impl FnOnce(&Budget)) {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let cancelled = AtomicBool::new(true);
+        test(&Budget::until(
+            Instant::now() + Duration::from_secs(3600),
+            &cancelled,
+        ));
+    }
+
+    /// `n` code points of `x`.
+    fn xs(n: usize) -> CodePointBuf {
+        let mut text = CodePointBuf::new();
+        decode_into("x".repeat(n).as_bytes(), &mut text);
+        text
+    }
+
+    /// A match that backtracks checks its budget as it goes, and a spent one
+    /// ends it unmatched: a pattern built to backtrack against a long full
+    /// path could otherwise take minutes over one text.
+    #[test]
+    fn a_spent_budget_ends_a_match_as_it_backtracks() {
+        // 101 tokens check every 1,024 code points.
+        let w = Wildcard::compile(format!("*{}", "?".repeat(100)).as_bytes());
+        let (long, short) = (xs(5000), xs(500));
+        with_spent_budget(|spent| {
+            assert!(!w.glob_match(&long, spent), "past a check");
+            assert!(w.glob_match(&short, spent), "short of one");
+        });
+        assert!(w.glob_match(&long, &Budget::unlimited()));
+    }
+
+    /// A match that may take many steps checks first, even over a text too
+    /// short to reach a check of its own, and one that cannot does not.
+    #[test]
+    fn a_spent_budget_turns_away_a_costly_match() {
+        let costly = Wildcard::compile(format!("*{}", "?".repeat(100)).as_bytes());
+        let text = xs(500);
+        assert!(costly.matches_decoded(&text, &Budget::unlimited()));
+        with_spent_budget(|spent| assert!(!costly.matches_decoded(&text, spent)));
+        let cheap = Wildcard::compile(b"*x");
+        with_spent_budget(|spent| assert!(cheap.matches_decoded(&xs(20), spent)));
+    }
+
     mod arbitrary {
         use super::*;
         use proptest::prelude::*;
+
+        /// Whether `pat` matches the whole of `text`, worked out for every
+        /// pair of positions: slow, but plainly right.
+        fn reference_match(pat: &[u8], text: &[u8]) -> bool {
+            // `rest[i][j]`: whether `pat[i..]` matches `text[j..]`.
+            let mut rest = vec![vec![false; text.len() + 1]; pat.len() + 1];
+            rest[pat.len()][text.len()] = true;
+            for i in (0..pat.len()).rev() {
+                for j in (0..=text.len()).rev() {
+                    let one = j < text.len() && rest[i + 1][j + 1];
+                    rest[i][j] = match pat[i] {
+                        b'*' => rest[i + 1][j] || (j < text.len() && rest[i][j + 1]),
+                        b'?' => one,
+                        c => one && text[j] == c,
+                    };
+                }
+            }
+            rest[0][0]
+        }
+
+        proptest! {
+            /// The matcher, and the length check that turns texts away
+            /// before it, answer as the reference does.
+            #[test]
+            fn wildcards_match_as_the_reference_does(
+                pat in "[ab*?]{0,8}",
+                text in "[ab]{0,10}",
+            ) {
+                let w = Wildcard::compile(pat.as_bytes());
+                prop_assert_eq!(
+                    w.matches(text.as_bytes()),
+                    reference_match(pat.as_bytes(), text.as_bytes())
+                );
+            }
+        }
 
         /// Query text built from the parser's own syntax and arbitrary
         /// characters, so that functions, ranges and wildcards are reached.

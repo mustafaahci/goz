@@ -11,7 +11,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
-use goz_core::query::{parse_query, run_query, run_query_refs};
+use goz_core::query::{Budget, parse_query, run_query, run_query_refs};
 use goz_core::types::{Frn, SortSpec};
 use goz_core::usn::record::{FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE};
 use std::hint::black_box;
@@ -234,7 +234,9 @@ fn bench_query(c: &mut Criterion) {
                     0,
                     None,
                     false,
-                );
+                    &Budget::unlimited(),
+                )
+                .unwrap();
                 black_box(out.refs.len())
             })
         });

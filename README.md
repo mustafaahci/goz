@@ -85,6 +85,8 @@ With `-size` and `-dm` the listing shows `es.exe`'s console columns: the size ri
 
 `dm:` (or `datemodified:`) takes `today`, `yesterday`, `thisweek`, `lastweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear`, a year, month or day (`2024`, `2024-05`, `2024-05-01`), or a duration back from now (`7days`, `last2hours`, `3months`), each optionally after `<`, `<=`, `>` or `>=`, or two of them as a range `2024-01-01..2024-03-31`. Days run between midnights in the machine's time zone, a week starts on the first day of the week of the service's regional format, and a file whose date goz has not read yet matches only `dm:unknown`.
 
+gozd searches each volume for at most 10 s per query, so one search cannot hold up the index's updates and the other searches for longer. A search that needs more, such as many wildcard terms with no letters to look for, is refused, and goz exits with code 4. A search whose client goes away stops too.
+
 To see where a search spends its time, set `GOZ_TIMING=1`: goz then ends with a line on stderr saying how long Windows took to start it and when it reached gozd, got its first and last page, and finished. gozd can log its side of each query, split into lock waits, matching, building rows and writing to the pipe, to `%SystemRoot%\Logs\goz\gozd.log`. The line gives the query's length, scope and sort, never its text. Turn it on from an elevated prompt, and off again by deleting the value:
 
 ```

@@ -14,7 +14,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
 use goz_core::layout::{LayoutFile, LayoutName};
-use goz_core::query::{parse_query, run_query_refs};
+use goz_core::query::{Budget, parse_query, run_query_refs};
 use goz_core::types::{Frn, SortDir, SortKey, SortSpec};
 use goz_core::usn::record::FILE_ATTRIBUTE_DIRECTORY;
 use rustc_hash::FxHashSet;
@@ -313,7 +313,9 @@ fn bench_sorts(c: &mut Criterion) {
             0,
             limit,
             false,
-        );
+            &Budget::unlimited(),
+        )
+        .unwrap();
         black_box(out.refs.len())
     };
     eprintln!(
@@ -326,8 +328,10 @@ fn bench_sorts(c: &mut Criterion) {
             SortSpec::default(),
             0,
             Some(0),
-            false
+            false,
+            &Budget::unlimited(),
         )
+        .unwrap()
         .total,
         run_query_refs(
             &idx,
@@ -337,8 +341,10 @@ fn bench_sorts(c: &mut Criterion) {
             SortSpec::default(),
             0,
             Some(0),
-            false
+            false,
+            &Budget::unlimited(),
         )
+        .unwrap()
         .total,
         run_query_refs(
             &idx,
@@ -348,8 +354,10 @@ fn bench_sorts(c: &mut Criterion) {
             SortSpec::default(),
             0,
             Some(0),
-            false
+            false,
+            &Budget::unlimited(),
         )
+        .unwrap()
         .total,
     );
 

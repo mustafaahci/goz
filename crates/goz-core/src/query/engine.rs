@@ -9,8 +9,9 @@
 //! and is its folder's path, built once per folder and query (see
 //! `FolderPaths`), plus its own name.
 
+use super::budget::{Budget, Stopped, Watch};
 use super::folder_rank::FolderRanks;
-use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange};
+use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange, Wildcard, decode_into};
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
 use crate::types::{EntryIdx, Frn, NIL, SortDir, SortKey, SortSpec};
@@ -67,9 +68,11 @@ pub struct RefOutcome {
 }
 
 /// A [`ParsedQuery`]'s substring needles prebuilt into finders once (rather
-/// than per candidate). The remaining predicates (wildcards, filters) are read
-/// straight off the `ParsedQuery` in the scan loop.
+/// than per candidate), and the [`Budget`] it runs within. The remaining
+/// predicates (wildcards, filters) are read straight off the `ParsedQuery` in
+/// the scan loop.
 pub struct CompiledQuery<'a> {
+    budget: &'a Budget<'a>,
     name_finders: Vec<memmem::Finder<'a>>,
     /// The path terms the mount prefix does not already hold. One it holds
     /// is in every full path on the volume, so `C:\ report` tests names only.
@@ -104,8 +107,8 @@ pub struct CompiledQuery<'a> {
 
 impl<'a> CompiledQuery<'a> {
     /// Compiles `parsed` for the volume mounted at `mount_prefix` (`C:\`, or a
-    /// mount folder such as `C:\mnt\data\`).
-    pub fn new(parsed: &'a ParsedQuery, mount_prefix: &str) -> Self {
+    /// mount folder such as `C:\mnt\data\`), to run within `budget`.
+    pub fn new(parsed: &'a ParsedQuery, mount_prefix: &str, budget: &'a Budget<'a>) -> Self {
         // The prefilter is the longest literal from any name term, wildcard, or
         // single `ext:` value;
         // every match must contain it, so scanning for it yields a superset of
@@ -160,6 +163,7 @@ impl<'a> CompiledQuery<'a> {
             .flatten();
 
         Self {
+            budget,
             name_finders: parsed
                 .name_terms
                 .iter()
@@ -282,7 +286,8 @@ pub fn run_query(
     offset: u32,
     limit: Option<u32>,
 ) -> QueryOutcome {
-    let RefOutcome { total, refs, .. } = page_refs(
+    let unlimited = Budget::unlimited();
+    let Ok(RefOutcome { total, refs, .. }) = page_refs(
         index,
         mount_prefix,
         parsed,
@@ -292,7 +297,10 @@ pub fn run_query(
         limit,
         false,
         true,
-    );
+        &unlimited,
+    ) else {
+        unreachable!("an unlimited budget is never spent");
+    };
     let hits = build_hits(index, &refs);
     QueryOutcome { total, hits }
 }
@@ -309,6 +317,11 @@ pub fn run_query(
 /// `-get-total-size`: a folder adds nothing, nor a file whose size is not
 /// read yet, and each name of a hard-linked file adds its size, as each is a
 /// row of its own. A sum past `u64::MAX` stops there.
+///
+/// Fails with [`Stopped`] when `budget` is spent before the matches are all
+/// found. Only the steps a query's terms make costlier check it: a pass over
+/// the names that tests none of them, like `e`, and the ordering after any
+/// search, cost the same whatever the query says, so they always finish.
 #[allow(clippy::too_many_arguments)]
 pub fn run_query_refs(
     index: &VolumeIndex,
@@ -319,7 +332,8 @@ pub fn run_query_refs(
     offset: u32,
     limit: Option<u32>,
     sum_sizes: bool,
-) -> RefOutcome {
+    budget: &Budget,
+) -> Result<RefOutcome, Stopped> {
     page_refs(
         index,
         mount_prefix,
@@ -330,6 +344,7 @@ pub fn run_query_refs(
         limit,
         sum_sizes,
         true,
+        budget,
     )
 }
 
@@ -345,7 +360,8 @@ pub fn run_query_refs(
 /// been walked. A bounded page sorted by an entry key keeps only its best
 /// rows as it scans (see [`top_k_refs`]). Everything else takes the
 /// candidate path: scan, order, slice. `fast` exists for the tests that hold
-/// these paths equal to the candidate path.
+/// these paths equal to the candidate path. See [`run_query_refs`] for what
+/// `budget` stops.
 #[allow(clippy::too_many_arguments)]
 fn page_refs(
     index: &VolumeIndex,
@@ -357,22 +373,26 @@ fn page_refs(
     limit: Option<u32>,
     sum_sizes: bool,
     fast: bool,
-) -> RefOutcome {
-    let compiled = CompiledQuery::new(parsed, mount_prefix);
+    budget: &Budget,
+) -> Result<RefOutcome, Stopped> {
+    let compiled = CompiledQuery::new(parsed, mount_prefix, budget);
     // A scope at the root admits every entry with a path, as no scope does,
     // so it goes: kept, it would bar the name-level path, and `-path C:\ e`
     // ran three times slower than `e`.
     let scope = scope.filter(|&s| s != index.root());
     if fast && sort.key == SortKey::Name && is_name_level(index, parsed, &compiled, scope) {
         let (matched, total) = match_names(index, parsed, &compiled);
+        if budget.spent() {
+            return Err(Stopped);
+        }
         let total_size = sum_sizes.then(|| names_files_size(index, &matched));
         let (start, end) = page_bounds(total as usize, offset, limit);
         let refs = name_level_refs(index, &matched, sort.dir, start, end);
-        return RefOutcome {
+        return Ok(RefOutcome {
             total,
             refs,
             total_size,
-        };
+        });
     }
     if fast
         && let Some(limit) = limit
@@ -381,6 +401,9 @@ fn page_refs(
         return top_k_refs(index, parsed, &compiled, sort, offset, limit, sum_sizes);
     }
     let mut candidates = scan(index, parsed, &compiled, scope);
+    if budget.spent() {
+        return Err(Stopped);
+    }
     let total = candidates.len() as u64;
     let total_size = sum_sizes.then(|| files_size(index, candidates.iter().map(|c| c.idx)));
     let (start, end) = page_bounds(candidates.len(), offset, limit);
@@ -392,11 +415,11 @@ fn page_refs(
             frn: index.entry(c.idx).frn(),
         })
         .collect();
-    RefOutcome {
+    Ok(RefOutcome {
         total,
         refs,
         total_size,
-    }
+    })
 }
 
 /// The summed size of the files among `entries`: a folder adds nothing, nor
@@ -450,10 +473,23 @@ fn name_matches(
         index.name_folded(id)
     };
     compiled.name_finders.iter().all(|f| f.find(hay).is_some())
-        && parsed.wildcards.iter().all(|w| w.matches_into(hay, cp_buf))
+        && (parsed.wildcards.is_empty()
+            || wildcards_match(&parsed.wildcards, hay, cp_buf, compiled.budget))
         // The ext check folds the extension, so it runs after the
         // allocation-free predicates that reject most names.
         && ext_matches(&parsed.filters, index.name_raw(id), ext_scratch)
+}
+
+/// Whether `text`, a name or full path, matches every one of `wildcards`,
+/// decoded once for them all.
+fn wildcards_match(
+    wildcards: &[Wildcard],
+    text: &[u8],
+    cp_buf: &mut CodePointBuf,
+    budget: &Budget,
+) -> bool {
+    decode_into(text, cp_buf);
+    wildcards.iter().all(|w| w.matches_decoded(cp_buf, budget))
 }
 
 /// Calls `f` once per distinct name whose folded bytes contain `needle`: one
@@ -617,7 +653,8 @@ fn entries_bearing(index: &VolumeIndex, id: NameId) -> u64 {
 }
 
 /// Every distinct name matching `parsed`, and the number of live
-/// non-synthetic entries bearing them (see [`entries_bearing`]).
+/// non-synthetic entries bearing them (see [`entries_bearing`]), or some of
+/// them once the query's budget is spent.
 ///
 /// The names are matched in chunks across cores. Each chunk sets bits in its
 /// own words of a set the caller allocated, and frees what it allocates
@@ -646,10 +683,22 @@ fn match_names(
                 let base = ids.start;
                 let mut cp_buf = CodePointBuf::new();
                 let mut ext_scratch = Vec::new();
+                let mut watch = Watch::new(compiled.budget);
                 let (mut len, mut total) = (0usize, 0u64);
                 let mut mark = |id: NameId| {
+                    // Only testing a name costs more with more terms, so only
+                    // that counts against the budget. Without it this pass is
+                    // bounded by the volume's names, whatever the query.
                     if verify
-                        && !name_matches(index, parsed, compiled, id, &mut cp_buf, &mut ext_scratch)
+                        && (watch.tick()
+                            || !name_matches(
+                                index,
+                                parsed,
+                                compiled,
+                                id,
+                                &mut cp_buf,
+                                &mut ext_scratch,
+                            ))
                     {
                         return;
                     }
@@ -841,7 +890,8 @@ struct Best {
 /// little; a buffer whose chunks match more grows on its thread, up to twice
 /// [`TOP_K_MAX`]. Every match is still counted, and summed
 /// when `sum_sizes` asks, so the totals are the scan's, and the page is the
-/// scan's too: the same candidates, ordered by the same comparator.
+/// scan's too: the same candidates, ordered by the same comparator. Fails
+/// with [`Stopped`] when the query's budget is spent before the end.
 #[allow(clippy::too_many_arguments)]
 fn top_k_refs(
     index: &VolumeIndex,
@@ -851,7 +901,7 @@ fn top_k_refs(
     offset: u32,
     limit: u32,
     sum_sizes: bool,
-) -> RefOutcome {
+) -> Result<RefOutcome, Stopped> {
     use rayon::prelude::*;
     let needle = compiled.prefilter.as_deref().unwrap_or_default();
     let want = offset as usize + limit as usize;
@@ -879,10 +929,15 @@ fn top_k_refs(
         let mut scope_memo = FxHashMap::default();
         let mut dir_paths = FxHashMap::default();
         let mut no_folders = None;
+        let mut watch = Watch::new(compiled.budget);
         let (mut count, mut size) = (0u64, 0u64);
         for_each_prefilter_hit_in(index, needle, chunk_ids(i, per, names), |id| {
+            // As in `match_names`: only testing a name costs more with more
+            // terms. An entry below costs the same whatever the query, as no
+            // query here tests a path.
             if !compiled.prefilter_decides_name
-                && !name_matches(index, parsed, compiled, id, &mut cp_buf, &mut ext_scratch)
+                && (watch.tick()
+                    || !name_matches(index, parsed, compiled, id, &mut cp_buf, &mut ext_scratch))
             {
                 return;
             }
@@ -932,6 +987,9 @@ fn top_k_refs(
             .map(scan_chunk)
             .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1.saturating_add(b.1)))
     });
+    if compiled.budget.spent() {
+        return Err(Stopped);
+    }
     let bests: Vec<Best> = bests
         .into_iter()
         .map(|best| best.into_inner().unwrap_or_else(PoisonError::into_inner))
@@ -943,7 +1001,7 @@ fn top_k_refs(
     drop(bests);
     let (start, end) = page_bounds(total as usize, offset, Some(limit));
     order_top(index, &mut kept, sort, end);
-    RefOutcome {
+    Ok(RefOutcome {
         total,
         refs: kept[start..end]
             .iter()
@@ -953,7 +1011,7 @@ fn top_k_refs(
             })
             .collect(),
         total_size: sum_sizes.then_some(total_size),
-    }
+    })
 }
 
 /// A folder-scoped query walks the scope's subtree instead of scanning the
@@ -1035,6 +1093,9 @@ fn scan_with(
     // so wildcard decoding and extension folding don't heap-allocate per hit.
     let mut cp_buf = CodePointBuf::new();
     let mut ext_scratch: Vec<u8> = Vec::new();
+    // Each path below stops testing entries once the budget is spent, and
+    // the caller refuses what it found.
+    let mut watch = Watch::new(compiled.budget);
 
     // Folder scope: walk the scope subtree via the child chains, so cost
     // tracks the folder, not the volume. Membership is by construction, so
@@ -1058,6 +1119,9 @@ fn scan_with(
             if visited > cap {
                 candidates.clear();
                 subtree_done = false;
+                break;
+            }
+            if watch.tick() {
                 break;
             }
             if index.is_synthetic(idx) {
@@ -1095,6 +1159,9 @@ fn scan_with(
         // this scan already found the names.
         let on_hit = |id: NameId| {
             for idx in index.name_chain(id) {
+                if watch.tick() {
+                    return;
+                }
                 if index.is_synthetic(idx) {
                     continue;
                 }
@@ -1120,26 +1187,32 @@ fn scan_with(
             None => for_each_prefilter_hit(index, needle, on_hit),
         }
     } else if let Some(piece) = compiled.path_piece.as_deref()
-        && walk_below_names(index, piece, index.len() / PATH_WALK_SHARE, |idx| {
-            if index.is_synthetic(idx) {
-                return;
-            }
-            if let Some(c) = evaluate(
-                index,
-                parsed,
-                compiled,
-                idx,
-                scope,
-                &mut scope_memo,
-                &mut dir_paths,
-                &mut folders,
-                false,
-                &mut cp_buf,
-                &mut ext_scratch,
-            ) {
-                candidates.push(c);
-            }
-        })
+        && walk_below_names(
+            index,
+            piece,
+            index.len() / PATH_WALK_SHARE,
+            compiled.budget,
+            |idx| {
+                if index.is_synthetic(idx) {
+                    return;
+                }
+                if let Some(c) = evaluate(
+                    index,
+                    parsed,
+                    compiled,
+                    idx,
+                    scope,
+                    &mut scope_memo,
+                    &mut dir_paths,
+                    &mut folders,
+                    false,
+                    &mut cp_buf,
+                    &mut ext_scratch,
+                ) {
+                    candidates.push(c);
+                }
+            },
+        )
     {
         // Every match is at or below a name holding the piece, and the walk
         // visited each of those entries once.
@@ -1149,6 +1222,9 @@ fn scan_with(
         // its share. Iterate every live entry.
         candidates.clear();
         for idx in index.live_entries() {
+            if watch.tick() {
+                break;
+            }
             if index.is_synthetic(idx) {
                 continue;
             }
@@ -1623,15 +1699,12 @@ impl FolderPaths {
         }
         self.with_full_path(index, idx, |full| {
             (!whole || compiled.path_finders.iter().all(|f| f.find(full).is_some()))
-                && parsed
-                    .path_wildcards
+                && compiled
+                    .path_wildcard_ends
                     .iter()
-                    .zip(&compiled.path_wildcard_ends)
-                    .all(|(w, (lead, trail))| {
-                        full.starts_with(lead)
-                            && full.ends_with(trail)
-                            && w.matches_into(full, cp_buf)
-                    })
+                    .all(|(lead, trail)| full.starts_with(lead) && full.ends_with(trail))
+                && (parsed.path_wildcards.is_empty()
+                    || wildcards_match(&parsed.path_wildcards, full, cp_buf, compiled.budget))
         })
         .unwrap_or(false)
     }
@@ -1647,6 +1720,14 @@ impl FolderPaths {
         let open = before_name.last() == Some(&b'\\');
         self.needs.clear();
         for finder in &compiled.path_finders {
+            // Every term searches the whole path at each new folder, which on
+            // a path of megabytes is the costliest step of a candidate. A
+            // spent budget says no name can complete the term, and the search
+            // stops at its next check.
+            if before_name.len() > CACHED_PATH_MAX && compiled.budget.check() {
+                self.needs.push(Need::Never);
+                continue;
+            }
             let term = finder.needle();
             self.needs.push(if finder.find(before_name).is_some() {
                 Need::Nothing
@@ -1810,36 +1891,46 @@ const PATH_WALK_SHARE: usize = 4;
 /// runs past [`MAX_PATH_HOPS`] holds no path and is skipped; `visit` still
 /// sees entries too deep for a path, for its caller to reject.
 ///
-/// Returns `false`, having visited some entries, once more than `budget`
-/// entries would be visited.
+/// Returns `false`, having visited some entries, once more than `max_visits`
+/// entries would be visited. It stops as well once `budget` is spent, which
+/// the caller finds out from the budget: the climb from each top can cost
+/// thousands of hops, and it runs even for a top too deep to visit.
 fn walk_below_names(
     index: &VolumeIndex,
     piece: &[u8],
-    budget: usize,
+    max_visits: usize,
+    budget: &Budget,
     mut visit: impl FnMut(EntryIdx),
 ) -> bool {
     let mut bearing = 0usize;
     let mut tops: Vec<EntryIdx> = Vec::new();
     for_each_prefilter_hit(index, piece, |id| {
         bearing += index.name_refcount(id) as usize;
-        if bearing <= budget {
+        if bearing <= max_visits {
             tops.extend(index.name_chain(id));
         }
     });
-    if bearing > budget {
+    if bearing > max_visits {
         return false;
     }
     // Sorted so that a climb can ask whether a folder is a top.
     tops.sort_unstable();
+    let mut watch = Watch::new(budget);
     let mut visited = 0usize;
     for &top in &tops {
+        if watch.tick() {
+            return true;
+        }
         if !walk_starts_at(index, top, &tops) {
             continue;
         }
         for idx in core::iter::once(top).chain(index.subtree_entries(top)) {
             visited += 1;
-            if visited > budget {
+            if visited > max_visits {
                 return false;
+            }
+            if watch.tick() {
+                return true;
             }
             visit(idx);
         }
@@ -2022,6 +2113,37 @@ mod tests {
         FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
     };
 
+    /// A budget for the tests that never runs out.
+    static UNLIMITED: Budget<'static> = Budget::unlimited();
+
+    /// [`page_refs`] with a budget that never runs out.
+    #[allow(clippy::too_many_arguments)]
+    fn unlimited_refs(
+        index: &VolumeIndex,
+        mount_prefix: &str,
+        parsed: &ParsedQuery,
+        scope: Option<EntryIdx>,
+        sort: SortSpec,
+        offset: u32,
+        limit: Option<u32>,
+        sum_sizes: bool,
+        fast: bool,
+    ) -> RefOutcome {
+        page_refs(
+            index,
+            mount_prefix,
+            parsed,
+            scope,
+            sort,
+            offset,
+            limit,
+            sum_sizes,
+            fast,
+            &UNLIMITED,
+        )
+        .unwrap()
+    }
+
     fn frn(rec: u64) -> Frn {
         Frn(rec | (1u64 << 48))
     }
@@ -2082,6 +2204,139 @@ mod tests {
             idx.insert_enum(&enum_rec(frn(f), frn(999), n, false));
         }
         idx
+    }
+
+    /// Every way a query can search checks its budget as it goes, wherever
+    /// more terms can make it cost more, so none holds the lock past it, and
+    /// a search the budget stopped fails rather than answering with what it
+    /// found so far.
+    #[test]
+    fn a_spent_budget_stops_every_way_of_searching() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let mut idx = sample_index();
+        // Enough other files that the walk below `docs` stays within its
+        // share of the volume, instead of giving up for the scan of every
+        // entry.
+        for i in 0..20 {
+            idx.insert_enum(&enum_rec(frn(200 + i), NTFS_ROOT_FRN, "filler.bin", false));
+        }
+        let docs = idx.head_of(frn(100));
+        let name = SortSpec::default_for(SortKey::Name);
+        let size = SortSpec::default_for(SortKey::Size);
+        let cancelled = AtomicBool::new(true);
+        for (way, q, scope, sort, limit) in [
+            ("distinct names", "*e*", None, name, None),
+            ("best of the matches", "*e*", None, size, Some(10)),
+            ("prefilter hits", "e size:>0", None, name, None),
+            ("every entry", "size:>0", None, name, None),
+            ("below a path piece", r"docs\", None, name, None),
+            ("every full path", r"*\*", None, name, None),
+            ("a folder", "", docs, name, None),
+        ] {
+            let parsed = parse_query(q).unwrap();
+            let run = |budget: &Budget| {
+                page_refs(
+                    &idx, r"C:\", &parsed, scope, sort, 0, limit, true, true, budget,
+                )
+            };
+            let found = run(&UNLIMITED).unwrap();
+            assert!(found.total > 0, "{way}: matches nothing");
+            let spent = Budget::until(Instant::now() + Duration::from_secs(3600), &cancelled);
+            assert_eq!(run(&spent), Err(Stopped), "{way}");
+        }
+    }
+
+    /// A budget that a cancel flag, set already or later, spends.
+    fn cancelled_by(cancel: &std::sync::atomic::AtomicBool) -> Budget<'_> {
+        use std::time::{Duration, Instant};
+        Budget::until(Instant::now() + Duration::from_secs(3600), cancel)
+    }
+
+    /// The climb from a top to the root costs thousands of hops and visits
+    /// nothing when the top is too deep for a path, so it checks the budget
+    /// itself: a million such tops held the lock for 100 s, and answered with
+    /// no matches.
+    #[test]
+    fn a_spent_budget_stops_the_climb_from_a_top_too_deep_to_visit() {
+        use std::sync::atomic::AtomicBool;
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let mut parent = NTFS_ROOT_FRN;
+        for i in 0..MAX_PATH_HOPS as u64 + 4 {
+            idx.insert_enum(&enum_rec(frn(1000 + i), parent, "d", true));
+            parent = frn(1000 + i);
+        }
+        idx.insert_enum(&enum_rec(frn(100), parent, "zq", true));
+        let parsed = parse_query(r"zq\").unwrap();
+        let run = |budget: &Budget| {
+            page_refs(
+                &idx,
+                r"C:\",
+                &parsed,
+                None,
+                SortSpec::default(),
+                0,
+                None,
+                false,
+                true,
+                budget,
+            )
+        };
+        assert_eq!(run(&UNLIMITED).unwrap().total, 0, "too deep to have a path");
+        let cancel = AtomicBool::new(true);
+        assert_eq!(run(&cancelled_by(&cancel)), Err(Stopped));
+    }
+
+    /// A walk under way ends soon after its budget is spent, instead of going
+    /// through every entry below the name.
+    #[test]
+    fn a_spent_budget_ends_a_walk_under_way() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        idx.insert_enum(&enum_rec(frn(100), NTFS_ROOT_FRN, "zq", true));
+        let files = 1000;
+        for i in 0..files {
+            idx.insert_enum(&enum_rec(frn(1000 + i), frn(100), "file", false));
+        }
+        let cancel = AtomicBool::new(false);
+        let budget = cancelled_by(&cancel);
+        let mut visits = 0;
+        walk_below_names(&idx, b"zq", 10 * files as usize, &budget, |_| {
+            visits += 1;
+            cancel.store(true, Ordering::Relaxed);
+        });
+        assert!(budget.spent());
+        assert!(visits < files, "visited {visits} of {files}");
+    }
+
+    /// Past [`CACHED_PATH_MAX`], each term's search of a folder's path checks
+    /// the budget first: 256 terms over a path of megabytes cost a folder 0.9 s,
+    /// and a real path never gets here.
+    #[test]
+    fn a_spent_budget_answers_for_each_term_on_a_long_path() {
+        use std::sync::atomic::AtomicBool;
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let long = "a".repeat(250);
+        let mut parent = NTFS_ROOT_FRN;
+        for i in 0..5 {
+            idx.insert_enum(&enum_rec(frn(100 + i), parent, &long, true));
+            parent = frn(100 + i);
+        }
+        idx.insert_enum(&enum_rec(frn(200), NTFS_ROOT_FRN, "aaaa", true));
+        let parsed = parse_query(r"aaaa\").unwrap();
+        let cancel = AtomicBool::new(true);
+        let spent = cancelled_by(&cancel);
+        let needs = |budget: &Budget, folder: Frn| {
+            let compiled = CompiledQuery::new(&parsed, r"C:\", budget);
+            let mut folders = FolderPaths::new(&idx, &compiled.prefix, true);
+            folders.load(&idx, idx.head_of(folder).unwrap());
+            folders.decide_needs(&compiled);
+            folders.needs.clone()
+        };
+        let (deep, near) = (frn(104), frn(200));
+        assert!(matches!(needs(&UNLIMITED, deep)[..], [Need::Nothing]));
+        assert!(matches!(needs(&spent, deep)[..], [Need::Never]));
+        assert!(matches!(needs(&spent, near)[..], [Need::Nothing]));
     }
 
     /// A case-sensitive scope follows the exact names down through the child
@@ -2221,7 +2476,9 @@ mod tests {
             0,
             Some(0),
             true,
+            &UNLIMITED,
         )
+        .unwrap()
         .total_size
     }
 
@@ -2257,7 +2514,9 @@ mod tests {
             0,
             None,
             false,
-        );
+            &UNLIMITED,
+        )
+        .unwrap();
         assert_eq!(unasked.total_size, None);
     }
 
@@ -2696,7 +2955,7 @@ mod tests {
                 r"docs\",
             ] {
                 let parsed = parse_query(q).unwrap();
-                let compiled = CompiledQuery::new(&parsed, r"C:\");
+                let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
                 let walked = |scope| {
                     let mut found: Vec<EntryIdx> = scan(idx, &parsed, &compiled, scope)
                         .iter()
@@ -2849,8 +3108,10 @@ mod tests {
                     (total, Some(5)),
                 ] {
                     let hits = run_query(&idx, r"C:\", &parsed, None, sort, offset, limit);
-                    let refs =
-                        run_query_refs(&idx, r"C:\", &parsed, None, sort, offset, limit, false);
+                    let refs = run_query_refs(
+                        &idx, r"C:\", &parsed, None, sort, offset, limit, false, &UNLIMITED,
+                    )
+                    .unwrap();
                     assert_eq!(refs.total, hits.total);
                     let want: Vec<EntryIdx> = hits.hits.iter().map(|h| h.idx).collect();
                     let got: Vec<EntryIdx> = refs.refs.iter().map(|r| r.idx).collect();
@@ -2896,7 +3157,7 @@ mod tests {
                 let parsed = parse_query(q).unwrap();
                 // Ground truth: the candidate path's match SET (ranks play no
                 // part in which entries match), ordered by the bytes alone.
-                let mut ground: Vec<EntryIdx> = page_refs(
+                let mut ground: Vec<EntryIdx> = unlimited_refs(
                     idx,
                     r"C:\",
                     &parsed,
@@ -2937,10 +3198,12 @@ mod tests {
                             (start + l as usize).min(expected_all.len())
                         });
                         let expected = &expected_all[start..end];
-                        let fast =
-                            page_refs(idx, r"C:\", &parsed, None, sort, offset, limit, true, true);
-                        let slow =
-                            page_refs(idx, r"C:\", &parsed, None, sort, offset, limit, true, false);
+                        let fast = unlimited_refs(
+                            idx, r"C:\", &parsed, None, sort, offset, limit, true, true,
+                        );
+                        let slow = unlimited_refs(
+                            idx, r"C:\", &parsed, None, sort, offset, limit, true, false,
+                        );
                         let ctx = format!("{stage}: {q:?} {dir:?} offset {offset} limit {limit:?}");
                         assert_eq!(fast.total, u64::from(total), "total (name-level) {ctx}");
                         assert_eq!(slow.total, u64::from(total), "total (candidates) {ctx}");
@@ -3285,17 +3548,17 @@ mod tests {
         }
         let e = |f: u64| idx.head_of(frn(f)).unwrap();
         let mut seen = Vec::new();
-        assert!(walk_below_names(&idx, b"sys32", 100, |x| seen.push(x)));
+        assert!(walk_below_names(&idx, b"sys32", 100, &UNLIMITED, |x| seen.push(x)));
         seen.sort_unstable();
         let mut want = vec![e(100), e(101), e(102), e(103), e(106)];
         want.sort_unstable();
         assert_eq!(seen, want);
         assert!(
-            !walk_below_names(&idx, b"sys32", 4, |_| {}),
+            !walk_below_names(&idx, b"sys32", 4, &UNLIMITED, |_| {}),
             "five to visit"
         );
         assert!(
-            !walk_below_names(&idx, b"sys32", 3, |_| panic!("walked")),
+            !walk_below_names(&idx, b"sys32", 3, &UNLIMITED, |_| panic!("walked")),
             "four names hold the piece"
         );
     }
@@ -3306,7 +3569,7 @@ mod tests {
     fn the_path_walk_takes_the_longest_piece_the_prefix_lacks() {
         let piece = |query: &str, prefix: &str| {
             let parsed = parse_query(query).unwrap();
-            CompiledQuery::new(&parsed, prefix)
+            CompiledQuery::new(&parsed, prefix, &UNLIMITED)
                 .path_piece
                 .map(|p| String::from_utf8(p).unwrap())
         };
@@ -3348,7 +3611,7 @@ mod tests {
         let report = parse_query("report").unwrap();
         for query in [r"C:\ report", r"\ report", "path:c: report"] {
             let parsed = parse_query(query).unwrap();
-            let compiled = CompiledQuery::new(&parsed, r"C:\");
+            let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
             assert!(is_name_level(&idx, &parsed, &compiled, None), "{query}");
             assert_eq!(
                 hits_under(&idx, r"C:\", &parsed),
@@ -3360,7 +3623,7 @@ mod tests {
         assert!(!is_name_level(
             &idx,
             &other_drive,
-            &CompiledQuery::new(&other_drive, r"D:\"),
+            &CompiledQuery::new(&other_drive, r"D:\", &UNLIMITED),
             None
         ));
         assert!(hits_under(&idx, r"D:\", &other_drive).is_empty());
@@ -3558,7 +3821,7 @@ mod tests {
             prop_assume!(!folders.is_empty());
             let scope = *scope_pick.get(&folders);
             let parsed = parse_query(query).unwrap();
-            let compiled = CompiledQuery::new(&parsed, r"C:\");
+            let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
             let found = |floor| {
                 let mut found: Vec<EntryIdx> = scan_with(&idx, &parsed, &compiled, Some(scope), floor)
                     .iter()
@@ -3612,7 +3875,7 @@ mod tests {
     /// and the ones the built-path keys give, over both directions and a few
     /// slices, or `None` when every page agrees.
     fn path_pages_differ(index: &VolumeIndex, parsed: &ParsedQuery) -> Option<String> {
-        let compiled = CompiledQuery::new(parsed, r"C:\");
+        let compiled = CompiledQuery::new(parsed, r"C:\", &UNLIMITED);
         for dir in [SortDir::Asc, SortDir::Desc] {
             let sort = SortSpec {
                 key: SortKey::Path,
@@ -3624,7 +3887,7 @@ mod tests {
                 path_keys_by_built_paths(index, &mut old);
                 order_top(index, &mut old, sort, end);
                 let old: Vec<EntryIdx> = old[start..end].iter().map(|c| c.idx).collect();
-                let refs = page_refs(
+                let refs = unlimited_refs(
                     index, r"C:\", parsed, None, sort, offset, limit, false, true,
                 )
                 .refs;
@@ -3743,7 +4006,7 @@ mod tests {
                 key: SortKey::Path,
                 dir,
             };
-            let refs = page_refs(&idx, r"C:\", &parsed, None, sort, 0, None, false, true).refs;
+            let refs = unlimited_refs(&idx, r"C:\", &parsed, None, sort, 0, None, false, true).refs;
             let got: Vec<EntryIdx> = refs.iter().map(|r| r.idx).collect();
             assert_eq!(got, want, "{dir:?}");
             want.reverse();
@@ -3922,8 +4185,8 @@ mod tests {
             let sort = SortSpec { key: SORT_KEYS[key], dir };
             // A count alone, as `-get-result-count` asks, and a single row.
             for (offset, limit) in [(offset, limit), (0, Some(0)), (0, Some(1))] {
-                let fast = page_refs(&idx, r"C:\", &parsed, None, sort, offset, limit, true, true);
-                let slow = page_refs(&idx, r"C:\", &parsed, None, sort, offset, limit, true, false);
+                let fast = unlimited_refs(&idx, r"C:\", &parsed, None, sort, offset, limit, true, true);
+                let slow = unlimited_refs(&idx, r"C:\", &parsed, None, sort, offset, limit, true, false);
                 prop_assert_eq!(fast.total, slow.total);
                 prop_assert_eq!(fast.total_size, slow.total_size);
                 let fast: Vec<EntryIdx> = fast.refs.iter().map(|r| r.idx).collect();

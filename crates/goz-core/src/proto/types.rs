@@ -256,7 +256,8 @@ pub struct VolumeStatus {
 /// Machine-readable failure class carried by [`Response::Error`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtoError {
-    /// The query string failed to parse.
+    /// The query string failed to parse, or the query needed longer than
+    /// gozd lets one query search a volume.
     BadQuery,
     /// Unexpected server-side failure.
     Internal,

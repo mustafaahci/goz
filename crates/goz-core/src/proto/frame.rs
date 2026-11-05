@@ -47,7 +47,9 @@ pub enum FrameError {
 /// Feed bytes as they arrive with [`feed`](Self::feed), then pop complete
 /// frames with [`next_frame`](Self::next_frame). Consumed frames are drained
 /// from the internal buffer (offset + periodic compaction), so memory stays
-/// bounded by the largest in-flight frame plus a small constant.
+/// bounded by the largest in-flight frame plus a small constant, as long as
+/// the caller feeds more only once [`is_empty`](Self::is_empty) or
+/// [`next_frame`](Self::next_frame) says the bytes so far are used up.
 pub struct FrameDecoder {
     /// Buffered bytes; `buf[read..]` is the unconsumed tail.
     buf: Vec<u8>,
@@ -75,6 +77,11 @@ impl FrameDecoder {
     /// [`next_frame`](Self::next_frame).
     pub fn feed(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// Whether every byte fed so far has left in a frame.
+    pub fn is_empty(&self) -> bool {
+        self.read == self.buf.len()
     }
 
     /// Pops the next complete frame, `None` if more bytes are needed.
