@@ -75,7 +75,9 @@ goz --json kernel32.dll
 goz --status
 ```
 
-`goz` accepts a subset of `es.exe` flags (`-path`, `-n` / `-max-results`, the `-sort` family, `-size`, `-dm`, `-export-csv`, the CSV-shape switches, `-get-result-count` and `-get-total-size`) and matches `es.exe`'s exit codes. Unsupported switches exit `6`, the same as `es.exe`. A size or date sort lists the entries without that value last, whichever way it runs: folders, since goz keeps no folder sizes, and files whose size or date is not read yet.
+`goz` reads its command line as `es.exe` does and accepts the search, sort and output switches of `es.exe`, with `-` or `/`: `-path`, `-n`, `-o`, `-i`, `-p`, `/ad`, `/a-d`, `/s`, `/on`, `/o-s`, the `-sort` family, `-size`, `-dm`, `-csv`, `-tsv`, `-efu`, `-txt`, `-m3u`, `-m3u8`, `-json`, each with its `-export-*` form, and more; `goz --help` lists them all. It matches `es.exe`'s exit codes. A switch `es.exe` has and goz lacks, such as `-r` or `/w`, exits `6`, the same as an unknown one, instead of searching for its text. A size or date sort lists the entries without that value last, whichever way it runs: folders, since goz keeps no folder sizes, and files whose size or date is not read yet.
+
+Quotes keep their meaning from the command line: `goz "annual report"` finds that phrase, and `goz annual report` finds names holding both words. A program that passes one argument per search, with its own quoting as Node's `execFile` does, should pass `-argv` first, which `es.exe` also takes: the argument then means its words, not a phrase.
 
 `--json` prints one object: `total` (every match), `items`, `more` (true when `-n` left matches out), `volumes_incomplete`, `metadata_pending` and `generation`, which is always 0 and only kept for compatibility.
 

@@ -5,7 +5,7 @@
 //! for a path wildcard), path terms (a term
 //! containing `\` or `/`, matched against the full path with its drive), and
 //! the functions `ext:`, `size:`, `dm:`, `path:`, `file:`, `folder:`, `case:`,
-//! whose value may be quoted. The boolean operators `|` and `!` are rejected
+//! `matchpath:`, whose value may be quoted. The boolean operators `|` and `!` are rejected
 //! loudly rather than silently mis-executed: es's own precedence for them is
 //! undocumented, so guessing it would be a compatibility trap. An unknown
 //! `func:` prefix is refused too: as text it could match nothing, since no name
@@ -343,7 +343,7 @@ pub enum QueryError {
     /// A `func:` goz does not know, carried with its colon. Searching it as text
     /// would match nothing, since no name contains `:`.
     #[error(
-        "unknown search function '{0}'; goz supports ext:, size:, dm:, path:, file:, folder:, dir: and case:"
+        "unknown search function '{0}'; goz supports ext:, size:, dm:, path:, file:, folder:, dir:, case: and matchpath:"
     )]
     UnknownFunction(String),
     /// A `dm:` term in a query parsed without a [`LocalClock`] to resolve it.
@@ -376,6 +376,18 @@ fn case_directive(text: &str) -> Option<bool> {
     match text.to_ascii_lowercase().as_str() {
         "case:" | "case:1" => Some(true),
         "case:0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Recognizes the `matchpath:` directive, as `case_directive` does `case:`:
+/// the search text tests the full path, not only the name. es's `-p` sends it
+/// rather than a request field, so a gozd too old to know it refuses the search
+/// instead of answering a different one.
+fn match_path_directive(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "matchpath:" | "matchpath:1" => Some(true),
+        "matchpath:0" => Some(false),
         _ => None,
     }
 }
@@ -420,6 +432,12 @@ fn parse(
         .filter_map(|t| case_directive(&t.text))
         .next_back()
         .unwrap_or(match_case);
+    let match_path = tokens
+        .iter()
+        .filter(|t| t.func_colon.is_some())
+        .filter_map(|t| match_path_directive(&t.text))
+        .next_back()
+        .unwrap_or(false);
 
     let fold_term = |s: &[u8]| -> Vec<u8> { if match_case { s.to_vec() } else { fold(s) } };
 
@@ -434,8 +452,10 @@ fn parse(
 
     for tok in &tokens {
         let text = tok.text.as_str();
-        if tok.func_colon.is_some() && case_directive(text).is_some() {
-            continue; // case:/case:0/case:1 are consumed, never search terms
+        if tok.func_colon.is_some()
+            && (case_directive(text).is_some() || match_path_directive(text).is_some())
+        {
+            continue; // the directives are consumed, never search terms
         }
 
         if let Some(colon) = tok.func_colon {
@@ -468,13 +488,22 @@ fn parse(
                 }
                 "file" => {
                     q.filters.kind = Some(Kind::File);
-                    push_text_term(&mut q, value, tok.quoted, false, &fold_term);
+                    push_text_term(&mut q, value, tok.quoted, match_path, &fold_term);
                     continue;
                 }
                 "folder" | "dir" => {
                     q.filters.kind = Some(Kind::Folder);
-                    push_text_term(&mut q, value, tok.quoted, false, &fold_term);
+                    push_text_term(&mut q, value, tok.quoted, match_path, &fold_term);
                     continue;
+                }
+                // Not one of the values `match_path_directive` consumed.
+                "matchpath" => {
+                    return Err(QueryError::Malformed {
+                        what: "matchpath:",
+                        detail: format!(
+                            "expected matchpath:, matchpath:0 or matchpath:1, got matchpath:{value}"
+                        ),
+                    });
                 }
                 // Not one of the directives `case_directive` consumed.
                 "case" => {
@@ -493,7 +522,7 @@ fn parse(
             }
         }
 
-        push_text_term(&mut q, text, tok.quoted, false, &fold_term);
+        push_text_term(&mut q, text, tok.quoted, match_path, &fold_term);
     }
 
     let terms = term_count(&q);
@@ -1066,6 +1095,23 @@ mod tests {
             parse_query(&exts(MAX_QUERY_TERMS)),
             Err(QueryError::TooManyTerms(MAX_QUERY_TERMS + 1))
         );
+    }
+
+    /// `matchpath:` sends all the search text to the full path, wherever it
+    /// stands, and leaves the functions that are not about text alone.
+    #[test]
+    fn match_path_moves_text_terms_to_the_full_path() {
+        let p = q("report matchpath: *.pdf ext:pdf");
+        assert_eq!(p.path_terms, [b"report".to_vec()]);
+        assert!(p.name_terms.is_empty() && p.wildcards.is_empty());
+        assert!(p.path_wildcards[0].matches(br"c:\docs\a.pdf"));
+        assert_eq!(p.filters.ext, Some(vec![b"pdf".to_vec()]));
+        assert_eq!(q("file:x matchpath:").path_terms, [b"x".to_vec()]);
+        assert_eq!(q("x matchpath: matchpath:0").name_terms, [b"x".to_vec()]);
+        assert!(matches!(
+            parse_query("matchpath:maybe"),
+            Err(QueryError::Malformed { .. })
+        ));
     }
 
     /// A budget already spent, for the tests of what checks one.

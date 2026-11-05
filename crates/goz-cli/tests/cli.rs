@@ -162,7 +162,8 @@ fn a_non_unicode_argument_exits_4() {
         .expect("failed to spawn the goz binary");
     assert_eq!(out.status.code(), Some(4), "stderr: {}", stderr(&out));
     assert!(
-        stderr(&out).contains("goz: an argument is not valid Unicode: a\u{FFFD}"),
+        stderr(&out).contains("goz: the command line is not valid Unicode: ")
+            && stderr(&out).contains("a\u{FFFD}"),
         "stderr: {}",
         stderr(&out)
     );

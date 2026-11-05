@@ -38,6 +38,8 @@ pub struct PlainOptions {
     pub columns: Vec<EsColumn>,
     /// How a Size cell groups its digits.
     pub grouping: DigitGrouping,
+    /// Whether each path is wrapped in double quotes, from `-double-quote`.
+    pub quote: bool,
 }
 
 impl Default for PlainOptions {
@@ -45,6 +47,7 @@ impl Default for PlainOptions {
         Self {
             columns: Vec::new(),
             grouping: DigitGrouping::es_default(),
+            quote: false,
         }
     }
 }
@@ -156,7 +159,13 @@ pub fn write_plain_row(opts: &PlainOptions, row: &Row<'_>, out: &mut Vec<u8>) {
         }
         out.push(b' ');
     }
+    if opts.quote {
+        out.push(b'"');
+    }
     out.extend_from_slice(row.path.as_bytes());
+    if opts.quote {
+        out.push(b'"');
+    }
     out.push(b'\n');
 }
 
@@ -243,6 +252,7 @@ mod tests {
             let format = Format::Plain(PlainOptions {
                 columns: columns.to_vec(),
                 grouping: DigitGrouping::from_locale(Some(","), Some("3;0")),
+                quote: false,
             });
             let mut writer = ResultWriter::new(format, format_filetime_utc);
             let mut out = Vec::new();
@@ -361,6 +371,7 @@ mod tests {
         let opts = PlainOptions {
             columns: vec![EsColumn::Size],
             grouping: DigitGrouping::from_locale(Some("\u{a0}"), Some("3;0")),
+            quote: false,
         };
         let mut out = Vec::new();
         write_plain_row(&opts, &file(r"C:\x", Some(1_234_567), None), &mut out);

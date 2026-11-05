@@ -2,8 +2,8 @@
 
 /// How a goz run ends, as its process exit code.
 ///
-/// Codes 4 to 8 keep es.exe's numbers and meanings, so a script written
-/// against es reads them the same way; 9 is goz's own.
+/// Codes 4 to 9 keep es.exe's numbers and meanings, so a script written
+/// against es reads them the same way; 10 is goz's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
     /// 0: the run did what it was asked.
@@ -20,19 +20,22 @@ pub enum Exit {
     Protocol,
     /// 8: gozd is not running.
     NotRunning,
-    /// 9: the pipe server is not the trusted gozd.
+    /// 9: `-no-result-error` was given and nothing matched.
+    NoResults,
+    /// 10: the pipe server is not the trusted gozd.
     Untrusted,
 }
 
 impl Exit {
     /// Every exit code, in the order the help lists them.
-    pub const ALL: [Exit; 7] = [
+    pub const ALL: [Exit; 8] = [
         Exit::Success,
         Exit::BadParam,
         Exit::WriteFailed,
         Exit::UnknownSwitch,
         Exit::Protocol,
         Exit::NotRunning,
+        Exit::NoResults,
         Exit::Untrusted,
     ];
 
@@ -45,7 +48,8 @@ impl Exit {
             Exit::UnknownSwitch => 6,
             Exit::Protocol => 7,
             Exit::NotRunning => 8,
-            Exit::Untrusted => 9,
+            Exit::NoResults => 9,
+            Exit::Untrusted => 10,
         }
     }
 
@@ -66,6 +70,7 @@ impl Exit {
                  or none in time"
             }
             Exit::NotRunning => "gozd is not running",
+            Exit::NoResults => "-no-result-error was given and nothing matched",
             Exit::Untrusted => "The pipe server is not the trusted gozd",
         }
     }
@@ -85,6 +90,6 @@ mod tests {
     #[test]
     fn codes_keep_their_numbers() {
         let codes: Vec<u8> = Exit::ALL.iter().map(|exit| exit.code()).collect();
-        assert_eq!(codes, [0, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(codes, [0, 4, 5, 6, 7, 8, 9, 10]);
     }
 }

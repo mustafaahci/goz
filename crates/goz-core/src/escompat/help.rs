@@ -106,9 +106,11 @@ const USAGE: &str = "Usage: goz [switches] [search text]";
 const INTRO: &str = "goz prints the full path of every indexed file and folder that \
      matches the search text, one per line, sorted by name. With no search text it \
      lists everything. A switch starts with a dash or a slash, and any dash inside \
-     its name may be left out, so -sortpath is -sort-path. A switch with two leading \
-     dashes, such as --json, is goz's own and must be typed exactly. Quote search \
-     text that holds < or > so the shell passes it on.";
+     its name may be left out, so -sortpath is -sort-path. A second leading dash \
+     changes nothing, except for goz's own switches such as --json, which must be \
+     typed exactly. A value can follow an equals sign, as in -n=5. Two dashes alone \
+     end the switches: the rest is search text. Quote search text that holds < or > \
+     so the shell passes it on.";
 
 const QUICK_FOOTER: &str = "Run goz --help for every switch, the search syntax and the exit codes.";
 
@@ -130,10 +132,11 @@ const EXAMPLES: &[(&str, &str)] = &[
     ("goz --status", "Check whether every volume is ready"),
 ];
 
-/// Search text as goz receives it, after the shell has removed its quotes.
+/// Search text as goz receives it.
 const SEARCH_TEXT: &[(&str, &str)] = &[
     ("report", "Names that contain report"),
     ("report pdf", "Names that contain both words, in any order"),
+    ("\"report pdf\"", "Names that contain that exact phrase"),
     ("*.cs", "Whole names that match a wildcard, * or ?"),
     (r"docs\api", r"Full paths that contain docs\api"),
     (r"C:\repo\", "Everything below that folder"),
@@ -153,6 +156,10 @@ const SEARCH_TEXT: &[(&str, &str)] = &[
         "Only files, or only folders; file:TEXT also needs TEXT in the name",
     ),
     ("case:", "Match case for this search"),
+    (
+        "matchpath:",
+        "Match all search text against full paths, as -p does",
+    ),
 ];
 
 /// The widest usage that keeps its text beside it in a switch section; a
@@ -334,11 +341,17 @@ mod tests {
         listed
     }
 
+    /// Whether a query holds only what a switch adds to it, or nothing: no
+    /// token was taken as search text. `text` is the sample for `-q TEXT`.
+    fn holds_no_search_text(query: &str) -> bool {
+        ["", "folder:", "file:", "matchpath:", "text"].contains(&query)
+    }
+
     /// Whether `parse_argv` takes `token` alone as a switch rather than as
     /// search text or an unknown switch.
     fn parses_as_switch(token: &str) -> bool {
         match parse_argv(&argv(&[token])) {
-            Ok(Command::Run(plan)) => plan.query.is_empty(),
+            Ok(Command::Run(plan)) => holds_no_search_text(&plan.query),
             Ok(Command::Help(_) | Command::Version) => true,
             // Exit 4 here can only be a switch missing its parameter.
             Err(fatal) => fatal.exit_code == Exit::BadParam.code(),
@@ -348,10 +361,10 @@ mod tests {
     /// Whether the help lists the switch the parser took `token` as.
     fn is_listed(token: &str, listed: &[String]) -> bool {
         let strip = |s: &str| s.replace('-', "");
-        if token.starts_with("--") {
-            return listed.iter().any(|form| form == token);
+        if listed.iter().any(|form| form == token) {
+            return true;
         }
-        let name = &token[1..];
+        let name = token.strip_prefix("--").unwrap_or(&token[1..]);
         listed
             .iter()
             .filter(|form| !form.starts_with("--"))
@@ -384,6 +397,7 @@ mod tests {
                             "DIR" => r"C:\repo",
                             "FILE" => "out.csv",
                             "KEY" => "size",
+                            "TEXT" => "text",
                             other => panic!("{form}: no sample value for {other}"),
                         };
                     }
@@ -391,7 +405,9 @@ mod tests {
                         continue; // expanded by listed_switches below
                     }
                     match parse_argv(&argv(&tokens)) {
-                        Ok(Command::Run(plan)) => assert_eq!(plan.query, "", "{form}"),
+                        Ok(Command::Run(plan)) => {
+                            assert!(holds_no_search_text(&plan.query), "{form}: {}", plan.query);
+                        }
                         Ok(Command::Help(_) | Command::Version) => {}
                         Err(fatal) => panic!("{form}: {fatal}"),
                     }

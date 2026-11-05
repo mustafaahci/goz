@@ -1,4 +1,4 @@
-//! Byte-exact es-compatible CSV writer.
+//! Byte-exact es-compatible CSV writer, and TSV, the same with a tab.
 //!
 //! Reproduces the `-export-csv` output of voidtools es.exe 1.1.0.30, with one
 //! documented deviation: goz writes a UTF-8 BOM by default (stock es only with
@@ -28,6 +28,8 @@ use crate::types::EsColumn;
 /// Options controlling the CSV byte stream, mirroring es.exe's flags.
 #[derive(Clone, Debug)]
 pub struct CsvOptions {
+    /// What separates the cells: `,`, or a tab for TSV.
+    pub separator: u8,
     /// Write the UTF-8 BOM (`EF BB BF`) first. goz defaults to `true`, a
     /// documented deviation; stock es writes a BOM only with `-utf8-bom`.
     pub bom: bool,
@@ -46,6 +48,7 @@ impl Default for CsvOptions {
     /// goz defaults; BOM on is a documented deviation from stock es.
     fn default() -> Self {
         Self {
+            separator: b',',
             bom: true,
             header: true,
             double_quote: true,
@@ -78,7 +81,7 @@ pub fn write_csv_preamble(opts: &CsvOptions, out: &mut Vec<u8>) {
     if opts.header {
         for &col in &opts.columns {
             out.extend_from_slice(column_display_name(col).as_bytes());
-            out.push(b',');
+            out.push(opts.separator);
         }
         out.extend_from_slice(b"Filename\r\n");
     }
@@ -99,9 +102,9 @@ pub fn write_csv_row(opts: &CsvOptions, row: &Row<'_>, out: &mut Vec<u8>) {
                 }
             }
         }
-        out.push(b',');
+        out.push(opts.separator);
     }
-    if opts.double_quote || needs_quoting(row.path) {
+    if opts.double_quote || needs_quoting(row.path, opts.separator) {
         write_quoted(row.path, out);
     } else {
         out.extend_from_slice(row.path.as_bytes());
@@ -119,15 +122,15 @@ fn column_display_name(col: EsColumn) -> &'static str {
 
 /// es's `_es_should_quote` (cli.c:1707-1718): quote when the field contains
 /// the separator, a double quote, CR, or LF.
-fn needs_quoting(field: &str) -> bool {
+fn needs_quoting(field: &str, separator: u8) -> bool {
     field
         .bytes()
-        .any(|b| matches!(b, b',' | b'"' | b'\r' | b'\n'))
+        .any(|b| b == separator || matches!(b, b'"' | b'\r' | b'\n'))
 }
 
 /// Wraps `field` in double quotes, doubling interior `"` (RFC-4180 / es
 /// cli.c:1668-1697).
-fn write_quoted(field: &str, out: &mut Vec<u8>) {
+pub(super) fn write_quoted(field: &str, out: &mut Vec<u8>) {
     out.push(b'"');
     for &b in field.as_bytes() {
         if b == b'"' {
@@ -171,6 +174,30 @@ mod tests {
         assert_eq!(
             out.as_slice(),
             b"\xEF\xBB\xBFSize,Date Modified,Filename\r\n"
+        );
+    }
+
+    /// TSV is the same with a tab: a comma needs no quotes, and a tab does.
+    #[test]
+    fn a_tab_separator_quotes_tabs_and_not_commas() {
+        let opts = CsvOptions {
+            separator: b'\t',
+            bom: false,
+            double_quote: false,
+            ..size_dm_opts()
+        };
+        let out = write(
+            &opts,
+            vec![
+                file(r"C:\a,b", 5, "2026-07-13T15:42:00"),
+                file("C:\\a\tb", 6, "2026-07-13T15:42:00"),
+            ],
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Size\tDate Modified\tFilename\r\n\
+             5\t2026-07-13T15:42:00\tC:\\a,b\r\n\
+             6\t2026-07-13T15:42:00\t\"C:\\a\tb\"\r\n"
         );
     }
 
@@ -448,6 +475,7 @@ mod tests {
                 header,
                 double_quote,
                 columns: vec![EsColumn::Size, EsColumn::DateModified],
+                ..CsvOptions::default()
             };
             let mut out = Vec::new();
             write_csv(

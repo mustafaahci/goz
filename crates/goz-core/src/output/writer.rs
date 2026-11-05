@@ -8,6 +8,7 @@
 use super::Row;
 use super::csv::{CsvOptions, write_csv_preamble, write_csv_row};
 use super::json::Json;
+use super::list::{List, ListOptions};
 use super::plain::{PlainOptions, write_plain_row};
 use crate::proto::QueryResults;
 use crate::types::EsColumn;
@@ -18,8 +19,10 @@ pub enum Format {
     /// One line per result, ending in LF: the path, after es's console
     /// cells when `-size` or `-dm` asks for them.
     Plain(PlainOptions),
-    /// es's `-export-csv` bytes.
+    /// es's `-export-csv` bytes, or `-export-tsv`'s with a tab.
     Csv(CsvOptions),
+    /// es's `-txt`, `-efu` or `-json`.
+    List(ListOptions),
     /// One object for the whole result set, in the bytes
     /// `serde_json::to_string_pretty` gives a [`QueryResults`] holding every
     /// item, then an LF. Its `more` says whether `limit`, the query's `-n`,
@@ -45,6 +48,7 @@ enum State {
         /// Whether the byte order mark and header are written.
         started: bool,
     },
+    List(List),
     Json(Json),
 }
 
@@ -57,6 +61,7 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
                 opts,
                 started: false,
             },
+            Format::List(opts) => State::List(List::new(opts)),
             Format::Json { limit } => State::Json(Json::new(limit)),
         };
         Self { state, date }
@@ -79,6 +84,7 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
                     write_csv_row(opts, row, out);
                 });
             }
+            State::List(list) => list.page(page, out),
             State::Json(json) => json.page(page, out),
         }
     }
@@ -93,6 +99,7 @@ impl<D: FnMut(i64) -> String> ResultWriter<D> {
                     write_csv_preamble(&opts, out);
                 }
             }
+            State::List(mut list) => list.finish(out),
             State::Json(mut json) => json.tail(out),
         }
     }
@@ -261,7 +268,7 @@ mod tests {
             header in any::<bool>(),
             double_quote in any::<bool>(),
         ) {
-            let opts = CsvOptions { bom, header, double_quote, columns };
+            let opts = CsvOptions { separator: b',', bom, header, double_quote, columns };
             let pages = paged(&page(0, Vec::new(), false), &items, &cuts);
             let dates: Vec<Option<String>> =
                 items.iter().map(|it| it.mtime_ft.map(date)).collect();

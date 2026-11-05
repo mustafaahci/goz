@@ -6,8 +6,10 @@
 //! UTF-8 BOM is on by default.
 //! [`plain`] writes the default listing: a path per line, after es's console
 //! cells for `-size` and `-dm`.
+//! [`list`] writes es's other export formats: `-txt`, `-efu` and `-json`.
 //! [`writer`] turns each results page into the bytes of the CLI's output as
-//! the page arrives: plain lines, CSV rows, or the `--json` object.
+//! the page arrives: plain lines, CSV rows, those formats, or the `--json`
+//! object.
 //! [`filetime`] converts between FILETIME ticks and Unix milliseconds and
 //! renders civil UTC timestamps without a timezone database (the CLI formats
 //! local time itself).
@@ -15,6 +17,7 @@
 pub mod csv;
 pub mod filetime;
 mod json;
+pub mod list;
 pub mod plain;
 pub mod writer;
 
@@ -22,6 +25,7 @@ pub use csv::{CsvOptions, write_csv, write_csv_preamble, write_csv_row};
 pub use filetime::{
     FILETIME_UNIX_EPOCH, filetime_to_unix_ms, format_filetime_utc, unix_ms_to_filetime,
 };
+pub use list::{ListKind, ListOptions};
 pub use plain::{DigitGrouping, PlainOptions, write_plain_row};
 pub use writer::{Format, ResultWriter};
 

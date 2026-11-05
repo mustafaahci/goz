@@ -1,10 +1,10 @@
 //! goz: the CLI client.
 //!
-//! Parses arguments with the es.exe-compatible rules from
+//! Parses its raw command line with the es.exe-compatible rules from
 //! `goz-core::escompat`, talks to the running daemon over `\\.\pipe\goz-v1`,
-//! and writes results as an es-compatible CSV (`-export-csv`), JSON (`--json`),
-//! or a plain listing of paths after es's console columns (default), or only
-//! their number
+//! and writes results as one of es's export formats (`-csv`, `-export-csv` and
+//! their kin), goz's JSON object (`--json`), or a plain listing of paths after
+//! es's console columns (default), or only their number
 //! (`-get-result-count`) or the summed size of their files
 //! (`-get-total-size`). The help and version switches print to stdout
 //! without contacting the daemon.
@@ -13,7 +13,8 @@
 //! parameter / bad query / argument not valid Unicode · 5 export-file
 //! create failure / output write failure · 6 unknown switch · 7 protocol
 //! failure (malformed daemon reply, 30 s of silence from the daemon, or
-//! pipe open error) · 8 daemon unreachable · 9 pipe server not trusted.
+//! pipe open error) · 8 daemon unreachable · 9 no results with
+//! `-no-result-error` · 10 pipe server not trusted.
 
 // Thread-caching allocator: decoding a broad result set allocates a String per
 // path (millions of them), which the Windows default heap serializes.
@@ -32,30 +33,43 @@ mod status;
 #[cfg(windows)]
 mod timing;
 
-use goz_core::escompat::{Command, Exit, VERSION_LINE, help, parse_argv};
-use std::ffi::OsString;
+use goz_core::escompat::{Command, EsFatal, Exit, VERSION_LINE, help};
 use std::io::Write;
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    // `std::env::args` panics on an argument that is not valid Unicode, such
-    // as a lone surrogate on Windows; goz cannot use one, so it is a bad
-    // parameter.
-    let args = match std::env::args_os()
+/// The command line, parsed. Text that is not valid Unicode, such as a lone
+/// surrogate on Windows, is a bad parameter: goz cannot use it.
+#[cfg(windows)]
+fn parse_command() -> Result<Command, EsFatal> {
+    match goz_winfs::command_line() {
+        Ok(line) => goz_core::escompat::parse_command_line(&line),
+        Err(lossy) => Err(not_unicode(&lossy)),
+    }
+}
+
+/// The command line, parsed, from the arguments the platform split.
+#[cfg(not(windows))]
+fn parse_command() -> Result<Command, EsFatal> {
+    use std::ffi::OsString;
+    match std::env::args_os()
         .skip(1)
         .map(OsString::into_string)
         .collect::<Result<Vec<String>, OsString>>()
     {
-        Ok(args) => args,
-        Err(arg) => {
-            eprintln!(
-                "goz: an argument is not valid Unicode: {}",
-                arg.to_string_lossy()
-            );
-            return Exit::BadParam.into();
-        }
-    };
-    match parse_argv(&args) {
+        Ok(args) => goz_core::escompat::parse_argv(&args),
+        Err(arg) => Err(not_unicode(&arg.to_string_lossy())),
+    }
+}
+
+fn not_unicode(text: &str) -> EsFatal {
+    EsFatal {
+        exit_code: Exit::BadParam.code(),
+        message: format!("the command line is not valid Unicode: {text}"),
+    }
+}
+
+fn main() -> ExitCode {
+    match parse_command() {
         Ok(Command::Run(plan)) => execute(plan),
         Ok(Command::Help(screen)) => print(&help(screen)),
         Ok(Command::Version) => print(&format!("{VERSION_LINE}\n")),
@@ -103,9 +117,10 @@ use win::execute;
 mod win {
     use super::client::{Client, ClientError};
     use super::timing::Timing;
-    use goz_core::escompat::{EsPlan, Exit, VERSION_LINE};
+    use goz_core::escompat::{EsPlan, Exit, OutputFormat, VERSION_LINE};
     use goz_core::output::{
-        CsvOptions, DigitGrouping, Format, PlainOptions, ResultWriter, filetime_to_unix_ms,
+        CsvOptions, DigitGrouping, Format, ListKind, ListOptions, PlainOptions, ResultWriter,
+        filetime_to_unix_ms,
     };
     use goz_core::proto::{PROTO_VERSION, QueryRequest, QueryResults, Request, Response};
     use goz_core::types::{EsColumn, SortSpec};
@@ -136,7 +151,7 @@ mod win {
     fn run(plan: EsPlan, timing: &mut Option<Timing>) -> Result<ExitCode, ExitCode> {
         // Create the export file up front (es semantics): a later daemon-unreachable
         // failure then leaves the observable artifact, a 0-byte file + exit 8.
-        let export_file = match &plan.export_csv {
+        let export_file = match &plan.export_file {
             Some(path) => match std::fs::File::create(path) {
                 Ok(f) => Some(f),
                 Err(e) => {
@@ -196,8 +211,15 @@ mod win {
             })
             .map_err(request_failed)?;
         let results = head.expect("a query that succeeds delivers a page");
+        let no_results = plan.no_result_error && results.total == 0;
         if plan.result_count {
-            return number_only(&plan, results.total, export_file);
+            return number_only(&plan, results.total, export_file).and_then(|code| {
+                if no_results {
+                    Err(nothing_matched())
+                } else {
+                    Ok(code)
+                }
+            });
         }
         // A gozd predating the field ignores the ask; 0 would be a lie.
         let Some(size) = results.total_size else {
@@ -212,7 +234,19 @@ mod win {
         if size == u64::MAX {
             eprintln!("goz: warning: the total is at least {size} bytes, the most goz reports");
         }
-        number_only(&plan, size, export_file)
+        number_only(&plan, size, export_file).and_then(|code| {
+            if no_results {
+                Err(nothing_matched())
+            } else {
+                Ok(code)
+            }
+        })
+    }
+
+    /// Reports `-no-result-error`'s case, in es's words, and its exit code.
+    fn nothing_matched() -> ExitCode {
+        eprintln!("goz: No results found.");
+        Exit::NoResults.into()
     }
 
     /// Why a streamed search stopped before its last page.
@@ -247,26 +281,45 @@ mod win {
         }
     }
 
-    /// Writes the results to the export file as CSV, or to stdout as JSON or
-    /// a line per result, a page at a time as the pages arrive, so the
-    /// client's memory stays at one page and the first rows show at once. A
-    /// failure partway leaves what was written, and the exit code says the
-    /// output is incomplete.
-    fn stream(
-        plan: &EsPlan,
-        connection: &mut Client,
-        query: QueryRequest,
-        export_file: Option<std::fs::File>,
-        timing: &mut Option<Timing>,
-    ) -> Result<ExitCode, ExitCode> {
-        let format = match &export_file {
-            Some(_) => Format::Csv(CsvOptions {
-                bom: plan.bom,
-                header: plan.header,
-                double_quote: plan.double_quote,
+    /// The [`Format`] the plan asks for.
+    fn output_format(plan: &EsPlan) -> Format {
+        let bom = plan.wants_bom();
+        let header = plan.wants_header();
+        let list = |kind| {
+            Format::List(ListOptions {
+                kind,
+                bom,
+                header,
+                quote: plan.text_double_quote,
                 columns: plan.columns.clone(),
+            })
+        };
+        let csv = |separator, double_quote| {
+            Format::Csv(CsvOptions {
+                separator,
+                bom,
+                header,
+                double_quote,
+                columns: plan.columns.clone(),
+            })
+        };
+        match plan.format {
+            Some(OutputFormat::Csv) => csv(b',', plan.double_quote),
+            Some(OutputFormat::Tsv) => csv(b'\t', plan.text_double_quote),
+            Some(OutputFormat::Efu) => list(ListKind::Efu),
+            Some(OutputFormat::Txt) => list(ListKind::Txt),
+            // Never a header, in es.
+            Some(OutputFormat::M3u | OutputFormat::M3u8) => Format::List(ListOptions {
+                kind: ListKind::Txt,
+                bom,
+                header: false,
+                quote: plan.text_double_quote,
+                columns: Vec::new(),
             }),
-            None if plan.json => Format::Json { limit: plan.limit },
+            Some(OutputFormat::Json) => list(ListKind::Json),
+            None if plan.json => Format::Json {
+                limit: plan.limit.map(|n| n.saturating_add(plan.offset)),
+            },
             None => Format::Plain(PlainOptions {
                 columns: plan.columns.clone(),
                 grouping: if plan.columns.contains(&EsColumn::Size) {
@@ -280,12 +333,29 @@ mod win {
                 } else {
                     DigitGrouping::es_default()
                 },
+                quote: plan.text_double_quote,
             }),
-        };
+        }
+    }
+
+    /// Writes the results to the export file or to stdout in the format the
+    /// plan asks for, a page at a time as the pages arrive, so the client's
+    /// memory stays at one page and the first rows show at once. A failure
+    /// partway leaves what was written, and the exit code says the output is
+    /// incomplete.
+    fn stream(
+        plan: &EsPlan,
+        connection: &mut Client,
+        query: QueryRequest,
+        export_file: Option<std::fs::File>,
+        timing: &mut Option<Timing>,
+    ) -> Result<ExitCode, ExitCode> {
+        let format = output_format(plan);
         // Local time, ISO 8601 (es's `-date-format 1`), so the JavaScript
         // consumer's `new Date()` parses it regardless of locale. The time
-        // zone is resolved once, and only when a date is shown.
-        let want_date = !matches!(format, Format::Json { .. })
+        // zone is resolved once, and only when a date is shown: es's JSON and
+        // file lists carry the raw FILETIME.
+        let want_date = matches!(format, Format::Csv(_) | Format::Plain(_))
             && plan.columns.contains(&EsColumn::DateModified);
         let tz = want_date.then(jiff::tz::TimeZone::system);
         let date = |ft| {
@@ -297,13 +367,15 @@ mod win {
         // A plain page ends in LF, so stdout's LineWriter hands it on in one
         // write; of a JSON page it keeps back only the part after the last LF.
         let (mut out, to): (Box<dyn Write>, &str) = match export_file {
-            Some(file) => (Box::new(file), "export CSV"),
+            Some(file) => (Box::new(file), "export file"),
             None => (Box::new(std::io::stdout().lock()), "results"),
         };
         let mut warning = IncompleteWarning::default();
         let mut buf = Vec::new();
+        let mut total = 0;
         let fetched = connection.query(query, |page| {
             warning.check(&page);
+            total = page.total;
             buf.clear();
             writer.page(&page, &mut buf);
             out.write_all(&buf).map_err(Stop::Output)?;
@@ -327,6 +399,9 @@ mod win {
         if let Err(e) = out.write_all(&buf).and_then(|()| out.flush()) {
             return Err(super::output_failed(&e, to));
         }
+        if plan.no_result_error && total == 0 {
+            return Err(nothing_matched());
+        }
         Ok(ExitCode::SUCCESS)
     }
 
@@ -334,16 +409,16 @@ mod win {
         // A count or a total size fetches no rows, in name order as es
         // resets it to, which the daemon can answer from the distinct names
         // alone.
-        let (sort, limit) = if plan.result_count || plan.total_size {
-            (SortSpec::default(), Some(0))
+        let (sort, offset, limit) = if plan.result_count || plan.total_size {
+            (SortSpec::default(), 0, Some(0))
         } else {
-            (plan.sort, plan.limit)
+            (plan.sort, plan.offset, plan.limit)
         };
         QueryRequest {
             query: plan.query.clone(),
             scope: plan.scope.as_ref().map(|s| absolutize(s)),
             sort,
-            offset: 0,
+            offset,
             limit,
             // Always fetch metadata; output decides what to show.
             want_size: true,
@@ -384,12 +459,12 @@ mod win {
             return Ok(super::print(&format!("{number}\n")));
         };
         let mut bytes = Vec::new();
-        if plan.bom {
+        if plan.wants_bom() {
             bytes.extend_from_slice(b"\xEF\xBB\xBF");
         }
         bytes.extend_from_slice(format!("{number}\r\n").as_bytes());
         if let Err(e) = file.write_all(&bytes) {
-            return Err(super::output_failed(&e, "export CSV"));
+            return Err(super::output_failed(&e, "export file"));
         }
         Ok(ExitCode::SUCCESS)
     }
