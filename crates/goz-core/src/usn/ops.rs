@@ -55,26 +55,42 @@ pub enum UsnOp {
     RenameOldSeen { frn: Frn },
 }
 
+/// Reasons that add or remove a name in the record's folder. Each changes
+/// the folder's date modified, and NTFS writes no record for the folder.
+const NAME_CHANGES: u32 = USN_REASON_FILE_CREATE
+    | USN_REASON_FILE_DELETE
+    | USN_REASON_RENAME_OLD_NAME
+    | USN_REASON_RENAME_NEW_NAME
+    | USN_REASON_HARD_LINK_CHANGE;
+
 /// Normalizes one record's accumulated reason bitmask into index ops.
 ///
-/// Decision table (rows evaluated top to bottom; rows 2-5 are cumulative,
+/// Decision table (rows evaluated top to bottom; rows 2-6 are cumulative,
 /// each `&`-test independently appends its op):
 ///
 /// | # | Condition (bitwise `&`)                                              | Effect                              |
 /// |---|----------------------------------------------------------------------|-------------------------------------|
-/// | 1 | `FILE_DELETE`                                                        | `[Delete]` and NOTHING else: delete wins over all accumulated bits |
+/// | 1 | `FILE_DELETE`                                                        | `[Delete, StatDirty(parent)]` and nothing else: delete wins over all accumulated bits |
 /// | 2 | `RENAME_NEW_NAME` or `FILE_CREATE`                                   | push `Upsert` (record name/parent are current state; no OLD/NEW pairing state machine exists by design) |
 /// | 3 | `RENAME_OLD_NAME` and none of `RENAME_NEW_NAME`/`FILE_CREATE`/`FILE_DELETE` | push `RenameOldSeen` (telemetry) |
 /// | 4 | `HARD_LINK_CHANGE`                                                   | push `LinkDirty` (never upsert: the named link may be dead) |
 /// | 5 | `FILE_CREATE`/`DATA_OVERWRITE`/`DATA_EXTEND`/`DATA_TRUNCATION`/`BASIC_INFO_CHANGE` | push `StatDirty` (a USN record carries no size/mtime, so a create needs one too) |
-/// | 6 | none of the above (e.g. CLOSE-only, security-only)                   | empty |
-pub fn ops_for(rec: &ParsedUsnRecord) -> SmallVec<[UsnOp; 2]> {
+/// | 6 | `FILE_CREATE`/`FILE_DELETE`/`RENAME_OLD_NAME`/`RENAME_NEW_NAME`/`HARD_LINK_CHANGE` | push `StatDirty` for the record's parent folder, whose date the name change moved |
+/// | 7 | none of the above (e.g. CLOSE-only, security-only)                   | empty |
+///
+/// A move is two records, the OLD one naming the old folder and the NEW one
+/// the new folder, so both folders are re-read.
+pub fn ops_for(rec: &ParsedUsnRecord) -> SmallVec<[UsnOp; 3]> {
     let mut ops = SmallVec::new();
     let reason = rec.reason;
 
-    // Row 1: delete wins over everything accumulated in the window.
+    // Row 1: delete wins over everything accumulated in the window, but the
+    // folder that lost the name still has a new date (row 6).
     if reason & USN_REASON_FILE_DELETE != 0 {
         ops.push(UsnOp::Delete { frn: rec.frn });
+        ops.push(UsnOp::StatDirty {
+            frn: rec.parent_frn,
+        });
         return ops;
     }
 
@@ -119,6 +135,13 @@ pub fn ops_for(rec: &ParsedUsnRecord) -> SmallVec<[UsnOp; 2]> {
         ops.push(UsnOp::StatDirty { frn: rec.frn });
     }
 
+    // Row 6.
+    if reason & NAME_CHANGES != 0 {
+        ops.push(UsnOp::StatDirty {
+            frn: rec.parent_frn,
+        });
+    }
+
     ops
 }
 
@@ -145,6 +168,9 @@ mod tests {
         }
     }
 
+    /// The stat of the record's folder that every name change schedules.
+    const FOLDER: UsnOp = UsnOp::StatDirty { frn: Frn(3) };
+
     fn upsert(is_dir: bool) -> UsnOp {
         UsnOp::Upsert {
             frn: Frn(7),
@@ -163,7 +189,7 @@ mod tests {
         let r = rec(USN_REASON_FILE_CREATE, 0x20);
         assert_eq!(
             ops_for(&r).into_vec(),
-            vec![upsert(false), UsnOp::StatDirty { frn: Frn(7) }]
+            vec![upsert(false), UsnOp::StatDirty { frn: Frn(7) }, FOLDER]
         );
     }
 
@@ -184,7 +210,7 @@ mod tests {
     #[test]
     fn rename_new_emits_upsert() {
         let r = rec(USN_REASON_RENAME_NEW_NAME, 0x20);
-        assert_eq!(ops_for(&r).into_vec(), vec![upsert(false)]);
+        assert_eq!(ops_for(&r).into_vec(), vec![upsert(false), FOLDER]);
     }
 
     #[test]
@@ -192,7 +218,7 @@ mod tests {
         let r = rec(USN_REASON_FILE_CREATE, FILE_ATTRIBUTE_DIRECTORY);
         assert_eq!(
             ops_for(&r).into_vec(),
-            vec![upsert(true), UsnOp::StatDirty { frn: Frn(7) }]
+            vec![upsert(true), UsnOp::StatDirty { frn: Frn(7) }, FOLDER]
         );
     }
 
@@ -204,7 +230,7 @@ mod tests {
         );
         assert_eq!(
             ops_for(&r).into_vec(),
-            vec![upsert(false), UsnOp::StatDirty { frn: Frn(7) }]
+            vec![upsert(false), UsnOp::StatDirty { frn: Frn(7) }, FOLDER]
         );
     }
 
@@ -213,7 +239,7 @@ mod tests {
         let r = rec(USN_REASON_RENAME_OLD_NAME, 0x20);
         assert_eq!(
             ops_for(&r).into_vec(),
-            vec![UsnOp::RenameOldSeen { frn: Frn(7) }]
+            vec![UsnOp::RenameOldSeen { frn: Frn(7) }, FOLDER]
         );
     }
 
@@ -223,7 +249,7 @@ mod tests {
             USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME,
             0x20,
         );
-        assert_eq!(ops_for(&r).into_vec(), vec![upsert(false)]);
+        assert_eq!(ops_for(&r).into_vec(), vec![upsert(false), FOLDER]);
     }
 
     #[test]
@@ -237,7 +263,10 @@ mod tests {
                 | USN_REASON_CLOSE,
             0x20,
         );
-        assert_eq!(ops_for(&r).into_vec(), vec![UsnOp::Delete { frn: Frn(7) }]);
+        assert_eq!(
+            ops_for(&r).into_vec(),
+            vec![UsnOp::Delete { frn: Frn(7) }, FOLDER]
+        );
     }
 
     #[test]
@@ -245,7 +274,7 @@ mod tests {
         let r = rec(USN_REASON_HARD_LINK_CHANGE | USN_REASON_CLOSE, 0x20);
         assert_eq!(
             ops_for(&r).into_vec(),
-            vec![UsnOp::LinkDirty { frn: Frn(7) }]
+            vec![UsnOp::LinkDirty { frn: Frn(7) }, FOLDER]
         );
     }
 
@@ -287,7 +316,7 @@ mod tests {
         );
         assert_eq!(
             ops_for(&r).into_vec(),
-            vec![upsert(false), UsnOp::StatDirty { frn: Frn(7) }]
+            vec![upsert(false), UsnOp::StatDirty { frn: Frn(7) }, FOLDER]
         );
     }
 
@@ -302,6 +331,7 @@ mod tests {
             vec![
                 UsnOp::RenameOldSeen { frn: Frn(7) },
                 UsnOp::LinkDirty { frn: Frn(7) },
+                FOLDER,
             ]
         );
     }
@@ -321,7 +351,35 @@ mod tests {
                 upsert(false),
                 UsnOp::LinkDirty { frn: Frn(7) },
                 UsnOp::StatDirty { frn: Frn(7) },
+                FOLDER,
             ]
         );
+    }
+
+    /// Adding or removing a name moves its folder's date modified, and NTFS
+    /// logs no record for the folder, so each name change re-reads it. A
+    /// change to a file's data or attributes leaves the folder alone.
+    #[test]
+    fn a_name_change_re_reads_its_folder() {
+        for reason in [
+            USN_REASON_FILE_CREATE,
+            USN_REASON_FILE_DELETE,
+            USN_REASON_RENAME_OLD_NAME,
+            USN_REASON_RENAME_NEW_NAME,
+            USN_REASON_HARD_LINK_CHANGE,
+        ] {
+            let ops = ops_for(&rec(reason | USN_REASON_CLOSE, 0x20));
+            assert!(ops.contains(&FOLDER), "reason {reason:#x} gave {ops:?}");
+        }
+        for reason in [
+            USN_REASON_DATA_OVERWRITE,
+            USN_REASON_DATA_EXTEND,
+            USN_REASON_DATA_TRUNCATION,
+            USN_REASON_BASIC_INFO_CHANGE,
+            USN_REASON_CLOSE,
+        ] {
+            let ops = ops_for(&rec(reason, 0x20));
+            assert!(!ops.contains(&FOLDER), "reason {reason:#x} gave {ops:?}");
+        }
     }
 }

@@ -166,7 +166,8 @@ impl IndexMemory {
 /// Side effects a batch produced that the daemon must service out of band.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ApplyOutcome {
-    /// FRNs whose size/mtime changed and need an external stat.
+    /// FRNs whose size/mtime changed and need an external stat, only those
+    /// still in the index once the batch is applied.
     pub needs_stat: Vec<Frn>,
     /// FRNs whose hard links changed and need an external link-set walk.
     ///
@@ -434,7 +435,7 @@ impl VolumeIndex {
     pub fn apply_batch(&mut self, records: &[ParsedUsnRecord]) -> ApplyOutcome {
         let mut outcome = ApplyOutcome::default();
         for rec in records {
-            let ops: SmallVec<[UsnOp; 2]> = ops_for(rec);
+            let ops: SmallVec<[UsnOp; 3]> = ops_for(rec);
             for op in ops {
                 match op {
                     UsnOp::Upsert {
@@ -468,6 +469,11 @@ impl VolumeIndex {
         if self.names.wants_merge() {
             self.names.merge_unranked();
         }
+        // A stat of an entry the batch removed would be a blocking open for
+        // nothing, and deleting a tree asks for one per folder in it.
+        outcome
+            .needs_stat
+            .retain(|&frn| self.head_of(frn).is_some());
         self.prune_cycle_suspects();
         self.generation += 1;
         // Compaction is NOT performed here: it is reported so the caller can do

@@ -311,6 +311,22 @@ fn created_and_deleted_in_same_batch_nets_to_nothing() {
     assert_eq!(path_set(&idx), BTreeSet::from(["dir".to_string()]));
 }
 
+/// A name added to a folder moves the folder's date, so the batch asks for a
+/// stat of the folder as well as of the new file. Deleting a tree asks for
+/// none of the entries it removed, only for the folder left holding it.
+#[test]
+fn a_name_change_asks_for_its_folder_but_not_for_removed_entries() {
+    let mut idx = index_from_enum(&[create(frn(10), root_frn(), "dir", true)]);
+    let outcome = idx.apply_batch(&[create(frn(100), frn(10), "a.txt", false)]);
+    assert_eq!(outcome.needs_stat, [frn(100), frn(10)]);
+
+    let outcome = idx.apply_batch(&[
+        record(frn(100), frn(10), "a.txt", false, USN_REASON_FILE_DELETE),
+        record(frn(10), root_frn(), "dir", true, USN_REASON_FILE_DELETE),
+    ]);
+    assert_eq!(outcome.needs_stat, [root_frn()]);
+}
+
 // -- hard links ----------------------------------------------------------
 
 use crate::layout::LayoutFile;
@@ -590,9 +606,10 @@ fn a_renamed_hard_link_keeps_the_size_and_date_of_its_file() {
 
     let outcome = idx.apply_batch(&[rename(frn(100), frn(10), "renamed.txt", false)]);
     assert_eq!(outcome.needs_link_reconcile, [frn(100)]);
-    assert!(
-        outcome.needs_stat.is_empty(),
-        "a rename carries no stat reason"
+    assert_eq!(
+        outcome.needs_stat,
+        [frn(10)],
+        "a rename re-reads only its folder, not the file"
     );
     // Listed new name first, so the new entry also becomes the chain's head.
     idx.reconcile_links(frn(100), &[link(a, "renamed.txt"), link(b, "link.txt")]);
