@@ -464,8 +464,10 @@ fn name_matches(
 /// (amortized O(1) per hit; a per-hit binary search cache-thrashes at scale).
 /// The first hit seeds the cursor with one binary search so a rare term whose
 /// matches start deep in the arena does not pay a full forward walk. A name
-/// is a contiguous NUL-separated region, so repeated hits inside one name are
-/// adjacent and a "same as last" check dedups them.
+/// is a contiguous NUL-separated region, so after a hit the search resumes at
+/// the end of that name: a short needle like `e` occurs about three times in
+/// each name it is in, and finding the rest only to drop them was most of the
+/// pass.
 fn for_each_prefilter_hit(index: &VolumeIndex, needle: &[u8], mut f: impl FnMut(NameId)) {
     let driver = memmem::Finder::new(needle);
     let hay = index.folded_bytes();
@@ -475,25 +477,24 @@ fn for_each_prefilter_hit(index: &VolumeIndex, needle: &[u8], mut f: impl FnMut(
     }
     let mut cursor = 0usize;
     let mut seeded = false;
-    let mut last_id = NameId::MAX;
-    for pos in driver.find_iter(hay) {
-        let pos = pos as u32;
+    let mut at = 0usize;
+    while let Some(rel) = hay.get(at..).and_then(|rest| driver.find(rest)) {
+        let pos = at + rel;
         if !seeded {
             cursor = pairs
-                .partition_point(|p| p.folded.off <= pos)
+                .partition_point(|p| p.folded.off as usize <= pos)
                 .saturating_sub(1);
             seeded = true;
         } else {
-            while cursor + 1 < pairs.len() && pairs[cursor + 1].folded.off <= pos {
+            while cursor + 1 < pairs.len() && pairs[cursor + 1].folded.off as usize <= pos {
                 cursor += 1;
             }
         }
-        let id = cursor as NameId;
-        if id == last_id {
-            continue;
-        }
-        last_id = id;
-        f(id);
+        f(cursor as NameId);
+        // On to the next name. An empty needle, which no caller passes, also
+        // matches at the end of the arena: `max` and `get` still end the loop.
+        let name = pairs[cursor].folded;
+        at = (name.off as usize + name.len as usize + 1).max(pos + 1);
     }
 }
 
@@ -1761,6 +1762,32 @@ mod tests {
             idx.insert_enum(&enum_rec(frn(f), frn(999), n, false));
         }
         idx
+    }
+
+    /// Each live name holding the needle is reported once, however often it
+    /// holds it, in id order, and a name right after a match or after a dead
+    /// name is still found: the same names a check of every live name gives.
+    #[test]
+    fn the_prefilter_reports_each_matching_name_once() {
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let names = [
+            "eee.txt", "x", "be", "ee", "zzz", "Gone.e", "eabc", "the end", "e",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            idx.insert_enum(&enum_rec(frn(100 + i as u64), NTFS_ROOT_FRN, name, false));
+        }
+        let mut gone = enum_rec(frn(105), NTFS_ROOT_FRN, "Gone.e", false);
+        gone.reason = USN_REASON_FILE_DELETE;
+        idx.apply_batch(&[gone]);
+        for needle in [&b"e"[..], b"ee", b"zz", b"the end", b"q"] {
+            let mut hits = Vec::new();
+            for_each_prefilter_hit(&idx, needle, |id| hits.push(id));
+            let every: Vec<NameId> = (0..idx.name_count() as NameId)
+                .filter(|&id| idx.name_refcount(id) > 0)
+                .filter(|&id| memmem::find(idx.name_folded(id), needle).is_some())
+                .collect();
+            assert_eq!(hits, every, "needle {:?}", String::from_utf8_lossy(needle));
+        }
     }
 
     /// `total` and the page must count the same things.
