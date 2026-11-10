@@ -11,6 +11,7 @@
 //! over between the needle's, while the needle's own characters, its
 //! punctuation included, must each match one of the target's.
 
+use super::budget::Budget;
 use super::expr::{Anchors, Skip};
 use super::glob::{CodePointBuf, decode_into};
 use crate::wtf8::CodePoints;
@@ -32,6 +33,12 @@ fn is_space(cp: u32) -> bool {
 fn is_punct(cp: u32) -> bool {
     !is_word(cp) && !is_space(cp)
 }
+
+/// How many steps a match that skips takes between checks of its budget:
+/// over a full path of tens of thousands of characters, which its own skips
+/// can make quadratic (`path:nopunc:-b` over a path of dashes), it must not
+/// outlast the budget, as no wildcard does either.
+const SKIP_STEPS_PER_CHECK: usize = 1 << 16;
 
 /// The code point that ends at byte `p` of `text` (WTF-8), if any.
 fn before(text: &[u8], p: usize) -> Option<u32> {
@@ -78,8 +85,9 @@ impl<'a> TextMatcher<'a> {
     /// Whether `hay` (folded as the needle is) holds the needle where the
     /// anchors say. `cps` is scratch for a match that skips. An empty
     /// needle matches any text but the empty one, as an empty value does in
-    /// Everything.
-    pub(super) fn matches(&self, hay: &[u8], cps: &mut CodePointBuf) -> bool {
+    /// Everything. `false` once `budget` is found spent, as the query is then
+    /// refused whatever this answers.
+    pub(super) fn matches(&self, hay: &[u8], cps: &mut CodePointBuf, budget: &Budget) -> bool {
         if self.needle_cps.is_empty() {
             return !hay.is_empty();
         }
@@ -87,7 +95,7 @@ impl<'a> TextMatcher<'a> {
             return self.anchored(hay);
         }
         decode_into(hay, cps);
-        self.skipping(cps)
+        self.skipping(cps, budget)
     }
 
     /// The match without skips: each occurrence of the needle in turn,
@@ -131,7 +139,8 @@ impl<'a> TextMatcher<'a> {
     /// later by an equal one, which may then be passed over in its turn. The
     /// target's characters before the start and after the end are passed
     /// over too, for `startwith:` and `endwith:`.
-    fn skipping(&self, hay: &[u32]) -> bool {
+    fn skipping(&self, hay: &[u32], budget: &Budget) -> bool {
+        let mut steps = 0usize;
         let needle = &self.needle_cps;
         let skippable =
             |c: u32| (self.skip.punct && is_punct(c)) || (self.skip.space && is_space(c));
@@ -148,6 +157,13 @@ impl<'a> TextMatcher<'a> {
                 continue;
             }
             let (mut k, mut p) = (0, s);
+            steps += hay.len() - s;
+            if steps > SKIP_STEPS_PER_CHECK {
+                steps = 0;
+                if budget.check() {
+                    return false;
+                }
+            }
             while k < needle.len() && p < hay.len() {
                 if hay[p] == needle[k] {
                     k += 1;
@@ -187,7 +203,33 @@ mod tests {
     fn m(needle: &str, anchors: Anchors, skip: Skip, hay: &str) -> bool {
         let needle = fold(needle.as_bytes());
         let matcher = TextMatcher::new(&needle, anchors, skip);
-        matcher.matches(&fold(hay.as_bytes()), &mut CodePointBuf::new())
+        matcher.matches(
+            &fold(hay.as_bytes()),
+            &mut CodePointBuf::new(),
+            &Budget::unlimited(),
+        )
+    }
+
+    /// The match that skips checks its budget as it goes, so a quadratic
+    /// one over a long path stops once the budget is spent.
+    #[test]
+    fn a_spent_budget_stops_a_long_skipping_match() {
+        let needle = fold("-b".as_bytes());
+        let matcher = TextMatcher::new(&needle, NO_ANCHOR, PUNCT);
+        let dashes = "-".repeat(20_000);
+        let mut cps = CodePointBuf::new();
+        assert!(!matcher.matches(dashes.as_bytes(), &mut cps, &Budget::unlimited()));
+        assert!(matcher.matches(
+            format!("{dashes}b").as_bytes(),
+            &mut cps,
+            &Budget::unlimited()
+        ));
+        // With no match, each start runs to the end: the budget is checked
+        // on the way, found spent, and the search stops.
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let spent = Budget::until(std::time::Instant::now(), &cancel);
+        assert!(!matcher.matches(dashes.as_bytes(), &mut cps, &spent));
+        assert!(spent.spent(), "the check ran");
     }
 
     const WW: Anchors = Anchors {

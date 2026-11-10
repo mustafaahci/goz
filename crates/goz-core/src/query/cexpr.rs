@@ -599,7 +599,7 @@ impl<'a> CNode<'a> {
             } => {
                 let budget = s.budget;
                 s.hay(*target, *case).is_some_and(|(hay, cps)| {
-                    !long_and_spent(hay, budget) && matcher.matches(hay, cps)
+                    !long_and_spent(hay, budget) && matcher.matches(hay, cps, budget)
                 })
             }
             CNode::NameGlob { glob, case } => {
