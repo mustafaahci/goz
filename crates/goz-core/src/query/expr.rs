@@ -65,14 +65,20 @@ impl Expr {
         Expr::join(a, b, false)
     }
 
+    /// Appends to `a`'s own list when `a` is of the same kind, so that a run
+    /// of `n` terms costs `n` appends, not `n` copies of a growing list: the
+    /// text arrives from the pipe, and a query of a million terms must reach
+    /// the term cap's refusal in linear time.
     fn join(a: Expr, b: Expr, and: bool) -> Expr {
-        let mut items = Vec::new();
-        for e in [a, b] {
-            match e {
-                Expr::And(inner) if and => items.extend(inner),
-                Expr::Or(inner) if !and => items.extend(inner),
-                other => items.push(other),
-            }
+        let mut items = match a {
+            Expr::And(inner) if and => inner,
+            Expr::Or(inner) if !and => inner,
+            other => vec![other],
+        };
+        match b {
+            Expr::And(inner) if and => items.extend(inner),
+            Expr::Or(inner) if !and => items.extend(inner),
+            other => items.push(other),
         }
         if and {
             Expr::And(items)
@@ -246,5 +252,26 @@ mod tests {
         let Expr::And(items) = &e else { panic!() };
         assert_eq!(items.len(), 10_001);
         assert_eq!(leaf_terms(&e), 10_001);
+    }
+
+    /// A query of a million terms reaches the term cap's refusal in linear
+    /// time: each AND or OR appends to the list it extends. Copying the list
+    /// at each term took minutes here.
+    #[test]
+    fn a_huge_query_is_refused_in_linear_time() {
+        use crate::query::parse::{QueryError, parse_query};
+        let started = std::time::Instant::now();
+        for (query, terms) in [
+            ("a ".repeat(1_000_000), 1_000_000),
+            ("a|".repeat(500_000) + "a", 500_001),
+            ("<a b> ".repeat(200_000), 400_000),
+        ] {
+            assert_eq!(parse_query(&query), Err(QueryError::TooManyTerms(terms)));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }
