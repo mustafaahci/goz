@@ -12,7 +12,7 @@
 use super::budget::{Budget, Stopped, Watch};
 use super::cexpr::{self, CNode, Scratch, Subject};
 use super::folder_rank::FolderRanks;
-use super::glob::{CodePointBuf, decode_into};
+use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Filters, Kind, ParsedQuery, SizeRange, Wildcard};
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
@@ -102,11 +102,20 @@ pub struct CompiledQuery<'a> {
     /// `false` when a path term or path wildcard cannot match anywhere under
     /// `prefix` (see [`term_admits`]), so the volume has no hits.
     volume_admits: bool,
-    /// Each path wildcard's ends: the literal a matching full path ends
+    /// The path wildcards that test the full path: all of them, but those
+    /// of one part that run with the name (see `name_parts`).
+    path_globs: Vec<&'a Wildcard>,
+    /// Each of `path_globs`' ends: the literal a matching full path ends
     /// with, and, for a pattern whose leading literal holds the drive's `:`,
     /// that literal, which a match must start with. Two byte compares turn
     /// most candidates away before the wildcard decodes the path.
     path_wildcard_ends: Vec<(Option<Vec<u8>>, Vec<u8>)>,
+    /// The path wildcards of one part and no `**` (`path:*.md`, or `*.pdf`
+    /// under `matchpath:`), when the mount prefix ends with a separator:
+    /// such a pattern matches the last part of the full path, which is the
+    /// last part of the name, so it is a test of the name, and the query can
+    /// run over the distinct names.
+    name_parts: Vec<&'a Glob>,
     /// The longest separator-free piece of path text that every match must
     /// hold inside one of its names (see [`path_piece`]); drives
     /// [`walk_below_names`]. `None` for a case-sensitive query, whose pieces
@@ -168,15 +177,42 @@ impl<'a> CompiledQuery<'a> {
         } else {
             fold(mount_prefix.as_bytes())
         };
-        let path_wildcard_ends: Vec<(Option<Vec<u8>>, Vec<u8>)> = parsed
-            .path_wildcards
+        // Below a prefix that ends with a separator, the last part of a full
+        // path is the last part of the name: a path wildcard of one part
+        // tests the name, and the last part of any other one names text the
+        // name must hold, which the prefilter can scan for, so that
+        // `*\bin\*.dll` finds the names holding `.dll` instead of walking
+        // every entry below each `bin`.
+        let parts_are_names = prefix.is_empty() || prefix.ends_with(b"\\");
+        let mut name_parts = Vec::new();
+        let mut path_globs = Vec::new();
+        for w in &parsed.path_wildcards {
+            match w.single_part() {
+                Some(part) if parts_are_names => {
+                    name_parts.push(part);
+                    if let Some(lit) = w.longest_literal() {
+                        consider(Cow::Owned(lit), false);
+                    }
+                }
+                _ => {
+                    path_globs.push(w);
+                    if parts_are_names && let Some(lit) = w.name_literal() {
+                        consider(Cow::Owned(lit), false);
+                    }
+                }
+            }
+        }
+        let path_wildcard_ends: Vec<(Option<Vec<u8>>, Vec<u8>)> = path_globs
             .iter()
             .map(|w| (anchored_lead(w), w.trailing_literal()))
             .collect();
         // The expression, with the path terms this volume's prefix decides
         // folded to constants: one that folds to `False` leaves the volume
         // nothing to read, as a path term of another drive does.
-        let expr = parsed.expr.as_ref().map(|e| cexpr::compile(e, &prefix));
+        let expr = parsed
+            .expr
+            .as_ref()
+            .map(|e| cexpr::compile(e, &prefix, parts_are_names));
         let expr_admits = !matches!(expr, Some(CNode::False));
         let (expr_name, expr_entry) = match expr {
             Some(e) if expr_admits => cexpr::split(e),
@@ -231,10 +267,13 @@ impl<'a> CompiledQuery<'a> {
                 && parsed.name_terms.len() == 1
                 && parsed.wildcards.is_empty()
                 && parsed.filters.ext.is_none()
+                && name_parts.is_empty()
                 && expr_name.is_none(),
             prefix,
             volume_admits,
+            path_globs,
             path_wildcard_ends,
+            name_parts,
             path_piece,
             expr_paths: expr_entry.as_ref().is_some_and(CNode::tests_paths),
             expr_name,
@@ -249,8 +288,8 @@ impl<'a> CompiledQuery<'a> {
     }
 
     /// Whether a candidate's full path has anything left to decide.
-    fn tests_paths(&self, parsed: &ParsedQuery) -> bool {
-        !self.path_finders.is_empty() || !parsed.path_wildcards.is_empty() || self.expr_paths
+    fn tests_paths(&self) -> bool {
+        !self.path_finders.is_empty() || !self.path_globs.is_empty() || self.expr_paths
     }
 }
 
@@ -515,7 +554,7 @@ fn is_name_level(
 ) -> bool {
     scope.is_none()
         && compiled.volume_admits
-        && !compiled.tests_paths(parsed)
+        && !compiled.tests_paths()
         && parsed.filters.kind.is_none()
         && parsed.filters.size.is_none()
         && parsed.filters.date.is_none()
@@ -544,6 +583,8 @@ fn name_matches(
     compiled.name_finders.iter().all(|f| f.find(hay).is_some())
         && (parsed.wildcards.is_empty()
             || wildcards_match(&parsed.wildcards, hay, &mut scratch.cps, compiled.budget))
+        && (compiled.name_parts.is_empty()
+            || last_part_matches(&compiled.name_parts, hay, &mut scratch.cps, compiled.budget))
         // The ext check folds the extension, so it runs after the
         // allocation-free predicates that reject most names.
         && ext_matches(&parsed.filters, index.name_raw(id), &mut scratch.ext)
@@ -557,6 +598,23 @@ fn name_matches(
                 scratch,
             ))
         })
+}
+
+/// Whether the last part of `name` matches every one of `parts`: the
+/// part after its last separator, which is all of it, since NTFS keeps
+/// separators out of names. One that corrupt data put there ends a part of
+/// the full path, so the name's last part is the full path's.
+fn last_part_matches(
+    parts: &[&Glob],
+    name: &[u8],
+    cp_buf: &mut CodePointBuf,
+    budget: &Budget,
+) -> bool {
+    let last = memchr::memrchr(b'\\', name).map_or(name, |sep| &name[sep + 1..]);
+    decode_into(last, cp_buf);
+    parts
+        .iter()
+        .all(|part| part.matches_decoded(cp_buf, budget))
 }
 
 /// Whether `text`, a name or full path, matches every one of `wildcards`,
@@ -980,7 +1038,7 @@ fn top_k_applies(
         && scope.is_none()
         && compiled.scans_names(parsed)
         && compiled.volume_admits
-        && !compiled.tests_paths(parsed)
+        && !compiled.tests_paths()
         && !index.may_have_unpresentable()
 }
 
@@ -1192,7 +1250,7 @@ fn scan_with(
     }
     // Built only when a full path has something left to decide.
     let mut folders = compiled
-        .tests_paths(parsed)
+        .tests_paths()
         .then(|| FolderPaths::new(index, &compiled.prefix, !parsed.match_case));
     let mut scope_memo: FxHashMap<EntryIdx, bool> = FxHashMap::default();
     // Each parent directory's reconstructed path, or None when it has none (its
@@ -1562,7 +1620,7 @@ fn evaluate(
     // path fails it.
     match folders {
         Some(folders) => {
-            if !folders.full_path_matches(index, idx, parsed, compiled, &mut scratch.cps) {
+            if !folders.full_path_matches(index, idx, compiled, &mut scratch.cps) {
                 return None;
             }
         }
@@ -1780,7 +1838,6 @@ impl FolderPaths {
         &mut self,
         index: &VolumeIndex,
         idx: EntryIdx,
-        parsed: &ParsedQuery,
         compiled: &CompiledQuery,
         cp_buf: &mut CodePointBuf,
     ) -> bool {
@@ -1817,7 +1874,7 @@ impl FolderPaths {
                 }
             }
         }
-        if !whole && parsed.path_wildcards.is_empty() {
+        if !whole && compiled.path_globs.is_empty() {
             return true;
         }
         self.with_full_path(index, idx, |full| {
@@ -1826,12 +1883,17 @@ impl FolderPaths {
                     lead.as_deref().is_none_or(|lead| full.starts_with(lead))
                         && full.ends_with(trail)
                 })
-                && (parsed.path_wildcards.is_empty()
+                && (compiled.path_globs.is_empty()
                     // Decoding and matching a path of megabytes, which no
                     // real path is, checks the budget first, as each term's
                     // search of such a path does in `decide_needs`.
-                    || !(full.len() > CACHED_PATH_MAX && compiled.budget.check())
-                        && wildcards_match(&parsed.path_wildcards, full, cp_buf, compiled.budget))
+                    || !(full.len() > CACHED_PATH_MAX && compiled.budget.check()) && {
+                        decode_into(full, cp_buf);
+                        compiled
+                            .path_globs
+                            .iter()
+                            .all(|w| w.matches_decoded(cp_buf, compiled.budget))
+                    })
         })
         .unwrap_or(false)
     }
@@ -3214,6 +3276,67 @@ mod tests {
         assert_eq!(hits(r"C:\", r#""docs\*.txt""#), [r"docs\notes.txt"]);
     }
 
+    /// Below a prefix that ends with a separator, a path wildcard's last part
+    /// is matched by the name, so its literal drives the prefilter instead of
+    /// a walk below every folder the path names, and a path wildcard of one
+    /// part is a test of the name, run over the distinct names. Below a
+    /// prefix without one (which the daemon never passes), the first name
+    /// runs into the prefix's last part, and neither holds.
+    #[test]
+    fn a_path_wildcard_prefilters_by_its_last_part() {
+        let mut idx = sample_index();
+        idx.optimize_storage();
+        for (query, needle, name_level) in [
+            (r"*\sub\*.pdf", Some(".pdf"), false),
+            (r"**\report*", Some("report"), false),
+            (r"docs\**.txt", Some(".txt"), false),
+            (r"*\*", None, false),
+            ("path:*.jpg", Some(".jpg"), true),
+            ("*.jpg matchpath:", Some(".jpg"), true),
+            ("path:*", None, true),
+            ("zz|path:*.jpg", Some(".jpg"), true),
+            (r"zz|*\sub\*.pdf", Some(".pdf"), false),
+        ] {
+            let parsed = parse_query(query).unwrap();
+            let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            let union = compiled.union.iter().any(|n| n == b"zz");
+            let prefilter = compiled
+                .prefilter
+                .as_deref()
+                .map(|p| String::from_utf8_lossy(p));
+            assert!(
+                prefilter.as_deref() == needle || (union && needle.is_some()),
+                "{query}: {prefilter:?}"
+            );
+            assert_eq!(
+                is_name_level(&idx, &parsed, &compiled, None),
+                name_level,
+                "{query}"
+            );
+            let mut unplanned = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            unplanned.prefilter = None;
+            unplanned.union.clear();
+            let found = |compiled: &CompiledQuery| {
+                let mut found: Vec<EntryIdx> = scan(&idx, &parsed, compiled, None)
+                    .iter()
+                    .map(|c| c.idx)
+                    .collect();
+                found.sort_unstable();
+                found
+            };
+            assert_eq!(found(&compiled), found(&unplanned), "{query}");
+            let below = CompiledQuery::new(&parsed, "C:", &UNLIMITED);
+            assert!(
+                !is_name_level(&idx, &parsed, &below, None),
+                "{query} under C:"
+            );
+        }
+        let hits = |query| hits_under(&idx, r"C:\", &parse_query(query).unwrap());
+        assert_eq!(hits("path:*.jpg"), ["photo.JPG"]);
+        assert_eq!(hits(r"*\sub\*.pdf"), [r"docs\sub\Report.PDF"]);
+        assert_eq!(hits("zz|path:*.jpg"), ["photo.JPG"]);
+    }
+
     /// Windows refuses `:` in a name, so a term's colon is the drive's, and a
     /// volume whose prefix disagrees with the term is skipped unread.
     #[test]
@@ -3321,7 +3444,7 @@ mod tests {
                 assert_eq!(walked(root), walked(None), "{q:?}");
                 let admits = |e, scope| {
                     let mut folders = compiled
-                        .tests_paths(&parsed)
+                        .tests_paths()
                         .then(|| FolderPaths::new(idx, &compiled.prefix, true));
                     evaluate(
                         idx,

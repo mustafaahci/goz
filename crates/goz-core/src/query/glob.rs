@@ -171,6 +171,16 @@ impl Wildcard {
         &self.source
     }
 
+    /// For a sub-path pattern of one part and no `**`, such as `path:*.md`,
+    /// the matcher of that part: what the last part of a full path, which is
+    /// the last part of the name, must match.
+    pub(crate) fn single_part(&self) -> Option<&Glob> {
+        match &self.shape {
+            Shape::Parts(parts) if parts.len() == 1 => parts.first(),
+            _ => None,
+        }
+    }
+
     /// Matches `text`, which [`decode_into`] decoded: the whole of a name for
     /// a name pattern, the end of a full path for a sub-path pattern. Answers
     /// `false` once `budget` is spent, as the query is then refused whatever
@@ -199,6 +209,27 @@ impl Wildcard {
     /// scan. `None` if the pattern is all wildcards (e.g. `*`, `?`).
     pub fn longest_literal(&self) -> Option<Vec<u8>> {
         longest_run(&self.toks)
+    }
+
+    /// For a sub-path pattern, literal text that the name of every entry it
+    /// matches holds, since the last part of a full path is the entry's name:
+    /// when the pattern's last part has no `**`, the name matches that part
+    /// wholly, so it holds the part's longest literal run; otherwise the
+    /// name ends with what follows the pattern's last wildcard, up to a
+    /// separator. `None` when neither gives any text.
+    pub(crate) fn name_literal(&self) -> Option<Vec<u8>> {
+        let last = match self.toks.iter().rposition(|t| *t == Tok::Lit(SEP)) {
+            Some(sep) => &self.toks[sep + 1..],
+            None => &self.toks[..],
+        };
+        if !last.contains(&Tok::RunAll) {
+            return longest_run(last);
+        }
+        let tail = last
+            .iter()
+            .rposition(|t| !matches!(t, Tok::Lit(_)))
+            .map_or(last, |i| &last[i + 1..]);
+        longest_run(tail)
     }
 
     /// Each maximal run of literal characters holding no `\`, as WTF-8 bytes
@@ -705,13 +736,28 @@ pub(crate) mod tests {
         assert_eq!(w.pattern(), br"windows\*\**");
         assert_eq!(w.leading_literal(), br"windows\");
         assert_eq!(w.trailing_literal(), b"");
+        assert_eq!(w.name_literal(), None, "the last part is **");
+        assert_eq!(
+            Wildcard::sub_path(b"**x.sys").name_literal(),
+            Some(b"x.sys".to_vec()),
+            "the name ends with it"
+        );
+        assert_eq!(Wildcard::sub_path(b"**cmd*").name_literal(), None);
         let w = Wildcard::sub_path(br"*\bin_x64_05\*.dll");
+        assert_eq!(w.name_literal(), Some(b".dll".to_vec()));
         assert_eq!(w.trailing_literal(), b".dll");
         assert_eq!(
             w.separator_free_literals(),
             [b"bin_x64_05".to_vec(), b".dll".to_vec()]
         );
-        assert!(!Wildcard::sub_path(b"*.md").is_name());
+        assert!(w.single_part().is_none());
+        let one = Wildcard::sub_path(b"*.md");
+        assert!(one.single_part().is_some() && !one.is_name());
+        assert!(Wildcard::sub_path(b"**.md").single_part().is_none());
+        assert_eq!(
+            Wildcard::sub_path(br"a\**x\b?cd").name_literal(),
+            Some(b"cd".to_vec())
+        );
     }
 
     /// A match that backtracks checks its budget as it goes, and a spent one

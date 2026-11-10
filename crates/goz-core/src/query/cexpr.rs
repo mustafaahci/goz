@@ -22,7 +22,7 @@ use super::engine::{
     CACHED_PATH_MAX, anchored_lead, ext_in, kind_matches, size_matches, term_admits,
 };
 use super::expr::{Expr, Leaf, Target};
-use super::glob::{CodePointBuf, decode_into};
+use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, SizeRange, Wildcard};
 use crate::index::{NameId, VolumeIndex};
 use crate::types::EntryIdx;
@@ -39,6 +39,13 @@ pub(super) enum CNode<'a> {
     Name(memmem::Finder<'a>),
     /// The name matches a name wildcard.
     NameGlob(&'a Wildcard),
+    /// The last part of the name matches a path wildcard of one part and no
+    /// `**` (`path:*.md`), which below a prefix ending with a separator is
+    /// what the full path's last part matches. `lit`: its longest literal.
+    NamePart {
+        part: &'a Glob,
+        lit: Option<Vec<u8>>,
+    },
     /// The extension is one of these.
     Ext(&'a [Vec<u8>]),
     Kind(Kind),
@@ -53,19 +60,35 @@ pub(super) enum CNode<'a> {
         glob: &'a Wildcard,
         lead: Option<Vec<u8>>,
         trail: Vec<u8>,
+        /// Text the name of every match holds (see
+        /// [`Wildcard::name_literal`]), when the prefix ends with a
+        /// separator, so that the last part of a full path is the name.
+        name_lit: Option<Vec<u8>>,
     },
 }
 
 /// Compiles `e` for the volume mounted at `prefix` (folded iff the query
 /// ignores case), folding each path term the prefix decides into a
-/// constant and the tree around it.
-pub(super) fn compile<'a>(e: &'a Expr, prefix: &[u8]) -> CNode<'a> {
+/// constant and the tree around it. `parts_are_names`: the prefix ends with
+/// a separator, so the last part of a full path is the last part of the
+/// name.
+pub(super) fn compile<'a>(e: &'a Expr, prefix: &[u8], parts_are_names: bool) -> CNode<'a> {
     let node = match e {
         Expr::True => CNode::True,
         Expr::False => CNode::False,
-        Expr::And(items) => CNode::And(items.iter().map(|i| compile(i, prefix)).collect()),
-        Expr::Or(items) => CNode::Or(items.iter().map(|i| compile(i, prefix)).collect()),
-        Expr::Not(inner) => CNode::Not(Box::new(compile(inner, prefix))),
+        Expr::And(items) => CNode::And(
+            items
+                .iter()
+                .map(|i| compile(i, prefix, parts_are_names))
+                .collect(),
+        ),
+        Expr::Or(items) => CNode::Or(
+            items
+                .iter()
+                .map(|i| compile(i, prefix, parts_are_names))
+                .collect(),
+        ),
+        Expr::Not(inner) => CNode::Not(Box::new(compile(inner, prefix, parts_are_names))),
         Expr::Leaf(leaf) => match leaf {
             Leaf::Text {
                 target: Target::Name,
@@ -86,21 +109,28 @@ pub(super) fn compile<'a>(e: &'a Expr, prefix: &[u8]) -> CNode<'a> {
                 }
             }
             Leaf::Glob(w) if w.is_name() => CNode::NameGlob(w),
-            Leaf::Glob(w) => {
-                let lead = anchored_lead(w);
-                if lead.as_deref().is_some_and(|lead| {
-                    let n = lead.len().min(prefix.len());
-                    lead[..n] != prefix[..n]
-                }) {
-                    CNode::False
-                } else {
-                    CNode::PathGlob {
-                        glob: w,
-                        lead,
-                        trail: w.trailing_literal(),
+            Leaf::Glob(w) => match w.single_part() {
+                Some(part) if parts_are_names => CNode::NamePart {
+                    part,
+                    lit: w.longest_literal(),
+                },
+                _ => {
+                    let lead = anchored_lead(w);
+                    if lead.as_deref().is_some_and(|lead| {
+                        let n = lead.len().min(prefix.len());
+                        lead[..n] != prefix[..n]
+                    }) {
+                        CNode::False
+                    } else {
+                        CNode::PathGlob {
+                            glob: w,
+                            lead,
+                            trail: w.trailing_literal(),
+                            name_lit: w.name_literal().filter(|_| parts_are_names),
+                        }
                     }
                 }
-            }
+            },
             Leaf::Kind(kind) => CNode::Kind(*kind),
             Leaf::Ext(exts) => CNode::Ext(exts),
             Leaf::Size(range) => CNode::Size(*range),
@@ -232,7 +262,7 @@ impl<'a> CNode<'a> {
             CNode::Kind(_) => (1, 1),
             CNode::Size(_) | CNode::Date(_) => (2, 1),
             CNode::Name(_) => (3, 1),
-            CNode::NameGlob(_) => (4, 1),
+            CNode::NameGlob(_) | CNode::NamePart { .. } => (4, 1),
             CNode::Ext(_) => (5, 1),
             CNode::Path(_) => (6, 1),
             CNode::PathGlob { .. } => (7, 1),
@@ -247,9 +277,12 @@ impl<'a> CNode<'a> {
     /// Whether every leaf is decided by the name alone.
     fn decided_by_name(&self) -> bool {
         match self {
-            CNode::True | CNode::False | CNode::Name(_) | CNode::NameGlob(_) | CNode::Ext(_) => {
-                true
-            }
+            CNode::True
+            | CNode::False
+            | CNode::Name(_)
+            | CNode::NameGlob(_)
+            | CNode::NamePart { .. }
+            | CNode::Ext(_) => true,
             CNode::Kind(_)
             | CNode::Size(_)
             | CNode::Date(_)
@@ -269,6 +302,9 @@ impl<'a> CNode<'a> {
         match self {
             CNode::Name(finder) => Some(vec![finder.needle().to_vec()]),
             CNode::NameGlob(w) => w.longest_literal().map(|lit| vec![lit]),
+            CNode::NamePart { lit, .. } | CNode::PathGlob { name_lit: lit, .. } => {
+                lit.clone().map(|lit| vec![lit])
+            }
             CNode::Ext(exts) if exts.len() <= UNION_MAX => {
                 Some(exts.iter().map(|e| [&b"."[..], e].concat()).collect())
             }
@@ -310,6 +346,15 @@ impl<'a> CNode<'a> {
                 let budget = s.budget;
                 w.matches_decoded(s.name_code_points(), budget)
             }
+            CNode::NamePart { part, .. } => {
+                let budget = s.budget;
+                let name = s.name_code_points();
+                let last = name
+                    .iter()
+                    .rposition(|&c| c == u32::from(b'\\'))
+                    .map_or(name, |sep| &name[sep + 1..]);
+                part.matches_decoded(last, budget)
+            }
             CNode::Ext(exts) => ext_in(exts, s.raw, &mut s.scratch.ext),
             CNode::Kind(kind) => kind_matches(Some(*kind), s.is_dir()),
             CNode::Size(range) => size_matches(*range, s.size()),
@@ -319,7 +364,9 @@ impl<'a> CNode<'a> {
                 s.full_path()
                     .is_some_and(|p| !long_and_spent(p, budget) && finder.find(p).is_some())
             }
-            CNode::PathGlob { glob, lead, trail } => {
+            CNode::PathGlob {
+                glob, lead, trail, ..
+            } => {
                 let budget = s.budget;
                 let fits = s.full_path().is_some_and(|p| {
                     lead.as_deref().is_none_or(|lead| p.starts_with(lead))
@@ -485,7 +532,7 @@ mod tests {
         let parsed = parse_query(query).unwrap();
         let prefix = crate::fold::fold(prefix.as_bytes());
         let e = parsed.expr.as_ref().expect("an expression");
-        f(&compile(e, &prefix));
+        f(&compile(e, &prefix, true));
     }
 
     /// A path term the mount prefix decides becomes a constant, and the
@@ -518,7 +565,7 @@ mod tests {
             assert_eq!(costs, [1, 2, 3, 4, 5, 6, 7]);
         });
         let parsed = parse_query("<a|b> <c|file:> <d|x\\y>").unwrap();
-        let node = compile(parsed.expr.as_ref().unwrap(), br"c:\");
+        let node = compile(parsed.expr.as_ref().unwrap(), br"c:\", true);
         let (name, entry) = split(node);
         assert!(name.as_ref().is_some_and(|n| !n.tests_paths()));
         let entry = entry.expect("entry terms");
@@ -530,7 +577,7 @@ mod tests {
     /// The needles of `query`'s expression on C:, sorted.
     fn needles_of(query: &str) -> Option<Vec<String>> {
         let parsed = parse_query(query).unwrap();
-        let node = compile(parsed.expr.as_ref().expect("an expression"), br"c:\");
+        let node = compile(parsed.expr.as_ref().expect("an expression"), br"c:\", true);
         plan([&node]).map(|needles| {
             let mut out: Vec<String> = needles
                 .into_iter()
