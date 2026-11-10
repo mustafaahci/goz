@@ -10,7 +10,7 @@
 //! without contacting the daemon.
 //!
 //! Exit codes (es-compatible where they overlap): 0 ok · 4 missing switch
-//! parameter / bad query / argument not valid Unicode · 5 export-file
+//! parameter / malformed or refused query / argument not valid Unicode · 5 export-file
 //! create failure / output write failure · 6 unknown switch · 7 protocol
 //! failure (malformed daemon reply, 30 s of silence from the daemon, or
 //! pipe open error) · 8 daemon unreachable · 9 no results with

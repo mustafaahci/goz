@@ -9,7 +9,8 @@ pub enum Exit {
     /// 0: the run did what it was asked.
     Success,
     /// 4: a switch is missing its parameter or got one goz cannot use, an
-    /// argument is not valid Unicode, or gozd refused the search.
+    /// argument is not valid Unicode, or the search text is malformed or
+    /// gozd refused it.
     BadParam,
     /// 5: the export file could not be created, or writing the output failed.
     WriteFailed,
@@ -59,7 +60,8 @@ impl Exit {
             Exit::Success => "Success",
             Exit::BadParam => {
                 "A switch is missing its parameter or got one goz cannot use, \
-                 an argument is not valid Unicode, or gozd refused the search"
+                 an argument is not valid Unicode, or the search text is malformed \
+                 or gozd refused it"
             }
             Exit::WriteFailed => {
                 "The export file could not be created, or writing the output failed"

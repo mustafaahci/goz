@@ -35,7 +35,19 @@
 //!   are switches, not search text.
 //! - Non-switch tokens become the query: joined with single spaces, in
 //!   command-line order, each token preserved as received. Flags may
-//!   interleave with query tokens freely.
+//!   interleave with query tokens freely. The search text is Everything
+//!   1.5's syntax, operators included (`|`, `!`, `< >`), so goz passes it on
+//!   as es does; a shell that takes `|`, `<` or `>` for itself needs them
+//!   escaped (`^|` in cmd) or `-argv` with the text in quotes.
+//! - What `-ad`, `-a-d` and `-p` add goes before the search text, where no
+//!   operator, open quote or `name*:` of the text can reach it: `foo|` with
+//!   `-ad` is `folder: foo|`, every folder, where `foo| folder:` would be
+//!   `foo` or any folder.
+//! - Search text that is malformed whatever gozd's clock, such as an
+//!   unbalanced `<`, is refused here with exit 4 and the parser's message,
+//!   whose column counts in the text as typed. es passes such text on and
+//!   Everything guesses; gozd refuses it too, so failing first only saves
+//!   the round trip and works without a daemon.
 //! - A sort's direction is set apart from its key: `-sort-size-ascending
 //!   -sort-dm` sorts by date, ascending, and an unset direction is the key's
 //!   default.
@@ -54,6 +66,7 @@
 
 use super::Exit;
 use super::es_only::ES_ONLY_SWITCHES;
+use crate::query::{DateOrder, LocalClock, QueryError, parse_query_at};
 use crate::types::{EsColumn, SortDir, SortKey, SortSpec};
 
 /// What one command line asks goz to do.
@@ -95,9 +108,9 @@ pub enum OutputFormat {
 /// talking to the daemon).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EsPlan {
-    /// Search text: every non-switch token, joined with single spaces in
-    /// command-line order, each token preserved as received, then what `-ad`,
-    /// `-a-d` and `-p` add to it.
+    /// Search text: what `-ad`, `-a-d` and `-p` add to it, then every
+    /// non-switch token, joined with single spaces in command-line order,
+    /// each token preserved as received.
     pub query: String,
     /// `-path` value, verbatim. The CLI absolutizes it (GetFullPathName
     /// semantics, no existence check); the core stays path-API-free.
@@ -210,7 +223,7 @@ impl EsPlan {
 ///
 /// | Code | es meaning |
 /// |------|------------|
-/// | 4    | expected an additional parameter after a switch (modern es also uses it for a bad switch parameter) |
+/// | 4    | expected an additional parameter after a switch (modern es also uses it for a bad switch parameter); in goz also malformed search text |
 /// | 6    | unknown switch |
 ///
 /// The message names the offending token so the CLI can report it on stderr
@@ -255,6 +268,15 @@ impl EsFatal {
         Self {
             exit_code: Exit::BadParam.code(),
             message: format!("expected {expected} after {token}, got: {value}"),
+        }
+    }
+
+    /// Exit 4: the search text cannot be searched as written; the message
+    /// is the query parser's, as gozd would send it.
+    fn bad_search(error: &QueryError) -> Self {
+        Self {
+            exit_code: Exit::BadParam.code(),
+            message: error.to_string(),
         }
     }
 }
@@ -1087,10 +1109,16 @@ fn parse_tokens(mut tokens: impl Tokens) -> Result<Command, EsFatal> {
         }
     }
 
-    let mut query = pending.terms;
-    query.extend(pending.filters.iter().map(|filter| (*filter).to_owned()));
+    let text = pending.terms.join(" ");
+    check_search_text(&text, plan.match_case)?;
+    // The switches' terms go first: after the text, an operator, an open
+    // quote or a `name*:` there would take them in (see the module docs).
+    let mut query: Vec<&str> = pending.filters.clone();
     if pending.match_path {
-        query.push("matchpath:".to_owned());
+        query.push("matchpath:");
+    }
+    if !text.is_empty() {
+        query.push(&text);
     }
     plan.query = query.join(" ");
     let key = pending.sort_key.unwrap_or(plan.sort.key);
@@ -1101,6 +1129,41 @@ fn parse_tokens(mut tokens: impl Tokens) -> Result<Command, EsFatal> {
             .unwrap_or_else(|| SortSpec::default_for(key).dir),
     };
     Ok(Command::Run(plan))
+}
+
+/// Refuses search text that gozd would refuse whatever its clock: an
+/// unbalanced `<` or `>`, group expansion, an unknown function, a malformed
+/// size, nesting too deep, too many terms. A `dm:` value is left to gozd,
+/// which reads it against its own clock and regional date order, so the
+/// clock here only lets the parse go on past one.
+fn check_search_text(text: &str, match_case: bool) -> Result<(), EsFatal> {
+    match parse_query_at(text, match_case, &CheckClock) {
+        Ok(_) | Err(QueryError::NoClock | QueryError::Malformed { what: "dm:", .. }) => Ok(()),
+        Err(error) => Err(EsFatal::bad_search(&error)),
+    }
+}
+
+/// A clock for [`check_search_text`]: any fixed time does, since no answer
+/// that depends on the date is taken from it.
+struct CheckClock;
+
+impl LocalClock for CheckClock {
+    fn now(&self) -> i64 {
+        // 2026-01-01T00:00:00Z as FILETIME ticks.
+        134_115_840_000_000_000
+    }
+    fn to_local(&self, utc: i64) -> Option<i64> {
+        Some(utc)
+    }
+    fn to_utc(&self, local: i64) -> Option<i64> {
+        Some(local)
+    }
+    fn week_start(&self) -> u8 {
+        0
+    }
+    fn date_order(&self) -> DateOrder {
+        DateOrder::YearMonthDay
+    }
 }
 
 /// Tells search text from a switch, by es's rules (see the module docs).
@@ -1817,16 +1880,109 @@ mod tests {
     /// a gozd too old to know it refuses rather than ignores.
     #[test]
     fn match_path_is_a_directive_on_the_query() {
-        assert_eq!(plan(&["-p", "a", "b"]).query, "a b matchpath:");
-        assert_eq!(plan(&["a", "/match-path"]).query, "a matchpath:");
+        assert_eq!(plan(&["-p", "a", "b"]).query, "matchpath: a b");
+        assert_eq!(plan(&["a", "/match-path"]).query, "matchpath: a");
         assert_eq!(plan(&["-p", "-no-p", "a"]).query, "a");
     }
 
     #[test]
     fn es_filters_join_the_query() {
-        assert_eq!(plan(&["/ad", "a"]).query, "a folder:");
-        assert_eq!(plan(&["a", "-a-d"]).query, "a file:");
+        assert_eq!(plan(&["/ad", "a"]).query, "folder: a");
+        assert_eq!(plan(&["a", "-a-d"]).query, "file: a");
         assert_eq!(plan(&["-ad"]).query, "folder:");
+        assert_eq!(plan(&["-p", "-ad", "a"]).query, "folder: matchpath: a");
+    }
+
+    /// The switches' terms go before the search text, where its operators,
+    /// an open quote or a `name*:` cannot take them in.
+    #[test]
+    fn es_filters_stand_apart_from_the_search_texts_syntax() {
+        use crate::query::{Kind, parse_query};
+        let parsed = |tokens: &[&str]| parse_query(&plan(tokens).query).unwrap();
+        // `foo|` is everything, so with -ad every folder: the filter is
+        // ANDed, not ORed with `foo`.
+        let all = parsed(&["-ad", "foo|"]);
+        assert_eq!(all.filters.kind, Some(Kind::Folder));
+        assert!(all.is_text_empty(), "{all:?}");
+        // `name*:` takes the rest of the text, and the filter is not in it.
+        let rest = parsed(&["name*:foo", "/a-d"]);
+        assert_eq!(rest.filters.kind, Some(Kind::File));
+        assert_eq!(rest.name_terms, [b"foo".to_vec()]);
+        // An open quote ends with the text.
+        let open = parsed(&["\"foo", "-ad"]);
+        assert_eq!(open.filters.kind, Some(Kind::Folder));
+        // An OR stays inside the text: (a|b) AND folders.
+        let or = parsed(&["a|b", "-ad"]);
+        assert_eq!(or.filters.kind, Some(Kind::Folder));
+        assert!(or.expr.is_some());
+    }
+
+    /// The search text is Everything 1.5's: `|`, `!`, `< >` and the keyword
+    /// operators reach gozd as typed, from split arguments, from a raw
+    /// command line and through `-argv` alike.
+    #[test]
+    fn operators_pass_through_as_typed() {
+        for text in [
+            "a|b",
+            "a | b",
+            "!a",
+            "a !b",
+            "<a b>|c",
+            "!<a|b> c",
+            "a or: b not: c and: d",
+            "*.dll|*.txt",
+            r"**\bin\*.dll",
+            "ext:txt;md|size:>1mb",
+            "foo|",
+            "<>",
+        ] {
+            assert_eq!(plan(&[text]).query, text, "split: {text}");
+            assert_eq!(line(&format!("goz {text}")).query, text, "raw: {text}");
+            assert_eq!(
+                line(&format!("goz -argv \"{text}\"")).query,
+                text,
+                "-argv: {text}"
+            );
+        }
+        // In es's reading the quotes reach the parser, so a quoted operator
+        // is literal text, and a quoted value is still a value.
+        assert_eq!(line(r#"goz "a|b""#).query, r#""a|b""#);
+        assert_eq!(line(r#"goz size:">1mb""#).query, r#"size:">1mb""#);
+    }
+
+    /// Search text that is malformed whatever the clock exits 4 with the
+    /// parser's message, its column counted in the text as typed.
+    #[test]
+    fn malformed_search_text_is_exit_4_with_its_column() {
+        let refused = |tokens: &[&str]| {
+            let err = fatal(tokens);
+            assert_eq!(err.exit_code, Exit::BadParam.code(), "{tokens:?}");
+            err.message
+        };
+        let msg = refused(&["<a", "b"]);
+        assert!(msg.contains("unbalanced '<' at column 1"), "{msg}");
+        let msg = refused(&["-ad", "a", "b>"]);
+        assert!(msg.contains("unbalanced '>' at column 4"), "{msg}");
+        let msg = refused(&["gr<a|e>y"]);
+        assert!(msg.contains("group expansion"), "{msg}");
+        let msg = refused(&["regex:foo"]);
+        assert!(
+            msg.contains("unknown search function or modifier 'regex:'"),
+            "{msg}"
+        );
+        let msg = refused(&["size:huge2"]);
+        assert!(msg.contains("size:"), "{msg}");
+        assert_eq!(
+            parse_command_line("goz -argv \"<a b\"")
+                .unwrap_err()
+                .exit_code,
+            4
+        );
+        // es's reading keeps the quotes, so a quoted `<` is literal text.
+        assert_eq!(line(r#"goz "<a b""#).query, r#""<a b""#);
+        // A date is gozd's to judge, against its own clock.
+        assert_eq!(plan(&["dm:today|dm:2024-05"]).query, "dm:today|dm:2024-05");
+        assert_eq!(plan(&["dm:notadate"]).query, "dm:notadate");
     }
 
     #[test]

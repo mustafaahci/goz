@@ -142,6 +142,38 @@ fn missing_switch_parameter_exits_4() {
     );
 }
 
+/// Exit 4 for search text that cannot be searched as written, such as an
+/// unbalanced `<`, with the parser's message: refused before any daemon
+/// contact, as gozd would refuse it. `|` and `!` are operators, not errors,
+/// so they never get here.
+#[test]
+fn malformed_search_text_exits_4() {
+    for (args, message) in [
+        (
+            &["<foo", "bar"][..],
+            "goz: unbalanced '<' at column 1: the group it opens is never closed with '>'",
+        ),
+        (
+            &["foo|bar>"][..],
+            "goz: unbalanced '>' at column 8: there is no '<' for it to close",
+        ),
+        (&["-argv", "<a|b"][..], "goz: unbalanced '<' at column 1"),
+        (&["gr<a|e>y"][..], "group expansion such as gr<a|e>y"),
+        (
+            &["!regex:x"][..],
+            "unknown search function or modifier 'regex:'",
+        ),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_goz"))
+            .args(args)
+            .output()
+            .expect("failed to spawn the goz binary");
+        assert_eq!(out.status.code(), Some(4), "{args:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains(message), "{args:?}: {}", stderr(&out));
+        assert!(stdout(&out).is_empty(), "{args:?}: {}", stdout(&out));
+    }
+}
+
 /// es exit code 4 for an argument goz cannot read at all: one that is not
 /// valid Unicode used to panic, exit 101, before parsing began.
 #[test]
