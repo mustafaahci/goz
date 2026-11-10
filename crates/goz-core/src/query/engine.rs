@@ -2972,7 +2972,11 @@ mod tests {
             ("dm:thismonth", &today[..]),
             ("dm:last59mins", &[][..]),
             ("dm:last1hours", &[r"docs\sub\Report.PDF"][..]),
-            ("dm:lastmonth", &[r"docs\notes.txt"][..]),
+            ("dm:prevmonth", &[r"docs\notes.txt"][..]),
+            // Rolling in Everything 1.5: from a month ago on.
+            ("dm:lastmonth", &today[..]),
+            // An age compares as one: older than an hour.
+            ("dm:>1hour", &["docs", r"docs\notes.txt", "photo.JPG"][..]),
             ("dm:<2000", &["photo.JPG"][..]),
             ("dm:unknown", &[r"docs\sub"][..]),
             ("report dm:today", &[r"docs\sub\Report.PDF"][..]),
@@ -2990,7 +2994,7 @@ mod tests {
                 &[r"docs\notes.txt", r"docs\sub", "photo.JPG"][..],
             ),
             (
-                "<notes dm:lastmonth>|dm:unknown",
+                "<notes dm:prevmonth>|dm:unknown",
                 &[r"docs\notes.txt", r"docs\sub"][..],
             ),
         ] {

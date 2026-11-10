@@ -1,11 +1,12 @@
-//! The machine's time zone and first day of the week: what turns a calendar
-//! day of a query, such as `dm:today`, into the UTC times the index holds.
+//! The machine's time zone, first day of the week and short date order:
+//! what turns a calendar day of a query, such as `dm:today` or
+//! `dm:11/4/2026`, into the UTC times the index holds.
 
 use core::ptr::null;
 
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows_sys::Win32::Globalization::{
-    GetLocaleInfoEx, LOCALE_IFIRSTDAYOFWEEK, LOCALE_RETURN_NUMBER,
+    GetLocaleInfoEx, LOCALE_IDATE, LOCALE_IFIRSTDAYOFWEEK, LOCALE_RETURN_NUMBER,
 };
 use windows_sys::Win32::System::Time::{
     DYNAMIC_TIME_ZONE_INFORMATION, FileTimeToSystemTime, GetDynamicTimeZoneInformation,
@@ -134,23 +135,41 @@ fn from_system_time(time: &SYSTEMTIME) -> Option<i64> {
 /// account's format, which Windows Setup takes from the region it installs
 /// for and "Copy settings" in the administrative language settings updates.
 pub fn first_day_of_week() -> u8 {
-    let mut day: u32 = 0;
+    match locale_number(LOCALE_IFIRSTDAYOFWEEK) {
+        Some(day @ 0..=6) => day as u8,
+        _ => 0,
+    }
+}
+
+/// The order of the day, month and year in the calling account's short date
+/// format (`LOCALE_IDATE`): 0 for month/day/year, 1 for day/month/year, 2
+/// for year/month/day, or month/day/year when it cannot be read. Everything
+/// reads a date written with `/` or `.` in this order (`dm:11/4/2026`), and
+/// so does goz; under the service, it is the system account's format, as
+/// for [`first_day_of_week`].
+pub fn short_date_order() -> u8 {
+    match locale_number(LOCALE_IDATE) {
+        Some(order @ 0..=2) => order as u8,
+        _ => 0,
+    }
+}
+
+/// A numeric field of the calling account's default locale, such as
+/// `LOCALE_IFIRSTDAYOFWEEK`, or `None` when it cannot be read.
+fn locale_number(field: u32) -> Option<u32> {
+    let mut value: u32 = 0;
     // SAFETY: plain Win32 FFI. With LOCALE_RETURN_NUMBER the call writes one
     // DWORD, two UTF-16 units, through the aligned pointer to a local u32;
     // a null name is the calling account's default locale.
     let written = unsafe {
         GetLocaleInfoEx(
             null(),
-            LOCALE_IFIRSTDAYOFWEEK | LOCALE_RETURN_NUMBER,
-            (&raw mut day).cast(),
+            field | LOCALE_RETURN_NUMBER,
+            (&raw mut value).cast(),
             2,
         )
     };
-    if written > 0 && day <= 6 {
-        day as u8
-    } else {
-        0
-    }
+    (written > 0).then_some(value)
 }
 
 #[cfg(test)]
@@ -259,5 +278,6 @@ mod tests {
         let local = (i64::from(local.dwHighDateTime) << 32) | i64::from(local.dwLowDateTime);
         assert_eq!(zone.local_from_utc(now), Some(local));
         assert!(first_day_of_week() <= 6);
+        assert!(short_date_order() <= 2);
     }
 }

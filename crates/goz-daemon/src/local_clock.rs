@@ -3,20 +3,22 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use goz_core::output::FILETIME_UNIX_EPOCH;
-use goz_core::query::LocalClock;
+use goz_core::query::{DateOrder, LocalClock};
 use goz_winfs::TimeZone;
 
 /// The machine's clock and calendar as a query arrives: the time, the time
-/// zone with its daylight-saving rules for every year, and the first day of
-/// the week. A Windows time zone belongs to the machine, so the daemon's is
-/// every user's. The week start is the daemon's regional format: under the
-/// service, the system account's (see [`goz_winfs::first_day_of_week`]).
+/// zone with its daylight-saving rules for every year, the first day of the
+/// week and the order of a short date. A Windows time zone belongs to the
+/// machine, so the daemon's is every user's. The week start and the date
+/// order are the daemon's regional format: under the service, the system
+/// account's (see [`goz_winfs::first_day_of_week`]).
 pub(crate) struct MachineClock {
     now: i64,
     /// `None` when the zone cannot be read, so calendar dates are refused
     /// while durations still work.
     zone: Option<TimeZone>,
     week_start: u8,
+    date_order: DateOrder,
 }
 
 impl MachineClock {
@@ -30,6 +32,11 @@ impl MachineClock {
             now: now_filetime(),
             zone,
             week_start: goz_winfs::first_day_of_week(),
+            date_order: match goz_winfs::short_date_order() {
+                1 => DateOrder::DayMonthYear,
+                2 => DateOrder::YearMonthDay,
+                _ => DateOrder::MonthDayYear,
+            },
         }
     }
 }
@@ -46,6 +53,9 @@ impl LocalClock for MachineClock {
     }
     fn week_start(&self) -> u8 {
         self.week_start
+    }
+    fn date_order(&self) -> DateOrder {
+        self.date_order
     }
 }
 

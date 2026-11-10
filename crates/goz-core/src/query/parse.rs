@@ -1427,7 +1427,6 @@ mod tests {
                     "size:abc",
                     "size:>=10kb",
                     "dm:today",
-                    "dm:lastweek",
                     "dm:2024",
                     "dm:>2020",
                     "dm:2024-01-01..2024-03-31",

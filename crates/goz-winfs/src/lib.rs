@@ -65,7 +65,7 @@ pub use device_notify::{DeviceEvent, DeviceNotification};
 #[cfg(windows)]
 pub use number_format::{NumberFormat, number_format};
 #[cfg(windows)]
-pub use time_zone::{TimeZone, first_day_of_week};
+pub use time_zone::{TimeZone, first_day_of_week, short_date_order};
 #[cfg(windows)]
 pub use working_set::{SelfMemory, pin_working_set, self_memory, trim_working_set};
 

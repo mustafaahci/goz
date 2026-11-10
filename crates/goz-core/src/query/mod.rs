@@ -26,7 +26,7 @@ mod parse_v060;
 pub use crate::fold;
 
 pub use budget::{Budget, Stopped};
-pub use dates::{DateFilter, LocalClock};
+pub use dates::{DateFilter, DateOrder, LocalClock};
 pub use engine::{
     CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, mtime_key, resolve_scope, run_query,
     run_query_refs, size_key,
