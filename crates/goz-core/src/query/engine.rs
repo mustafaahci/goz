@@ -2426,6 +2426,7 @@ mod tests {
             ("an expression on entries", "!zzz|file:", None, name, None),
             ("an expression on paths", r"zzz|docs\", None, name, None),
             ("the best of an expression", "e !zzz", None, size, Some(10)),
+            ("a sub-path automaton", r"**\*e*", None, name, None),
         ] {
             let parsed = parse_query(q).unwrap();
             let run = |budget: &Budget| {
@@ -4694,6 +4695,482 @@ mod tests {
                 let fast: Vec<EntryIdx> = fast.refs.iter().map(|r| r.idx).collect();
                 let slow: Vec<EntryIdx> = slow.refs.iter().map(|r| r.idx).collect();
                 prop_assert_eq!(fast, slow);
+            }
+        }
+    }
+
+    // -- boolean queries against a naive evaluator ---------------------------
+
+    /// The naive reference for boolean queries: random trees, random
+    /// expressions of every term kind S1 knows, printed to query text and
+    /// parsed back, run through every way a page is gathered, and compared
+    /// with a plain evaluation of the expression over every entry and a plain
+    /// sort of what matches.
+    mod boolean_reference {
+        use super::*;
+        use crate::query::glob::tests::{reference_match, reference_sub_path};
+        use prop::sample::Index;
+
+        /// A query as the test builds it.
+        #[derive(Clone, Debug)]
+        enum Q {
+            /// The name holds the text.
+            Word(String),
+            /// The full path holds the text: one with a separator, or under
+            /// `path:` (`prefixed`).
+            Path {
+                text: String,
+                prefixed: bool,
+            },
+            /// A name wildcard.
+            Glob(String),
+            /// A sub-path wildcard, under `path:` when it has neither a
+            /// separator nor `**`.
+            SubGlob {
+                text: String,
+                prefixed: bool,
+            },
+            /// `ext:` values.
+            Ext(Vec<String>),
+            /// `size:` and the range the test means by it.
+            Size(String, SizeRange),
+            /// `file:` (true) or `folder:`.
+            Kind(bool),
+            /// `<>`.
+            Empty,
+            Not(Box<Q>),
+            And(Vec<Q>),
+            Or(Vec<Q>),
+        }
+
+        /// The shape of a query, drawn before the tree its terms are cut
+        /// from exists.
+        #[derive(Clone, Debug)]
+        enum Spec {
+            Leaf(u8, Index, Index, Index, u64, u64),
+            Not(Box<Spec>),
+            And(Vec<Spec>),
+            Or(Vec<Spec>),
+        }
+
+        fn spec() -> impl Strategy<Value = Spec> {
+            let leaf = (
+                0u8..8,
+                any::<Index>(),
+                any::<Index>(),
+                any::<Index>(),
+                any::<u64>(),
+                any::<u64>(),
+            )
+                .prop_map(|(kind, pick, a, b, flip, n)| Spec::Leaf(kind, pick, a, b, flip, n));
+            leaf.prop_recursive(3, 6, 3, |inner| {
+                prop_oneof![
+                    inner.clone().prop_map(|s| Spec::Not(Box::new(s))),
+                    prop::collection::vec(inner.clone(), 2..4).prop_map(Spec::And),
+                    prop::collection::vec(inner, 2..4).prop_map(Spec::Or),
+                ]
+            })
+        }
+
+        /// What the terms are cut from: each presentable entry's name and
+        /// full path, as typed.
+        struct Vocabulary {
+            names: Vec<Vec<char>>,
+            paths: Vec<Vec<char>>,
+        }
+
+        fn cut(chars: &[char], a: Index, b: Index) -> &[char] {
+            let (x, y) = (a.index(chars.len() + 1), b.index(chars.len() + 1));
+            &chars[x.min(y)..x.max(y)]
+        }
+
+        /// `chars` with some replaced by wildcards, as `n`'s bits say, never
+        /// a separator, and runs of `*` kept single; at least one wildcard.
+        fn wild(chars: &[char], n: u64) -> String {
+            let mut out = String::new();
+            for (k, &c) in chars.iter().enumerate() {
+                let bits = (n >> ((k * 2) % 62)) & 3;
+                let w = match bits {
+                    0 if c != '\\' => Some('*'),
+                    1 if c != '\\' && k % 3 == 0 => Some('?'),
+                    _ => None,
+                };
+                match w {
+                    Some('*') if out.ends_with('*') => {}
+                    Some(w) => out.push(w),
+                    None => out.push(c),
+                }
+            }
+            if !out.contains(['*', '?']) {
+                out.push('*');
+            }
+            out
+        }
+
+        fn materialize(spec: &Spec, v: &Vocabulary) -> Q {
+            match spec {
+                Spec::Not(s) => Q::Not(Box::new(materialize(s, v))),
+                Spec::And(items) => Q::And(items.iter().map(|s| materialize(s, v)).collect()),
+                Spec::Or(items) => Q::Or(items.iter().map(|s| materialize(s, v)).collect()),
+                Spec::Leaf(kind, pick, a, b, flip, n) => {
+                    let name = pick.get(&v.names);
+                    let path = pick.get(&v.paths);
+                    match kind {
+                        0 => {
+                            let text = flip_case(cut(name, *a, *b), *flip);
+                            Q::Word(if text.is_empty() { "a".into() } else { text })
+                        }
+                        1 => {
+                            let text = flip_case(cut(path, *a, *b), *flip);
+                            let text = if text.is_empty() { "a".into() } else { text };
+                            Q::Path {
+                                prefixed: !text.contains('\\'),
+                                text,
+                            }
+                        }
+                        2 => {
+                            let mut text =
+                                wild(&flip_case(name, *flip).chars().collect::<Vec<_>>(), *n);
+                            if text.contains("**") {
+                                text = text.replace("**", "*");
+                            }
+                            Q::Glob(text)
+                        }
+                        3 => {
+                            // The last `k + 1` parts, or the whole path, with
+                            // wildcards, maybe a `**` part, maybe a separator
+                            // in front or behind.
+                            let parts: Vec<String> = flip_case(path, *flip)
+                                .split('\\')
+                                .map(str::to_string)
+                                .collect();
+                            let k = (*n % 4) as usize;
+                            let from = if n % 7 == 0 {
+                                0
+                            } else {
+                                parts.len().saturating_sub(k + 1)
+                            };
+                            let mut parts: Vec<String> = parts[from..].to_vec();
+                            if n % 5 == 0 && parts.len() > 2 {
+                                let mid = parts.len() / 2;
+                                parts[mid] = "**".into();
+                            }
+                            let joined = parts.join("\\");
+                            let mut text =
+                                wild(&joined.chars().collect::<Vec<_>>(), n.rotate_left(17));
+                            if n % 3 == 0 {
+                                text.push('\\');
+                            } else if n % 11 == 0 {
+                                text.insert(0, '\\');
+                            }
+                            Q::SubGlob {
+                                prefixed: !text.contains('\\') && !text.contains("**"),
+                                text,
+                            }
+                        }
+                        4 => {
+                            let ext: String = name.iter().rposition(|&c| c == '.').map_or_else(
+                                || "x".to_string(),
+                                |dot| name[dot + 1..].iter().collect(),
+                            );
+                            let ext = flip_case(&ext.chars().collect::<Vec<_>>(), *flip);
+                            let mut values = vec![if n % 2 == 0 { format!(".{ext}") } else { ext }];
+                            if n % 3 == 0 {
+                                values.push("a".into());
+                            }
+                            // An empty value is S2's "no extension"; S1
+                            // leaves it out, as goz always has.
+                            values.retain(|v| !v.trim_start_matches('.').is_empty());
+                            if values.is_empty() {
+                                values = vec!["x".into()];
+                            }
+                            Q::Ext(values)
+                        }
+                        5 => {
+                            let k = 1 + (n % 40);
+                            let m = k + (n >> 8) % 20;
+                            match (n >> 16) % 6 {
+                                0 => Q::Size(
+                                    format!(">{k}"),
+                                    SizeRange {
+                                        min: k + 1,
+                                        max: u64::MAX,
+                                    },
+                                ),
+                                1 => Q::Size(format!("<{k}"), SizeRange { min: 0, max: k - 1 }),
+                                2 => Q::Size(
+                                    format!(">={k}"),
+                                    SizeRange {
+                                        min: k,
+                                        max: u64::MAX,
+                                    },
+                                ),
+                                3 => Q::Size(format!("<={k}"), SizeRange { min: 0, max: k }),
+                                4 => Q::Size(format!("{k}..{m}"), SizeRange { min: k, max: m }),
+                                _ => Q::Size(format!("{k}"), SizeRange { min: k, max: k }),
+                            }
+                        }
+                        6 => Q::Kind(n % 2 == 0),
+                        _ => Q::Empty,
+                    }
+                }
+            }
+        }
+
+        /// Keeps the first `file:`/`folder:`, `ext:` and `size:` and makes
+        /// the others words: a top-level `ext:` or `size:` still keeps its
+        /// last term, as it always has, which S2 replaces with AND.
+        fn one_filter_each(q: &mut Q, seen: &mut [bool; 3]) {
+            let slot = match q {
+                Q::Kind(_) => Some(0),
+                Q::Ext(_) => Some(1),
+                Q::Size(..) => Some(2),
+                Q::Not(inner) => {
+                    one_filter_each(inner, seen);
+                    None
+                }
+                Q::And(items) | Q::Or(items) => {
+                    items.iter_mut().for_each(|i| one_filter_each(i, seen));
+                    None
+                }
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                if seen[slot] {
+                    *q = Q::Word("b".into());
+                }
+                seen[slot] = true;
+            }
+        }
+
+        fn is_composite(q: &Q) -> bool {
+            matches!(q, Q::And(_) | Q::Or(_))
+        }
+
+        /// The query text: every group bracketed, or only where Everything's
+        /// precedence (OR binds tighter than AND, NOT tighter still) needs it.
+        fn print(q: &Q, minimal: bool) -> String {
+            match q {
+                Q::Word(s) | Q::Glob(s) => s.clone(),
+                Q::Path { text, prefixed } | Q::SubGlob { text, prefixed } => {
+                    if *prefixed {
+                        format!("path:{text}")
+                    } else {
+                        text.clone()
+                    }
+                }
+                Q::Ext(values) => format!("ext:{}", values.join(";")),
+                Q::Size(text, _) => format!("size:{text}"),
+                Q::Kind(true) => "file:".into(),
+                Q::Kind(false) => "folder:".into(),
+                Q::Empty => "<>".into(),
+                Q::Not(inner) if is_composite(inner) => format!("!<{}>", print(inner, minimal)),
+                Q::Not(inner) => format!("!{}", print(inner, minimal)),
+                Q::And(items) => {
+                    let text: Vec<String> = items.iter().map(|i| print(i, minimal)).collect();
+                    if minimal {
+                        text.join(" ")
+                    } else {
+                        format!("<{}>", text.join(" "))
+                    }
+                }
+                Q::Or(items) => {
+                    let text: Vec<String> = items
+                        .iter()
+                        .map(|i| match i {
+                            Q::And(_) if minimal => format!("<{}>", print(i, minimal)),
+                            _ => print(i, minimal),
+                        })
+                        .collect();
+                    if minimal {
+                        text.join("|")
+                    } else {
+                        format!("<{}>", text.join("|"))
+                    }
+                }
+            }
+        }
+
+        /// The entry as the reference reads it.
+        struct Seen {
+            name: Vec<u8>,
+            full: String,
+            is_dir: bool,
+            size: Option<u64>,
+        }
+
+        fn holds(hay: &[u8], needle: &[u8]) -> bool {
+            needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
+        }
+
+        /// Whether `q` matches the entry, worked out plainly. `case`: the
+        /// query matches case.
+        fn eval(q: &Q, e: &Seen, case: bool) -> bool {
+            let fold = |b: &[u8]| {
+                if case {
+                    b.to_vec()
+                } else {
+                    crate::fold::fold(b)
+                }
+            };
+            let chars = |b: &[u8]| {
+                String::from_utf8(b.to_vec())
+                    .unwrap()
+                    .chars()
+                    .collect::<Vec<char>>()
+            };
+            match q {
+                Q::Word(s) => holds(&fold(&e.name), &fold(s.as_bytes())),
+                Q::Path { text, .. } => {
+                    holds(e.full.as_bytes(), &fold(text.replace('/', "\\").as_bytes()))
+                }
+                Q::Glob(p) => {
+                    reference_match(&chars(&fold(p.as_bytes())), &chars(&fold(&e.name)), false)
+                }
+                Q::SubGlob { text, .. } => {
+                    let pattern = String::from_utf8(fold(text.as_bytes())).unwrap();
+                    reference_sub_path(&pattern, &e.full)
+                }
+                Q::Ext(values) => {
+                    let Some(dot) = e.name.iter().rposition(|&b| b == b'.') else {
+                        return false;
+                    };
+                    let ext = crate::fold::fold(&e.name[dot + 1..]);
+                    values
+                        .iter()
+                        .map(|v| crate::fold::fold(v.trim_start_matches('.').as_bytes()))
+                        .any(|v| v == ext)
+                }
+                Q::Size(_, range) => e.size.is_some_and(|s| range.contains(s)),
+                Q::Kind(file) => e.is_dir != *file,
+                Q::Empty => true,
+                Q::Not(inner) => !eval(inner, e, case),
+                Q::And(items) => items.iter().all(|i| eval(i, e, case)),
+                Q::Or(items) => items.iter().any(|i| eval(i, e, case)),
+            }
+        }
+
+        /// The page `sort` gives the matches `found`, ordered plainly.
+        fn naive_order(idx: &VolumeIndex, found: &[EntryIdx], sort: SortSpec) -> Vec<EntryIdx> {
+            let fold_name = |e: EntryIdx| crate::fold::fold(idx.entry(e).name());
+            let parent = |e: EntryIdx| {
+                let mut path = Vec::new();
+                idx.path_of(idx.entry(e).parent(), &mut path);
+                crate::fold::fold(&path)
+            };
+            /// A match and what it sorts by: a number, then two byte strings.
+            type Keyed = ((u64, Vec<u8>, Vec<u8>), EntryIdx);
+            let mut keyed: Vec<Keyed> = found
+                .iter()
+                .map(|&e| {
+                    let entry = idx.entry(e);
+                    let key = match sort.key {
+                        SortKey::Name => (0, Vec::new(), fold_name(e)),
+                        SortKey::Path => (0, parent(e), fold_name(e)),
+                        SortKey::Size => {
+                            (size_key(entry.size(), sort.dir), Vec::new(), fold_name(e))
+                        }
+                        SortKey::DateModified => {
+                            (mtime_key(entry.mtime(), sort.dir), Vec::new(), fold_name(e))
+                        }
+                    };
+                    (key, e)
+                })
+                .collect();
+            keyed.sort();
+            if sort.dir == SortDir::Desc {
+                keyed.reverse();
+            }
+            keyed.into_iter().map(|(_, e)| e).collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1024))]
+
+            #[test]
+            fn boolean_queries_agree_with_a_naive_evaluator(
+                nodes in prop::collection::vec(
+                    (any::<Index>(), "[aAbBé.]{1,4}", any::<bool>()),
+                    1..30,
+                ),
+                orphans in prop::collection::vec("[aAbB]{1,3}", 0..3),
+                stats in prop::collection::vec(prop::option::of((0u64..40, 1i64..40)), 30),
+                shape in spec(),
+                mount in 0usize..5,
+                case in prop::bool::weighted(0.15),
+                padded in any::<bool>(),
+                ordered in any::<bool>(),
+                minimal in any::<bool>(),
+                offset in 0u32..6,
+                limit in prop::option::of(0u32..8),
+            ) {
+                let (mut idx, entries) = random_tree(&nodes, &orphans, padded);
+                for (i, stat) in stats.iter().enumerate().take(nodes.len()) {
+                    if let Some((size, mtime)) = stat {
+                        idx.set_stat(frn(1000 + i as u64), *size, *mtime);
+                    }
+                }
+                if ordered {
+                    idx.optimize_storage();
+                }
+                let prefix = [r"C:\", r"C:\", r"C:\Mnt\aB\", r"C:\Mnt\aB\", "C:"][mount];
+                let vocabulary = Vocabulary {
+                    names: entries
+                        .iter()
+                        .map(|&e| String::from_utf8(idx.entry(e).name().to_vec()).unwrap().chars().collect())
+                        .collect(),
+                    paths: entries
+                        .iter()
+                        .filter_map(|&e| slow_full_path(&idx, e, prefix, false))
+                        .map(|p| String::from_utf8(p).unwrap().chars().collect())
+                        .collect(),
+                };
+                prop_assume!(!vocabulary.paths.is_empty());
+                let mut q = materialize(&shape, &vocabulary);
+                one_filter_each(&mut q, &mut [false; 3]);
+                let mut text = print(&q, minimal);
+                if case {
+                    text.push_str(" case:");
+                }
+                let parsed = parse_query(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+                // Brackets where precedence needs none change nothing.
+                let other = print(&q, !minimal) + if case { " case:" } else { "" };
+                prop_assert_eq!(&parse_query(&other).unwrap(), &parsed, "{} vs {}", text, other);
+
+                let mut found: Vec<EntryIdx> = Vec::new();
+                for e in idx.live_entries().filter(|&e| !idx.is_synthetic(e)) {
+                    let Some(full) = slow_full_path(&idx, e, prefix, !case) else {
+                        continue;
+                    };
+                    let entry = idx.entry(e);
+                    let seen = Seen {
+                        name: entry.name().to_vec(),
+                        full: String::from_utf8(full).unwrap(),
+                        is_dir: entry.is_dir(),
+                        size: entry.size(),
+                    };
+                    if eval(&q, &seen, case) {
+                        found.push(e);
+                    }
+                }
+                let total_size = files_size(&idx, found.iter().copied());
+                for key in SORT_KEYS {
+                    for dir in [SortDir::Asc, SortDir::Desc] {
+                        let sort = SortSpec { key, dir };
+                        let all = naive_order(&idx, &found, sort);
+                        for (offset, limit) in [(offset, limit), (0, Some(0)), (0, None), (1, Some(3))] {
+                            let (start, end) = page_bounds(all.len(), offset, limit);
+                            for fast in [true, false] {
+                                let out = unlimited_refs(&idx, prefix, &parsed, None, sort, offset, limit, true, fast);
+                                let ctx = format!("{text:?} under {prefix} {key:?} {dir:?} {offset}+{limit:?} fast {fast}");
+                                prop_assert_eq!(out.total, found.len() as u64, "total of {}", ctx);
+                                prop_assert_eq!(out.total_size, Some(total_size), "size of {}", ctx);
+                                let page: Vec<EntryIdx> = out.refs.iter().map(|r| r.idx).collect();
+                                prop_assert_eq!(&page[..], &all[start..end], "page of {}", ctx);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

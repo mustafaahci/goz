@@ -2168,6 +2168,47 @@ mod tests {
         );
     }
 
+    /// A boolean query runs on each volume and merges as any other does: one
+    /// page in global name order and one total over both. A path term the
+    /// mount prefix decides is folded per volume, so `!c:\` leaves C: out
+    /// and keeps all of D:, and `c:\|z.log` is all of C: and D:'s z.log.
+    #[test]
+    fn boolean_queries_merge_across_volumes() {
+        let vols = set(&[
+            volume(r"C:\", merge_index(), VolumePhase::Live),
+            volume(r"D:\", merge_index(), VolumePhase::Live),
+        ]);
+        let pages = results(&encode_query_binary(&vols, query("z.log|a.log")));
+        assert_eq!(pages[0].total, 4);
+        let names: Vec<&str> = pages[0]
+            .items
+            .iter()
+            .map(|i| i.path.rsplit('\\').next().unwrap())
+            .collect();
+        assert_eq!(names, ["a.log", "a.log", "z.log", "z.log"]);
+        let mut first = query("<z|a> !z.log");
+        first.limit = Some(1);
+        let pages = results(&encode_query_binary(&vols, first));
+        assert_eq!(pages[0].total, 6, "a and z on each, a.log on each");
+        assert_eq!(pages[0].items.len(), 1);
+        let mut on_d = result_paths(&vols, query(r"!c:\"));
+        on_d.sort();
+        assert_eq!(on_d, [r"D:\a", r"D:\a\z.log", r"D:\z", r"D:\z\a.log"]);
+        let mut either = result_paths(&vols, query(r"c:\|z.log"));
+        either.sort();
+        assert_eq!(
+            either,
+            [
+                r"C:\a",
+                r"C:\a\z.log",
+                r"C:\z",
+                r"C:\z\a.log",
+                r"D:\a\z.log"
+            ]
+        );
+        assert!(result_paths(&vols, query("!")).is_empty());
+    }
+
     /// A volume mounted under another volume's folder interleaves with it in a
     /// path sort: `C:\m\z.log` belongs between `C:\z.log` and
     /// `C:\z.log`. Each run is ordered within its volume; only the merge
