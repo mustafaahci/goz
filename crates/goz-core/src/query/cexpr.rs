@@ -132,6 +132,45 @@ fn all_of(mut items: Vec<CNode<'_>>) -> Option<CNode<'_>> {
     }
 }
 
+/// The most needles a union prefilter scans the names for. Each is a pass
+/// over the folded names, and past a few, testing every name costs less
+/// than finding them.
+pub(super) const UNION_MAX: usize = 8;
+
+/// The prefilter of a case-insensitive expression: folded needles such that
+/// the folded name of every entry it matches holds at least one of them, so
+/// that scanning the folded names for them finds every match. `conjuncts`
+/// must all match; the best plan of any one of them serves. `None` when no
+/// plan exists, as for a NOT, or an OR with a branch no needle covers.
+pub(super) fn plan<'n, 'a: 'n>(
+    conjuncts: impl IntoIterator<Item = &'n CNode<'a>>,
+) -> Option<Vec<Vec<u8>>> {
+    best(conjuncts.into_iter().filter_map(CNode::needles))
+}
+
+/// The best of `plans`: the fewest needles, as each is a pass over the
+/// names, and then the longest shortest needle, as a longer needle is
+/// usually rarer.
+fn best(plans: impl Iterator<Item = Vec<Vec<u8>>>) -> Option<Vec<Vec<u8>>> {
+    plans.min_by_key(|p| {
+        let shortest = p.iter().map(Vec::len).min().unwrap_or(0);
+        (p.len(), std::cmp::Reverse(shortest))
+    })
+}
+
+/// The needles of an OR: every branch's, less any that holds another (a
+/// name holding it holds the other too), or `None` past [`UNION_MAX`].
+fn union(mut needles: Vec<Vec<u8>>) -> Option<Vec<Vec<u8>>> {
+    needles.sort_by_key(Vec::len);
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    for needle in needles {
+        if !kept.iter().any(|k| memmem::find(&needle, k).is_some()) {
+            kept.push(needle);
+        }
+    }
+    (kept.len() <= UNION_MAX).then_some(kept)
+}
+
 impl<'a> CNode<'a> {
     /// `self`, whose children are folded already, with its constants folded
     /// away, nested ANDs and ORs flattened, and its children cheapest first.
@@ -218,6 +257,32 @@ impl<'a> CNode<'a> {
             | CNode::PathGlob { .. } => false,
             CNode::Not(inner) => inner.decided_by_name(),
             CNode::And(items) | CNode::Or(items) => items.iter().all(CNode::decided_by_name),
+        }
+    }
+
+    /// The needles of [`plan`] for this node: a name search's own needle, a
+    /// name wildcard's longest literal, `.ext` for each of a few extensions;
+    /// the best of an AND's children; all of an OR's, when each has some.
+    /// What a NOT, a kind, size, date or path term matches holds no needle
+    /// its name must hold.
+    fn needles(&self) -> Option<Vec<Vec<u8>>> {
+        match self {
+            CNode::Name(finder) => Some(vec![finder.needle().to_vec()]),
+            CNode::NameGlob(w) => w.longest_literal().map(|lit| vec![lit]),
+            CNode::Ext(exts) if exts.len() <= UNION_MAX => {
+                Some(exts.iter().map(|e| [&b"."[..], e].concat()).collect())
+            }
+            CNode::And(items) => best(items.iter().filter_map(CNode::needles)),
+            CNode::Or(items) => {
+                let mut all = Vec::new();
+                for item in items {
+                    all.extend(item.needles()?);
+                }
+                union(all)
+            }
+            // Matches nothing, so no name need be scanned for.
+            CNode::False => Some(Vec::new()),
+            _ => None,
         }
     }
 
@@ -460,5 +525,60 @@ mod tests {
         assert!(entry.tests_paths());
         let CNode::And(items) = entry else { panic!() };
         assert_eq!(items.len(), 2);
+    }
+
+    /// The needles of `query`'s expression on C:, sorted.
+    fn needles_of(query: &str) -> Option<Vec<String>> {
+        let parsed = parse_query(query).unwrap();
+        let node = compile(parsed.expr.as_ref().expect("an expression"), br"c:\");
+        plan([&node]).map(|needles| {
+            let mut out: Vec<String> = needles
+                .into_iter()
+                .map(|n| String::from_utf8(n).unwrap())
+                .collect();
+            out.sort();
+            out
+        })
+    }
+
+    /// An OR scans for a needle per branch, an AND for its best branch's;
+    /// a NOT, or a branch with no needle, leaves no plan.
+    #[test]
+    fn a_plan_covers_every_branch_of_an_or() {
+        let s = |v: &[&str]| Some(v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(needles_of("kernel32|report"), s(&["kernel32", "report"]));
+        assert_eq!(needles_of("*.dll|*.TXT"), s(&[".dll", ".txt"]));
+        assert_eq!(
+            needles_of("<kernel32 dll>|<report v3>"),
+            s(&["kernel32", "report"]),
+            "the longer needle of each AND"
+        );
+        assert_eq!(
+            needles_of("abc|abcd|xabcx"),
+            s(&["abc"]),
+            "a needle holding another goes"
+        );
+        assert_eq!(needles_of("ext:jpg;png|gif"), s(&[".jpg", ".png", "gif"]));
+        assert_eq!(needles_of("a|!b"), None);
+        assert_eq!(needles_of("a|file:"), None);
+        assert_eq!(needles_of("a|*"), None, "a wildcard with no literal");
+        assert_eq!(needles_of(r"a|x\y"), None);
+        assert_eq!(needles_of("!a"), None);
+        assert_eq!(
+            needles_of("<a|bb> <ccc|d|e>"),
+            s(&["a", "bb"]),
+            "fewest needles"
+        );
+        assert_eq!(
+            needles_of("<a|bbb> <cc|dd>"),
+            s(&["cc", "dd"]),
+            "longest shortest"
+        );
+        let nine: Vec<String> = (0..=UNION_MAX).map(|i| format!("n{i}x")).collect();
+        assert_eq!(needles_of(&nine.join("|")), None, "past the cap");
+        assert_eq!(
+            needles_of(&nine[..UNION_MAX].join("|")).map(|n| n.len()),
+            Some(UNION_MAX)
+        );
     }
 }

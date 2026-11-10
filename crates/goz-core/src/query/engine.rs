@@ -81,10 +81,16 @@ pub struct CompiledQuery<'a> {
     path_finders: Vec<memmem::Finder<'a>>,
     /// The longest literal substring guaranteed present in any match, drawn
     /// from the name terms, from wildcard literals (e.g. `.dll` of `*.dll`), and
-    /// from a single `ext:` value (`.ext`). Drives the folded-arena prefilter
-    /// scan. `None` when nothing offers a usable literal (then the query
-    /// iterates every entry).
+    /// from a single `ext:` value (`.ext`), or else the one needle of the
+    /// expression's plan. Drives the folded-arena prefilter scan. `None` when
+    /// nothing offers a usable literal (then the query iterates every entry,
+    /// unless `union` drives it).
     prefilter: Option<Vec<u8>>,
+    /// The needles of a union prefilter, two or more, when the buckets give
+    /// no prefilter and the expression gives several (`kernel32|report`):
+    /// every match's folded name holds one of them (see [`cexpr::plan`]).
+    /// One needle from the expression is `prefilter` itself.
+    union: Vec<Vec<u8>>,
     /// `true` when a prefilter hit IS a name match: the prefilter is the
     /// query's only name term and there is no wildcard or extension filter.
     /// The scan then skips re-testing the name it has just found, which on a
@@ -189,6 +195,23 @@ impl<'a> CompiledQuery<'a> {
             .then(|| path_piece(parsed, &prefix))
             .flatten();
 
+        // The buckets' prefilter keeps priority, so a query of plain terms
+        // scans as it always has. Without one, the expression may still
+        // name what every match's name holds: one needle is a prefilter
+        // like any other, several a union of passes over the names.
+        let mut prefilter = prefilter.map(Cow::into_owned);
+        let mut union = Vec::new();
+        if prefilter.is_none()
+            && !parsed.match_case
+            && let Some(mut needles) = cexpr::plan(expr_name.iter().chain(&expr_entry))
+        {
+            if needles.len() == 1 {
+                prefilter = needles.pop();
+            } else {
+                union = needles;
+            }
+        }
+
         Self {
             budget,
             name_finders: parsed
@@ -202,7 +225,8 @@ impl<'a> CompiledQuery<'a> {
                 .filter(|t| memmem::find(&prefix, t).is_none())
                 .map(|t| memmem::Finder::new(t.as_slice()))
                 .collect(),
-            prefilter: prefilter.map(Cow::into_owned),
+            prefilter,
+            union,
             prefilter_decides_name: from_name_term
                 && parsed.name_terms.len() == 1
                 && parsed.wildcards.is_empty()
@@ -216,6 +240,12 @@ impl<'a> CompiledQuery<'a> {
             expr_name,
             expr_entry,
         }
+    }
+
+    /// Whether the scan can find its candidates in the folded names: a
+    /// case-insensitive query with a prefilter or a union of needles.
+    fn scans_names(&self, parsed: &ParsedQuery) -> bool {
+        !parsed.match_case && (self.prefilter.is_some() || !self.union.is_empty())
     }
 
     /// Whether a candidate's full path has anything left to decide.
@@ -599,6 +629,43 @@ fn for_each_prefilter_hit_in(
     }
 }
 
+/// [`for_each_prefilter_hit_in`] for each of several needles, calling `f`
+/// once per name, however many of them it holds: a union prefilter.
+fn for_each_union_hit_in(
+    index: &VolumeIndex,
+    needles: &[Vec<u8>],
+    ids: Range<usize>,
+    mut f: impl FnMut(NameId),
+) {
+    let base = ids.start;
+    let mut seen = vec![0u64; ids.len().div_ceil(64)];
+    for needle in needles {
+        for_each_prefilter_hit_in(index, needle, ids.clone(), |id| {
+            let at = id as usize - base;
+            let bit = 1u64 << (at % 64);
+            if seen[at / 64] & bit == 0 {
+                seen[at / 64] |= bit;
+                f(id);
+            }
+        });
+    }
+}
+
+/// Calls `f` once per name with an id in `ids` that the prefilter of
+/// `compiled` finds: its needle's, or its union's. The caller checks
+/// [`CompiledQuery::scans_names`].
+fn for_each_hit_in(
+    index: &VolumeIndex,
+    compiled: &CompiledQuery,
+    ids: Range<usize>,
+    f: impl FnMut(NameId),
+) {
+    match compiled.prefilter.as_deref() {
+        Some(needle) => for_each_prefilter_hit_in(index, needle, ids, f),
+        None => for_each_union_hit_in(index, &compiled.union, ids, f),
+    }
+}
+
 /// A pass over the names splits them into chunks of at least this many,
 /// which run across cores, and one this small runs as a single chunk. Tests
 /// use one 64-id word, so that small indexes split too.
@@ -718,6 +785,11 @@ fn match_names(
     let names = index.name_count();
     let per = chunk_words(names);
     let needle = compiled.prefilter.as_deref().filter(|_| !parsed.match_case);
+    let union: &[Vec<u8>] = if parsed.match_case {
+        &[]
+    } else {
+        &compiled.union
+    };
     // Case-sensitive, or no literal to drive the arena scan: every live name
     // is tested. Dead names are zero-filled and have no entries.
     let verify = needle.is_none() || !compiled.prefilter_decides_name;
@@ -750,6 +822,9 @@ fn match_names(
                 };
                 match needle {
                     Some(needle) => for_each_prefilter_hit_in(index, needle, ids, &mut mark),
+                    None if !union.is_empty() => {
+                        for_each_union_hit_in(index, union, ids, &mut mark);
+                    }
                     None => ids
                         .map(|id| id as NameId)
                         .filter(|&id| index.name_refcount(id) > 0)
@@ -888,8 +963,8 @@ const TOP_K_MAX: usize = 10_000;
 
 /// Whether the page `[offset, offset + limit)` of `parsed` can be gathered
 /// by [`top_k_refs`], the key `sort` asks for being one entry key: a name,
-/// size or date sort of an unscoped query that a prefilter drives, with no
-/// path to test and no entry without one.
+/// size or date sort of an unscoped query that a prefilter or a union of
+/// needles drives, with no path to test and no entry without one.
 #[allow(clippy::too_many_arguments)]
 fn top_k_applies(
     index: &VolumeIndex,
@@ -903,8 +978,7 @@ fn top_k_applies(
     sort.key != SortKey::Path
         && limit.is_some_and(|l| (offset as usize).saturating_add(l as usize) <= TOP_K_MAX)
         && scope.is_none()
-        && !parsed.match_case
-        && compiled.prefilter.is_some()
+        && compiled.scans_names(parsed)
         && compiled.volume_admits
         && !compiled.tests_paths(parsed)
         && !index.may_have_unpresentable()
@@ -944,7 +1018,6 @@ fn top_k_refs(
     sum_sizes: bool,
 ) -> Result<RefOutcome, Stopped> {
     use rayon::prelude::*;
-    let needle = compiled.prefilter.as_deref().unwrap_or_default();
     let want = offset as usize + limit as usize;
     let names = index.name_count();
     let per = chunk_words(names);
@@ -971,7 +1044,7 @@ fn top_k_refs(
         let mut no_folders = None;
         let mut watch = Watch::new(compiled.budget);
         let (mut count, mut size) = (0u64, 0u64);
-        for_each_prefilter_hit_in(index, needle, chunk_ids(i, per, names), |id| {
+        for_each_hit_in(index, compiled, chunk_ids(i, per, names), |id| {
             // As in `match_names`: only testing a name costs more with more
             // terms. An entry below costs the same whatever the query, as no
             // query here tests a path.
@@ -1077,16 +1150,16 @@ fn scan_cost(
     compiled: &CompiledQuery,
     hits: &mut Option<Vec<NameId>>,
 ) -> usize {
-    let Some(needle) = compiled.prefilter.as_deref().filter(|_| !parsed.match_case) else {
+    if !compiled.scans_names(parsed) {
         return if compiled.path_piece.is_some() {
             0
         } else {
             index.len()
         };
-    };
+    }
     let mut ids = Vec::new();
     let mut entries = 0usize;
-    for_each_prefilter_hit(index, needle, |id| {
+    for_each_hit_in(index, compiled, 0..index.name_count(), |id| {
         entries += index.name_refcount(id) as usize;
         ids.push(id);
     });
@@ -1182,12 +1255,11 @@ fn scan_with(
     }
 
     // Fast path: case-insensitive query with a usable literal → scan the
-    // folded arena for the prefilter literal and verify the rest per hit.
+    // folded arena for the prefilter literal, or each needle of a union, and
+    // verify the rest per hit.
     if subtree_done {
         // Scoped walk answered the query; the scan paths are skipped.
-    } else if !parsed.match_case
-        && let Some(needle) = compiled.prefilter.as_deref()
-    {
+    } else if compiled.scans_names(parsed) {
         // The scan cost is proportional to the unique-name bytes (~1/3 of
         // the total on a real volume); a hit fans out to every entry bearing
         // the name through its same-name chain. The chains are exact, so no
@@ -1219,7 +1291,7 @@ fn scan_with(
         };
         match prefilter_hits {
             Some(ids) => ids.into_iter().for_each(on_hit),
-            None => for_each_prefilter_hit(index, needle, on_hit),
+            None => for_each_hit_in(index, compiled, 0..index.name_count(), on_hit),
         }
     } else if let Some(piece) = compiled.path_piece.as_deref()
         && walk_below_names(
@@ -2971,6 +3043,63 @@ mod tests {
         assert_eq!(hits(r"D:\", r"!c:\").len(), 5);
         let parsed = parse_query(r"!c:\").unwrap();
         assert!(!CompiledQuery::new(&parsed, r"C:\", &UNLIMITED).volume_admits);
+    }
+
+    /// An OR whose every branch holds a needle scans the folded names for
+    /// them, a NOT scans every name, and each finds what testing every name
+    /// finds, on every path: the scan, the name-level pass and the best rows.
+    #[test]
+    fn a_union_prefilter_finds_what_every_name_does() {
+        let mut idx = sample_index();
+        for (i, name) in ["report2.txt", "notes.md", "kernel32.dll", "x.jpg"]
+            .iter()
+            .enumerate()
+        {
+            idx.insert_enum(&enum_rec(frn(500 + i as u64), frn(100), name, false));
+        }
+        idx.optimize_storage();
+        for (query, needles) in [
+            ("report|notes", 2),
+            ("*.pdf|*.jpg", 2),
+            ("<report txt>|<kernel dll>", 2),
+            ("report|report2", 1),
+            ("ext:pdf;jpg|x", 3),
+            ("!report", 0),
+            ("report|file:", 0),
+            ("report|notes size:>1", 2),
+            (r"report|notes docs\", 2),
+        ] {
+            let parsed = parse_query(query).unwrap();
+            let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            let planned = compiled
+                .union
+                .len()
+                .max(usize::from(compiled.prefilter.is_some()));
+            assert_eq!(planned, needles, "{query}");
+            let mut unplanned = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            unplanned.prefilter = None;
+            unplanned.union.clear();
+            let found = |compiled: &CompiledQuery| {
+                let mut found: Vec<EntryIdx> = scan(&idx, &parsed, compiled, None)
+                    .iter()
+                    .map(|c| c.idx)
+                    .collect();
+                found.sort_unstable();
+                found
+            };
+            assert_eq!(found(&compiled), found(&unplanned), "{query}");
+            assert!(!found(&compiled).is_empty() || needles == 0, "{query}");
+            for key in SORT_KEYS {
+                let sort = SortSpec::default_for(key);
+                for limit in [None, Some(1), Some(3)] {
+                    let fast =
+                        unlimited_refs(&idx, r"C:\", &parsed, None, sort, 0, limit, true, true);
+                    let slow =
+                        unlimited_refs(&idx, r"C:\", &parsed, None, sort, 0, limit, true, false);
+                    assert_eq!(fast, slow, "{query} {key:?} {limit:?}");
+                }
+            }
+        }
     }
 
     /// A NOT never admits an entry without a path: an orphan, or one below
