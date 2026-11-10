@@ -731,15 +731,23 @@ pub(super) struct ExtMatcher {
     globs: Vec<Wildcard>,
     /// An empty value: a name with no dot.
     none: bool,
+    /// Whether every value is plain and of one part, as every value of
+    /// v0.6.0's `ext:` was: then the extension after the last dot decides.
+    last_part_only: bool,
 }
 
 enum Plain {
     None,
-    /// One value: a compare.
-    One(Vec<u8>),
-    /// A list, such as a macro's: one lookup however long.
+    /// Up to [`FEW_MAX`] values, compared in turn: for a short list, which
+    /// most are, cheaper than hashing each name's extension, and what
+    /// v0.6.0 did.
+    Few(Vec<Vec<u8>>),
+    /// A longer list, such as a macro's: one lookup however long.
     Set(FxHashSet<Vec<u8>>),
 }
+
+/// The most plain values an [`ExtMatcher`] compares in turn.
+const FEW_MAX: usize = 8;
 
 impl ExtMatcher {
     pub(super) fn new(values: &[Vec<u8>], case: bool) -> Self {
@@ -759,14 +767,17 @@ impl ExtMatcher {
         }
         parts.sort_unstable();
         parts.dedup();
+        plain.sort_unstable();
+        plain.dedup();
         let plain = match plain.len() {
             0 => Plain::None,
-            1 => Plain::One(plain.pop().unwrap_or_default()),
+            n if n <= FEW_MAX => Plain::Few(plain),
             _ => Plain::Set(plain.into_iter().collect()),
         };
         ExtMatcher {
             case,
             plain,
+            last_part_only: globs.is_empty() && parts.iter().all(|&k| k == 1),
             parts,
             globs,
             none,
@@ -775,7 +786,11 @@ impl ExtMatcher {
 
     /// Whether the name `raw` (as stored) has one of the extensions; the
     /// caller checks that its entry is a file. `fold_buf` and `cps` are
-    /// scratch.
+    /// scratch. Values of one part, every v0.6.0 `ext:`, are tested here as
+    /// v0.6.0 tested them, inline in the test of a name as v0.6.0's was (a
+    /// call more per name of an `ext:` query cost it 20%); the rest out of
+    /// line.
+    #[inline(always)]
     pub(super) fn matches(
         &self,
         raw: &[u8],
@@ -783,26 +798,58 @@ impl ExtMatcher {
         cps: &mut CodePointBuf,
         budget: &Budget,
     ) -> bool {
-        if memchr::memchr(b'.', raw).is_none() {
+        // An extension is short: a loop from the end finds its dot sooner
+        // than a call to `memrchr` does.
+        let Some(last) = raw.iter().rposition(|&b| b == b'.') else {
             return self.none || self.extension_globbed(b"", cps, budget);
+        };
+        if self.last_part_only {
+            let ext = self.folded(&raw[last + 1..], fold_buf);
+            return self.plain_has(ext);
         }
+        self.matches_parts(raw, last, fold_buf, cps, budget)
+    }
+
+    /// Whether `tail`, folded as the values are, is one of the plain
+    /// values.
+    #[inline(always)]
+    fn plain_has(&self, tail: &[u8]) -> bool {
+        match &self.plain {
+            Plain::None => false,
+            Plain::Few(values) => values.iter().any(|v| v.as_slice() == tail),
+            Plain::Set(set) => set.contains(tail),
+        }
+    }
+
+    /// [`matches`](Self::matches) for values of several parts or with
+    /// wildcards, `last` being the name's last dot.
+    #[inline(never)]
+    fn matches_parts(
+        &self,
+        raw: &[u8],
+        last: usize,
+        fold_buf: &mut Vec<u8>,
+        cps: &mut CodePointBuf,
+        budget: &Budget,
+    ) -> bool {
         for &k in &self.parts {
-            let Some(tail) = self.tail(raw, k, fold_buf) else {
-                break;
+            // The dot before the last `k` parts: the last one, or the
+            // `k - 1`th before it.
+            let dot = match k {
+                1 => last,
+                _ => match memchr::memrchr_iter(b'.', &raw[..last]).nth(k - 2) {
+                    Some(dot) => dot,
+                    None => break,
+                },
             };
-            let hit = match &self.plain {
-                Plain::None => false,
-                Plain::One(v) => v.as_slice() == tail,
-                Plain::Set(set) => set.contains(tail),
-            };
-            if hit {
+            if self.plain_has(self.folded(&raw[dot + 1..], fold_buf)) {
                 return true;
             }
         }
-        !self.globs.is_empty()
-            && self
-                .tail(raw, 1, fold_buf)
-                .is_some_and(|ext| self.extension_globbed(ext, cps, budget))
+        !self.globs.is_empty() && {
+            let ext = self.folded(&raw[last + 1..], fold_buf);
+            self.extension_globbed(ext, cps, budget)
+        }
     }
 
     /// Whether extension `ext` (folded as the values are) matches a
@@ -817,18 +864,17 @@ impl ExtMatcher {
             .any(|glob| glob.matches_decoded(cps, budget))
     }
 
-    /// The last `k` dot-separated parts of `raw`, folded into `fold_buf`
-    /// unless the values match case, or `None` when it has fewer dots.
-    fn tail<'b>(&self, raw: &'b [u8], k: usize, fold_buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
-        let dot = memchr::memrchr_iter(b'.', raw).nth(k - 1)?;
-        let tail = &raw[dot + 1..];
-        Some(if self.case {
+    /// `tail`, a part of a name, folded into `fold_buf` unless the values
+    /// match case.
+    #[inline(always)]
+    fn folded<'b>(&self, tail: &'b [u8], fold_buf: &'b mut Vec<u8>) -> &'b [u8] {
+        if self.case {
             tail
         } else {
             fold_buf.clear();
             crate::fold::fold_into(tail, fold_buf);
             fold_buf.as_slice()
-        })
+        }
     }
 
     /// `.ext` for each of a few plain values, one of which the folded name
@@ -840,14 +886,10 @@ impl ExtMatcher {
         }
         let dotted = |v: &Vec<u8>| [&b"."[..], v].concat();
         match &self.plain {
-            Plain::None => None,
-            Plain::One(v) => Some(vec![dotted(v)]),
-            Plain::Set(set) if set.len() <= UNION_MAX => {
-                let mut out: Vec<Vec<u8>> = set.iter().map(dotted).collect();
-                out.sort();
-                Some(out)
+            Plain::Few(values) if values.len() <= UNION_MAX => {
+                Some(values.iter().map(dotted).collect())
             }
-            Plain::Set(_) => None,
+            _ => None,
         }
     }
 }
@@ -1335,5 +1377,20 @@ mod tests {
             !ext(&["a.txt"], false, "a.txt"),
             "a dotted value follows a dot"
         );
+        // A few values are compared in turn, more looked up in a set: the
+        // two answer alike, a dotted value among them too.
+        let few = ["tar.gz", "txt", "x.y.z"];
+        let more: Vec<&str> = few.iter().copied().chain(FILLER).collect();
+        assert!(more.len() > FEW_MAX);
+        for values in [&few[..], &more] {
+            assert!(ext(values, false, "c.TAR.gz") && ext(values, false, "a.x.y.Z"));
+            assert!(ext(values, false, "b.txt") && ext(values, false, ".x.y.z"));
+            assert!(!ext(values, false, "c.gz") && !ext(values, false, "y.z"));
+            assert!(!ext(values, false, "noext") && !ext(values, false, "a.txt.gz"));
+        }
+        assert!(ext(&["txt", "txt"], false, "a.txt"), "a value repeated");
     }
+
+    /// Extensions no test name has, to make a list long.
+    const FILLER: [&str; 8] = ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"];
 }

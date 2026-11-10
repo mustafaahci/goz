@@ -1307,6 +1307,13 @@ impl VolumeIndex {
         self.names.may_bear_folder(id)
     }
 
+    /// [`Self::name_may_bear_folder`] for ids `64 * w..64 * w + 64` at once,
+    /// bit `i` for id `64 * w + i`.
+    #[inline]
+    pub(crate) fn name_folder_word(&self, w: usize) -> u64 {
+        self.names.folder_word(w)
+    }
+
     /// Live entries bearing `id`: the chain's length without walking it.
     #[inline]
     pub(crate) fn name_refcount(&self, id: NameId) -> u32 {
@@ -1341,6 +1348,8 @@ impl VolumeIndex {
     /// Whether entries bearing `id` may be synthetic (the root's empty name,
     /// lost+found's, a placeholder's), so a count must walk the chain instead
     /// of trusting the refcount. A real file can carry the latter two names.
+    /// Inline in each pass over the names, which asks it of every name.
+    #[inline(always)]
     pub(crate) fn name_may_bear_synthetic(&self, id: NameId) -> bool {
         let raw = self.names.raw_bytes(id);
         raw.is_empty() || raw == LOST_FOUND_NAME || raw == PLACEHOLDER_NAME

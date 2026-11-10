@@ -581,7 +581,14 @@ fn page_refs(
             _ => names_files_size(index, &matched),
         });
         let (start, end) = page_bounds(total as usize, offset, limit);
-        let refs = name_level_refs(index, &matched, compiled.kind, sort.dir, start, end);
+        let refs = match compiled.kind {
+            None => name_level_refs(index, &matched, sort.dir, start, end, |e| {
+                !index.is_synthetic(e)
+            }),
+            Some(kind) => name_level_refs(index, &matched, sort.dir, start, end, |e| {
+                !index.is_synthetic(e) && kind_matches(Some(kind), index.entry(e).is_dir())
+            }),
+        };
         return Ok(RefOutcome {
             total,
             refs,
@@ -634,7 +641,7 @@ fn files_size(index: &VolumeIndex, entries: impl Iterator<Item = EntryIdx>) -> u
 /// case sensitivity are properties of the name and pass, and so does an
 /// expression whose terms all are. A kind filter passes too: a name no
 /// folder bears counts its files by refcount, and only the chain of one a
-/// folder may bear is walked (see [`entries_of_kind`]), so `ext:pdf`, which
+/// folder may bear is walked (see [`retain_kind`]), so `ext:pdf`, which
 /// keeps files, runs over the names as it did when it kept folders too.
 fn is_name_level(
     index: &VolumeIndex,
@@ -986,7 +993,10 @@ fn entries_of_kind(index: &VolumeIndex, id: NameId, kind: Kind) -> u64 {
 
 /// How many live entries, synthetic ones aside, bear name `id`: its refcount,
 /// which is its chain length, so no entry is touched, except for the three
-/// names synthetic entries can bear, whose chains are walked.
+/// names synthetic entries can bear, whose chains are walked. Inline in
+/// each pass over the names, as in v0.6.0: a call per name more cost a
+/// pass that tests every name a few percent.
+#[inline(always)]
 fn entries_bearing(index: &VolumeIndex, id: NameId) -> u64 {
     if index.name_may_bear_synthetic(id) {
         index
@@ -1014,12 +1024,9 @@ fn match_names(
     // Stamped out for the query's shape, so that a query with one needle or
     // none and no name tests beyond the buckets' runs the loop it always has:
     // it tests every distinct name, and an instruction more per name showed.
-    // A kind filter counts each name's entries of that kind, beyond the
-    // buckets' tests too.
-    match (
-        compiled.needles(parsed).len() > 1,
-        compiled.name_extra || compiled.kind.is_some(),
-    ) {
+    // A kind filter is applied after each chunk's loop (see
+    // [`retain_kind`]), which stays the same.
+    match (compiled.needles(parsed).len() > 1, compiled.name_extra) {
         (false, false) => match_names_as::<false, false>(index, parsed, compiled),
         (false, true) => match_names_as::<false, true>(index, parsed, compiled),
         (true, false) => match_names_as::<true, false>(index, parsed, compiled),
@@ -1028,9 +1035,9 @@ fn match_names(
 }
 
 /// [`match_names`] for a scan of several needles (`UNION`), whose repeats
-/// it skips, and for a query with name tests beyond the buckets' or a kind
-/// filter (`EXTRA`). A name with no entry of the kind is left out of the set,
-/// so the page walk never visits its chain.
+/// it skips, and for a query with name tests beyond the buckets' (`EXTRA`).
+/// With a kind filter, a name with no entry of the kind is left out of the
+/// set, so the page walk never visits its chain.
 fn match_names_as<const UNION: bool, const EXTRA: bool>(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
@@ -1072,17 +1079,10 @@ fn match_names_as<const UNION: bool, const EXTRA: bool>(
                     {
                         return;
                     }
-                    let bearing = match compiled.kind {
-                        Some(kind) if EXTRA => entries_of_kind(index, id, kind),
-                        _ => entries_bearing(index, id),
-                    };
-                    if EXTRA && bearing == 0 && compiled.kind.is_some() {
-                        return;
-                    }
                     let at = id as usize - base;
                     words[at / 64] |= 1 << (at % 64);
                     len += 1;
-                    total += bearing;
+                    total += entries_bearing(index, id);
                 };
                 if needles.is_empty() {
                     ids.map(|id| id as NameId)
@@ -1093,11 +1093,49 @@ fn match_names_as<const UNION: bool, const EXTRA: bool>(
                         for_each_prefilter_hit_in(index, needle, ids.clone(), &mut mark);
                     }
                 }
+                if let Some(kind) = compiled.kind {
+                    let (dropped, others) = retain_kind(index, kind, base, words);
+                    len -= dropped;
+                    total -= others;
+                }
                 (len, total)
             })
             .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     });
     (NameSet { words, len }, total)
+}
+
+/// Narrows the names one chunk of [`match_names_as`] matched (`words`, bit
+/// `i` for id `base + i`) to those bearing an entry of `kind`, and returns
+/// how many names it dropped and how many of the entries counted for the
+/// names are of another kind. A file filter visits only the names a folder
+/// may bear, a few, 64 names a word; a folder filter every matched name.
+/// After the loop over the names, so that the test of each, as hot as any
+/// loop in the engine, is v0.6.0's: a test of the kind in it cost an `ext:`
+/// list, which keeps files, 4% (and more at first, with the calls it
+/// brought).
+#[inline(never)]
+fn retain_kind(index: &VolumeIndex, kind: Kind, base: usize, words: &mut [u64]) -> (usize, u64) {
+    debug_assert_eq!(base % 64, 0);
+    let (mut dropped, mut others) = (0usize, 0u64);
+    for (w, word) in words.iter_mut().enumerate() {
+        let mut visit = match kind {
+            Kind::File => *word & index.name_folder_word(base / 64 + w),
+            Kind::Folder => *word,
+        };
+        while visit != 0 {
+            let bit = visit.trailing_zeros();
+            visit &= visit - 1;
+            let id = (base + w * 64 + bit as usize) as NameId;
+            let of_kind = entries_of_kind(index, id, kind);
+            others += entries_bearing(index, id).saturating_sub(of_kind);
+            if of_kind == 0 {
+                *word &= !(1 << bit);
+                dropped += 1;
+            }
+        }
+    }
+    (dropped, others)
 }
 
 /// The names a scan with [`CompiledQuery::names_first`] visits: every live
@@ -1228,17 +1266,19 @@ fn names_in_order<'a>(
 
 /// Rows `[start, end)` of a name-level query: walks the matched names in
 /// name order (reversed for a descending sort) and each name's same-name
-/// chain, its entries of `kind` when the query keeps one, and stops at `end`.
-/// Names with equal folded bytes form one group whose entries interleave by
-/// idx (descending when the sort is), exactly the `(folded name, idx)` order
-/// the candidate comparator produces.
+/// chain, its entries that are `listed` (not synthetic, and of the query's
+/// kind when it keeps one), and stops at `end`. Names with equal folded
+/// bytes form one group whose entries interleave by idx (descending when the
+/// sort is), exactly the `(folded name, idx)` order the candidate comparator
+/// produces. Stamped out per `listed`, so that a query with no kind lists
+/// a chain as v0.6.0 did.
 fn name_level_refs(
     index: &VolumeIndex,
     matched: &NameSet,
-    kind: Option<Kind>,
     dir: SortDir,
     start: usize,
     end: usize,
+    listed: impl Fn(EntryIdx) -> bool,
 ) -> Vec<HitRef> {
     if start >= end {
         return Vec::new();
@@ -1247,10 +1287,6 @@ fn name_level_refs(
     let mut refs = Vec::with_capacity((end - start).min(1 << 16));
     let mut group: Vec<EntryIdx> = Vec::new();
     let mut seen = 0usize;
-    let listed = |e: EntryIdx| {
-        !index.is_synthetic(e)
-            && kind.is_none_or(|k| kind_matches(Some(k), index.entry(e).is_dir()))
-    };
     while seen < end
         && let Some(first) = names.next()
     {
@@ -1606,30 +1642,19 @@ fn scan_with(
     } else if let Some(Source::Children(dirs)) = &compiled.source {
         // A top-level `parent:` term: only those folders' children can
         // match, a few entries however big the volume.
-        'dirs: for &dir in dirs {
-            for idx in index.children(dir) {
-                if watch.tick() {
-                    break 'dirs;
-                }
-                if index.is_synthetic(idx) {
-                    continue;
-                }
-                if let Some(c) = evaluate(
-                    index,
-                    parsed,
-                    compiled,
-                    idx,
-                    scope,
-                    &mut scope_memo,
-                    &mut dir_paths,
-                    &mut folders,
-                    false,
-                    &mut scratch,
-                ) {
-                    candidates.push(c);
-                }
-            }
-        }
+        scan_children(
+            index,
+            parsed,
+            compiled,
+            dirs,
+            scope,
+            &mut watch,
+            &mut scope_memo,
+            &mut dir_paths,
+            &mut folders,
+            &mut scratch,
+            &mut candidates,
+        );
     } else if !compiled.needles(parsed).is_empty() {
         // The scan cost is proportional to the unique-name bytes (~1/3 of
         // the total on a real volume); a hit fans out to every entry bearing
@@ -1705,51 +1730,20 @@ fn scan_with(
         // Every match is at or below a name holding the piece, and the walk
         // visited each of those entries once.
     } else if compiled.names_first {
-        // An expression with terms on the entry: the names that pass the
-        // name's tests and the projection come first, from a pass across
-        // cores, and only their entries are evaluated, their names settled.
-        // When they bear more than a share of the volume, every entry is read
-        // in order instead, those of a name the pass turned away skipped.
+        // An expression with terms on the entry: the names come first.
         candidates.clear();
-        let (matched, bearing) = match_scan_names(index, parsed, compiled);
-        let mut visit = |idx: EntryIdx, candidates: &mut Vec<Candidate>| {
-            if index.is_synthetic(idx) {
-                return;
-            }
-            if let Some(c) = evaluate(
-                index,
-                parsed,
-                compiled,
-                idx,
-                scope,
-                &mut scope_memo,
-                &mut dir_paths,
-                &mut folders,
-                true,
-                &mut scratch,
-            ) {
-                candidates.push(c);
-            }
-        };
-        if bearing as usize <= index.len() / PATH_WALK_SHARE {
-            'names: for id in matched.ids() {
-                for idx in index.name_chain(id) {
-                    if watch.tick() {
-                        break 'names;
-                    }
-                    visit(idx, &mut candidates);
-                }
-            }
-        } else {
-            for idx in index.live_entries() {
-                if watch.tick() {
-                    break;
-                }
-                if matched.contains(index.name_id(idx)) {
-                    visit(idx, &mut candidates);
-                }
-            }
-        }
+        scan_names_first(
+            index,
+            parsed,
+            compiled,
+            scope,
+            &mut watch,
+            &mut scope_memo,
+            &mut dir_paths,
+            &mut folders,
+            &mut scratch,
+            &mut candidates,
+        );
     } else {
         // Slow path: case-sensitive, or no positive substring term (only
         // wildcards / filters / path terms), or a path walk that grew past
@@ -1780,6 +1774,95 @@ fn scan_with(
     }
 
     candidates
+}
+
+/// The candidates of a query with a top-level `parent:` term (see
+/// [`scan_with`]): the children of its folders. Out of line, as is
+/// [`scan_names_first`], so that the scans every query had before S2 keep
+/// their code: each call site of [`evaluate`] in one function weighs on
+/// whether the compiler inlines it into the others.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn scan_children(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    dirs: &[EntryIdx],
+    scope: Option<EntryIdx>,
+    watch: &mut Watch,
+    scope_memo: &mut FxHashMap<EntryIdx, bool>,
+    dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
+    folders: &mut Option<FolderPaths>,
+    scratch: &mut Scratch,
+    candidates: &mut Vec<Candidate>,
+) {
+    for &dir in dirs {
+        for idx in index.children(dir) {
+            if watch.tick() {
+                return;
+            }
+            if index.is_synthetic(idx) {
+                continue;
+            }
+            if let Some(c) = evaluate(
+                index, parsed, compiled, idx, scope, scope_memo, dir_paths, folders, false, scratch,
+            ) {
+                candidates.push(c);
+            }
+        }
+    }
+}
+
+/// The candidates of a query whose expression has terms on the entry (see
+/// [`CompiledQuery::names_first`]): the names that pass the name's tests and
+/// the projection come first, from a pass across cores, and only their
+/// entries are evaluated, their names settled. When they bear more than a
+/// share of the volume, every entry is read in order instead, those of a
+/// name the pass turned away skipped. Out of line, as [`scan_children`].
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn scan_names_first(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    scope: Option<EntryIdx>,
+    watch: &mut Watch,
+    scope_memo: &mut FxHashMap<EntryIdx, bool>,
+    dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
+    folders: &mut Option<FolderPaths>,
+    scratch: &mut Scratch,
+    candidates: &mut Vec<Candidate>,
+) {
+    let (matched, bearing) = match_scan_names(index, parsed, compiled);
+    let mut visit = |idx: EntryIdx, candidates: &mut Vec<Candidate>| {
+        if index.is_synthetic(idx) {
+            return;
+        }
+        if let Some(c) = evaluate(
+            index, parsed, compiled, idx, scope, scope_memo, dir_paths, folders, true, scratch,
+        ) {
+            candidates.push(c);
+        }
+    };
+    if bearing as usize <= index.len() / PATH_WALK_SHARE {
+        for id in matched.ids() {
+            for idx in index.name_chain(id) {
+                if watch.tick() {
+                    return;
+                }
+                visit(idx, candidates);
+            }
+        }
+    } else {
+        for idx in index.live_entries() {
+            if watch.tick() {
+                return;
+            }
+            if matched.contains(index.name_id(idx)) {
+                visit(idx, candidates);
+            }
+        }
+    }
 }
 
 /// `[start, end)` of the requested page within `n` matches.
@@ -3493,6 +3576,13 @@ mod tests {
             ("report|file:", 0),
             ("report|notes size:>1", 2),
             (r"report|notes docs\", 2),
+            // An `ext:` filter of several values scans as v0.6.0 did.
+            ("ext:pdf;jpg", 0),
+            ("ext:md;dll;pdf size:>1", 0),
+            ("ext:pdf;PDF;jpg", 0),
+            ("report ext:txt;md", 1),
+            ("ext:pdf;j*", 0),
+            ("ext:a;b;c;d;e;f;g;h;md", 0),
         ] {
             let parsed = parse_query(query).unwrap();
             let compiled = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);

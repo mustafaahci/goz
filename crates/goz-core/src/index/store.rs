@@ -335,6 +335,13 @@ impl NameStore {
         self.folder_bearer[id as usize / 64] & (1 << (id % 64)) != 0
     }
 
+    /// The folder-bearer bits of ids `64 * w..64 * w + 64`, bit `i` for id
+    /// `64 * w + i` (see [`Self::may_bear_folder`]).
+    #[inline]
+    pub(crate) fn folder_word(&self, w: usize) -> u64 {
+        self.folder_bearer.get(w).copied().unwrap_or(0)
+    }
+
     #[inline]
     pub(crate) fn chain_head(&self, id: NameId) -> EntryIdx {
         self.head[id as usize]
