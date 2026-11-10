@@ -10,6 +10,7 @@
 //! `FolderPaths`), plus its own name.
 
 use super::budget::{Budget, Stopped, Watch};
+use super::cexpr::{self, CNode, Scratch, Subject};
 use super::folder_rank::FolderRanks;
 use super::glob::{CodePointBuf, decode_into};
 use super::parse::{Filters, Kind, ParsedQuery, SizeRange, Wildcard};
@@ -105,6 +106,14 @@ pub struct CompiledQuery<'a> {
     /// [`walk_below_names`]. `None` for a case-sensitive query, whose pieces
     /// the folded arena cannot find.
     path_piece: Option<Vec<u8>>,
+    /// The terms of the query's expression that the name alone decides,
+    /// compiled for this volume: tested with the name, so on the pass over
+    /// the distinct names too (see [`cexpr`]).
+    expr_name: Option<CNode<'a>>,
+    /// The rest of the expression, tested last, on each entry.
+    expr_entry: Option<CNode<'a>>,
+    /// Whether `expr_entry` reads full paths.
+    expr_paths: bool,
 }
 
 impl<'a> CompiledQuery<'a> {
@@ -158,7 +167,17 @@ impl<'a> CompiledQuery<'a> {
             .iter()
             .map(|w| (anchored_lead(w), w.trailing_literal()))
             .collect();
-        let volume_admits = parsed.path_terms.iter().all(|t| term_admits(t, &prefix))
+        // The expression, with the path terms this volume's prefix decides
+        // folded to constants: one that folds to `False` leaves the volume
+        // nothing to read, as a path term of another drive does.
+        let expr = parsed.expr.as_ref().map(|e| cexpr::compile(e, &prefix));
+        let expr_admits = !matches!(expr, Some(CNode::False));
+        let (expr_name, expr_entry) = match expr {
+            Some(e) if expr_admits => cexpr::split(e),
+            _ => (None, None),
+        };
+        let volume_admits = expr_admits
+            && parsed.path_terms.iter().all(|t| term_admits(t, &prefix))
             && path_wildcard_ends.iter().all(|(lead, _)| {
                 lead.as_deref().is_none_or(|lead| {
                     let n = lead.len().min(prefix.len());
@@ -187,17 +206,21 @@ impl<'a> CompiledQuery<'a> {
             prefilter_decides_name: from_name_term
                 && parsed.name_terms.len() == 1
                 && parsed.wildcards.is_empty()
-                && parsed.filters.ext.is_none(),
+                && parsed.filters.ext.is_none()
+                && expr_name.is_none(),
             prefix,
             volume_admits,
             path_wildcard_ends,
             path_piece,
+            expr_paths: expr_entry.as_ref().is_some_and(CNode::tests_paths),
+            expr_name,
+            expr_entry,
         }
     }
 
     /// Whether a candidate's full path has anything left to decide.
     fn tests_paths(&self, parsed: &ParsedQuery) -> bool {
-        !self.path_finders.is_empty() || !parsed.path_wildcards.is_empty()
+        !self.path_finders.is_empty() || !parsed.path_wildcards.is_empty() || self.expr_paths
     }
 }
 
@@ -242,7 +265,7 @@ fn path_piece(parsed: &ParsedQuery, prefix: &[u8]) -> Option<Vec<u8>> {
 /// and a match that covers it starts at that part. Elsewhere the match may
 /// start after any separator, so its leading literal tells nothing about
 /// where the full path starts.
-fn anchored_lead(w: &Wildcard) -> Option<Vec<u8>> {
+pub(super) fn anchored_lead(w: &Wildcard) -> Option<Vec<u8>> {
     let lead = w.leading_literal();
     lead.contains(&b':').then_some(lead)
 }
@@ -252,7 +275,7 @@ fn anchored_lead(w: &Wildcard) -> Option<Vec<u8>> {
 /// only be the drive's, the first `:` in `prefix`; that fixes where the term
 /// starts, and the part of it that overlaps the prefix must equal the prefix
 /// there. `D:\data` thus skips every volume but D: without reading an entry.
-fn term_admits(term: &[u8], prefix: &[u8]) -> bool {
+pub(super) fn term_admits(term: &[u8], prefix: &[u8]) -> bool {
     let Some(k) = memchr::memchr(b':', term) else {
         return true;
     };
@@ -452,7 +475,8 @@ fn files_size(index: &VolumeIndex, entries: impl Iterator<Item = EntryIdx>) -> u
 /// scope, no path term the mount prefix leaves open, no kind, size or date
 /// filter, and no entry without a path (an orphan, or one in a parent cycle)
 /// whose presentability would need a per-entry walk. Extensions, wildcards
-/// and case sensitivity are properties of the name and pass.
+/// and case sensitivity are properties of the name and pass, and so does an
+/// expression whose terms all are.
 fn is_name_level(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
@@ -465,22 +489,22 @@ fn is_name_level(
         && parsed.filters.kind.is_none()
         && parsed.filters.size.is_none()
         && parsed.filters.date.is_none()
+        && compiled.expr_entry.is_none()
         && !index.may_have_unpresentable()
 }
 
 /// The name predicates of `parsed` against one distinct name: substring
-/// terms, wildcards and the extension filter, on the folded bytes
-/// (case-insensitive) or the raw bytes (case-sensitive), matching how the
-/// needles were folded at parse time. Shared by the per-entry
-/// [`evaluate`] and the per-name [`match_names`], so the two paths cannot
-/// disagree on what a name matches.
+/// terms, wildcards, the extension filter and the expression's terms on the
+/// name, on the folded bytes (case-insensitive) or the raw bytes
+/// (case-sensitive), matching how the needles were folded at parse time.
+/// Shared by the per-entry [`evaluate`] and the per-name [`match_names`], so
+/// the two paths cannot disagree on what a name matches.
 fn name_matches(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
     compiled: &CompiledQuery,
     id: NameId,
-    cp_buf: &mut CodePointBuf,
-    ext_scratch: &mut Vec<u8>,
+    scratch: &mut Scratch,
 ) -> bool {
     let hay = if parsed.match_case {
         index.name_raw(id)
@@ -489,10 +513,20 @@ fn name_matches(
     };
     compiled.name_finders.iter().all(|f| f.find(hay).is_some())
         && (parsed.wildcards.is_empty()
-            || wildcards_match(&parsed.wildcards, hay, cp_buf, compiled.budget))
+            || wildcards_match(&parsed.wildcards, hay, &mut scratch.cps, compiled.budget))
         // The ext check folds the extension, so it runs after the
         // allocation-free predicates that reject most names.
-        && ext_matches(&parsed.filters, index.name_raw(id), ext_scratch)
+        && ext_matches(&parsed.filters, index.name_raw(id), &mut scratch.ext)
+        // Only a query with operators has an expression.
+        && compiled.expr_name.as_ref().is_none_or(|e| {
+            e.eval(&mut Subject::name(
+                index,
+                id,
+                parsed.match_case,
+                compiled.budget,
+                scratch,
+            ))
+        })
 }
 
 /// Whether `text`, a name or full path, matches every one of `wildcards`,
@@ -696,8 +730,7 @@ fn match_names(
             .map(|(i, words)| {
                 let ids = chunk_ids(i, per, names);
                 let base = ids.start;
-                let mut cp_buf = CodePointBuf::new();
-                let mut ext_scratch = Vec::new();
+                let mut scratch = Scratch::default();
                 let mut watch = Watch::new(compiled.budget);
                 let (mut len, mut total) = (0usize, 0u64);
                 let mut mark = |id: NameId| {
@@ -706,14 +739,7 @@ fn match_names(
                     // bounded by the volume's names, whatever the query.
                     if verify
                         && (watch.tick()
-                            || !name_matches(
-                                index,
-                                parsed,
-                                compiled,
-                                id,
-                                &mut cp_buf,
-                                &mut ext_scratch,
-                            ))
+                            || !name_matches(index, parsed, compiled, id, &mut scratch))
                     {
                         return;
                     }
@@ -939,8 +965,7 @@ fn top_k_refs(
         let slot = rayon::current_thread_index().unwrap_or(0) % bests.len();
         let mut best = bests[slot].lock().unwrap_or_else(PoisonError::into_inner);
         let Best { kept, cutoff } = &mut *best;
-        let mut cp_buf = CodePointBuf::new();
-        let mut ext_scratch = Vec::new();
+        let mut scratch = Scratch::default();
         let mut scope_memo = FxHashMap::default();
         let mut dir_paths = FxHashMap::default();
         let mut no_folders = None;
@@ -951,8 +976,7 @@ fn top_k_refs(
             // terms. An entry below costs the same whatever the query, as no
             // query here tests a path.
             if !compiled.prefilter_decides_name
-                && (watch.tick()
-                    || !name_matches(index, parsed, compiled, id, &mut cp_buf, &mut ext_scratch))
+                && (watch.tick() || !name_matches(index, parsed, compiled, id, &mut scratch))
             {
                 return;
             }
@@ -970,8 +994,7 @@ fn top_k_refs(
                     &mut dir_paths,
                     &mut no_folders,
                     true,
-                    &mut cp_buf,
-                    &mut ext_scratch,
+                    &mut scratch,
                 ) else {
                     continue;
                 };
@@ -1106,8 +1129,7 @@ fn scan_with(
     let mut candidates: Vec<Candidate> = Vec::new();
     // Per-candidate scratch buffers, allocated once and reused across the scan
     // so wildcard decoding and extension folding don't heap-allocate per hit.
-    let mut cp_buf = CodePointBuf::new();
-    let mut ext_scratch: Vec<u8> = Vec::new();
+    let mut scratch = Scratch::default();
     // Each path below stops testing entries once the budget is spent, and
     // the caller refuses what it found.
     let mut watch = Watch::new(compiled.budget);
@@ -1152,8 +1174,7 @@ fn scan_with(
                 &mut dir_paths,
                 &mut folders,
                 false,
-                &mut cp_buf,
-                &mut ext_scratch,
+                &mut scratch,
             ) {
                 candidates.push(c);
             }
@@ -1190,8 +1211,7 @@ fn scan_with(
                     &mut dir_paths,
                     &mut folders,
                     compiled.prefilter_decides_name,
-                    &mut cp_buf,
-                    &mut ext_scratch,
+                    &mut scratch,
                 ) {
                     candidates.push(c);
                 }
@@ -1221,8 +1241,7 @@ fn scan_with(
                     &mut dir_paths,
                     &mut folders,
                     false,
-                    &mut cp_buf,
-                    &mut ext_scratch,
+                    &mut scratch,
                 ) {
                     candidates.push(c);
                 }
@@ -1253,8 +1272,7 @@ fn scan_with(
                 &mut dir_paths,
                 &mut folders,
                 false,
-                &mut cp_buf,
-                &mut ext_scratch,
+                &mut scratch,
             ) {
                 candidates.push(c);
             }
@@ -1421,8 +1439,7 @@ fn evaluate(
     dir_paths: &mut FxHashMap<EntryIdx, Option<Vec<u8>>>,
     folders: &mut Option<FolderPaths>,
     name_decided: bool,
-    cp_buf: &mut CodePointBuf,
-    ext_scratch: &mut Vec<u8>,
+    scratch: &mut Scratch,
 ) -> Option<Candidate> {
     let entry = index.entry(idx);
     if !kind_matches(parsed.filters.kind, entry.is_dir()) {
@@ -1444,16 +1461,7 @@ fn evaluate(
 
     // `name_decided`: the caller reached this entry through a prefilter hit
     // that already settles the name predicates (`prefilter_decides_name`).
-    if !name_decided
-        && !name_matches(
-            index,
-            parsed,
-            compiled,
-            index.name_id(idx),
-            cp_buf,
-            ext_scratch,
-        )
-    {
+    if !name_decided && !name_matches(index, parsed, compiled, index.name_id(idx), scratch) {
         return None;
     }
 
@@ -1482,7 +1490,7 @@ fn evaluate(
     // path fails it.
     match folders {
         Some(folders) => {
-            if !folders.full_path_matches(index, idx, parsed, compiled, cp_buf) {
+            if !folders.full_path_matches(index, idx, parsed, compiled, &mut scratch.cps) {
                 return None;
             }
         }
@@ -1495,10 +1503,32 @@ fn evaluate(
         }
     }
 
+    // The expression's terms on the entry go last, once the entry is known
+    // to have a path: a NOT must not admit an entry the page cannot list.
+    if let Some(e) = &compiled.expr_entry {
+        let mut full_path = |out: &mut Vec<u8>| {
+            folders
+                .as_mut()
+                .and_then(|f| f.with_full_path(index, idx, |p| out.extend_from_slice(p)))
+                .is_some()
+        };
+        let mut subject = Subject::entry(
+            index,
+            idx,
+            parsed.match_case,
+            compiled.budget,
+            scratch,
+            &mut full_path,
+        );
+        if !e.eval(&mut subject) {
+            return None;
+        }
+    }
+
     Some(Candidate { idx, key: 0 })
 }
 
-fn kind_matches(kind: Option<Kind>, is_dir: bool) -> bool {
+pub(super) fn kind_matches(kind: Option<Kind>, is_dir: bool) -> bool {
     match kind {
         None => true,
         Some(Kind::File) => !is_dir,
@@ -1508,7 +1538,7 @@ fn kind_matches(kind: Option<Kind>, is_dir: bool) -> bool {
 
 /// A size filter excludes entries whose size is unknown (not yet enriched):
 /// we cannot confirm the predicate, so we do not claim a match.
-fn size_matches(range: SizeRange, size: Option<u64>) -> bool {
+pub(super) fn size_matches(range: SizeRange, size: Option<u64>) -> bool {
     size.is_some_and(|s| range.contains(s))
 }
 
@@ -1519,6 +1549,12 @@ fn ext_matches(filters: &Filters, name: &[u8], scratch: &mut Vec<u8>) -> bool {
     let Some(exts) = &filters.ext else {
         return true;
     };
+    ext_in(exts, name, scratch)
+}
+
+/// Whether the extension of `name` (raw), folded into `scratch`, is one of
+/// `exts` (folded).
+pub(super) fn ext_in(exts: &[Vec<u8>], name: &[u8], scratch: &mut Vec<u8>) -> bool {
     let Some(dot) = name.iter().rposition(|&b| b == b'.') else {
         return false; // no extension → cannot match an ext: filter
     };
@@ -1556,7 +1592,7 @@ fn parent_path<'a>(
 /// nearest cached ancestor when needed instead of cached: caching every
 /// folder of a deep chain of long names would store each ancestor's path
 /// again inside every descendant's, which grows with the square of the depth.
-const CACHED_PATH_MAX: usize = 1024;
+pub(super) const CACHED_PATH_MAX: usize = 1024;
 
 /// The most path bytes [`FolderPaths`] holds before it starts over: 16 MB,
 /// which also bounds the arena's allocation, since its doubling stops there.
@@ -2252,6 +2288,10 @@ mod tests {
             ("below a path piece", r"docs\", None, name, None),
             ("every full path", r"*\*", None, name, None),
             ("a folder", "", docs, name, None),
+            ("an expression on names", "!zzz", None, name, None),
+            ("an expression on entries", "!zzz|file:", None, name, None),
+            ("an expression on paths", r"zzz|docs\", None, name, None),
+            ("the best of an expression", "e !zzz", None, size, Some(10)),
         ] {
             let parsed = parse_query(q).unwrap();
             let run = |budget: &Budget| {
@@ -2824,6 +2864,150 @@ mod tests {
         assert_eq!(folders, vec!["docs", "docs\\sub"]);
     }
 
+    /// ORs, NOTs and groups are decided per entry, with the filters and
+    /// paths inside them, and each count and page lists exactly what they
+    /// match, under every sort.
+    #[test]
+    fn boolean_queries_match_per_entry() {
+        let mut idx = sample_index();
+        idx.optimize_storage();
+        let every = [
+            "docs",
+            r"docs\notes.txt",
+            r"docs\sub",
+            r"docs\sub\Report.PDF",
+            "photo.JPG",
+        ];
+        for (query, expected) in [
+            (
+                "report|notes",
+                &[r"docs\notes.txt", r"docs\sub\Report.PDF"][..],
+            ),
+            ("report notes|pdf", &[r"docs\sub\Report.PDF"][..]),
+            ("<report notes>|jpg", &["photo.JPG"][..]),
+            (
+                "!report",
+                &["docs", r"docs\notes.txt", r"docs\sub", "photo.JPG"][..],
+            ),
+            ("docs !sub", &["docs"][..]),
+            (
+                "<*.pdf|*.jpg> size:>1kb",
+                &[r"docs\sub\Report.PDF", "photo.JPG"][..],
+            ),
+            (
+                "*.pdf|size:>1mb",
+                &[r"docs\sub\Report.PDF", "photo.JPG"][..],
+            ),
+            ("file:|folder:", &every[..]),
+            (
+                "folder:!sub",
+                &[
+                    "docs",
+                    r"docs\notes.txt",
+                    r"docs\sub\Report.PDF",
+                    "photo.JPG",
+                ][..],
+            ),
+            ("file:!pdf", &[r"docs\notes.txt", "photo.JPG"][..]),
+            (r"sub\|photo", &[r"docs\sub\Report.PDF", "photo.JPG"][..]),
+            (
+                r"*.txt|**\sub\*",
+                &[r"docs\notes.txt", r"docs\sub\Report.PDF"][..],
+            ),
+            (r"!docs\", &["docs", "photo.JPG"][..]),
+            ("<>", &every[..]),
+            ("|", &every[..]),
+            ("!", &[][..]),
+            ("foo ! bar", &[][..]),
+            ("!<!report>", &[r"docs\sub\Report.PDF"][..]),
+        ] {
+            let parsed = parse_query(query).unwrap();
+            for key in SORT_KEYS {
+                let out = run_query(
+                    &idx,
+                    r"C:\",
+                    &parsed,
+                    None,
+                    SortSpec::default_for(key),
+                    0,
+                    None,
+                );
+                let mut paths: Vec<String> = out
+                    .hits
+                    .iter()
+                    .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                    .collect();
+                paths.sort();
+                assert_eq!(paths, expected, "{query} {key:?}");
+                assert_eq!(out.total, expected.len() as u64, "{query} {key:?}");
+            }
+        }
+    }
+
+    /// The mount prefix decides a path term in an expression, as it does a
+    /// plain one: on C:, `c:\docs` is a full-path test and `!c:\` matches
+    /// nothing; on D:, `c:\docs` matches nothing, so `c:\docs|photo` is
+    /// `photo`, decided by names alone, and `!c:\` matches everything.
+    #[test]
+    fn the_mount_prefix_decides_path_terms_in_an_expression() {
+        let mut idx = sample_index();
+        idx.optimize_storage();
+        let hits = |prefix, query| hits_under(&idx, prefix, &parse_query(query).unwrap());
+        assert_eq!(
+            hits(r"C:\", r"c:\docs|photo"),
+            [
+                "docs",
+                r"docs\notes.txt",
+                r"docs\sub",
+                r"docs\sub\Report.PDF",
+                "photo.JPG"
+            ]
+        );
+        assert_eq!(hits(r"D:\", r"c:\docs|photo"), ["photo.JPG"]);
+        let parsed = parse_query(r"c:\docs|photo").unwrap();
+        let on_d = CompiledQuery::new(&parsed, r"D:\", &UNLIMITED);
+        assert!(is_name_level(&idx, &parsed, &on_d, None), "names decide it");
+        assert!(hits(r"C:\", r"!c:\").is_empty());
+        assert_eq!(hits(r"D:\", r"!c:\").len(), 5);
+        let parsed = parse_query(r"!c:\").unwrap();
+        assert!(!CompiledQuery::new(&parsed, r"C:\", &UNLIMITED).volume_admits);
+    }
+
+    /// A NOT never admits an entry without a path: an orphan, or one below
+    /// lost+found, fails whatever the expression says.
+    #[test]
+    fn a_not_admits_no_entry_without_a_path() {
+        let idx = index_with_orphans();
+        for query in [
+            "!ghost",
+            "!zzz",
+            "ghost|!ghost",
+            "<ghost|real> !zzz",
+            r"!x\",
+        ] {
+            let parsed = parse_query(query).unwrap();
+            for key in [SortKey::Name, SortKey::Path, SortKey::Size] {
+                let out = run_query(
+                    &idx,
+                    r"C:\",
+                    &parsed,
+                    None,
+                    SortSpec::default_for(key),
+                    0,
+                    Some(10),
+                );
+                let mut paths: Vec<String> = out
+                    .hits
+                    .iter()
+                    .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                    .collect();
+                paths.sort();
+                assert_eq!(paths, ["real1.log", "real2.log"], "{query} {key:?}");
+                assert_eq!(out.total, 2, "{query} {key:?}");
+            }
+        }
+    }
+
     #[test]
     fn wildcard_whole_name() {
         let idx = sample_index();
@@ -2990,6 +3174,10 @@ mod tests {
                 "file:",
                 "size:>100",
                 r"docs\",
+                "x|log",
+                "!e",
+                r"!docs\",
+                "file:|ghost",
             ] {
                 let parsed = parse_query(q).unwrap();
                 let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
@@ -3016,8 +3204,7 @@ mod tests {
                         &mut FxHashMap::default(),
                         &mut folders,
                         false,
-                        &mut CodePointBuf::new(),
-                        &mut Vec::new(),
+                        &mut Scratch::default(),
                     )
                     .is_some()
                 };
@@ -3190,6 +3377,9 @@ mod tests {
                 "notes",
                 "Report case:",
                 "zzz",
+                "readme|notes",
+                "!e",
+                "<*.md !a>|txt",
             ] {
                 let parsed = parse_query(q).unwrap();
                 // Ground truth: the candidate path's match SET (ranks play no
@@ -3863,7 +4053,8 @@ mod tests {
             scope_pick in any::<prop::sample::Index>(),
             query in prop::sample::select(vec![
                 "ab", "b.txt", "*.txt", "ab b", "b ext:txt", "b.txt file:", "file:", "folder:",
-                "A case:", r"a\", r"path:*\b*",
+                "A case:", r"a\", r"path:*\b*", "ab|b.txt", "!ab", r"a|b\", "<a b>|*.txt",
+                "file:!a", "folder:!b", r"ab !a\", r"**\b*",
             ]),
         ) {
             let (idx, entries) = random_tree(&nodes, &orphans, false);
@@ -4147,7 +4338,7 @@ mod tests {
         }
     }
 
-    const FAST_QUERIES: [&str; 12] = [
+    const FAST_QUERIES: [&str; 20] = [
         "e",
         "E1",
         "a",
@@ -4160,6 +4351,14 @@ mod tests {
         "zz size:<20",
         "x",
         "",
+        "e|zz",
+        "*.md|ext:txt",
+        "!e",
+        "e !E1",
+        "<e a>|zz",
+        "file:|a",
+        "e1|e2 size:>10",
+        "!<a|zz>|e3",
     ];
 
     const SORT_KEYS: [SortKey; 4] = [

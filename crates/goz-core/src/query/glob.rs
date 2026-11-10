@@ -89,8 +89,9 @@ enum Shape {
     /// A sub-path pattern without `**`: one piece per path part, last part
     /// last.
     Parts(Vec<Glob>),
-    /// A sub-path pattern with `**`.
-    Nfa(Nfa),
+    /// A sub-path pattern with `**`, boxed: its masks would make every
+    /// wildcard several times larger.
+    Nfa(Box<Nfa>),
 }
 
 impl Wildcard {
@@ -149,7 +150,7 @@ impl Wildcard {
         }
         flush(&mut stars, &mut toks);
         let shape = if toks.contains(&Tok::RunAll) {
-            Shape::Nfa(Nfa::new(&toks))
+            Shape::Nfa(Box::new(Nfa::new(&toks)))
         } else {
             Shape::Parts(toks.split(|t| *t == Tok::Lit(SEP)).map(Glob::new).collect())
         };
