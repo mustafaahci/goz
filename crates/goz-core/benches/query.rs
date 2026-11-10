@@ -154,6 +154,10 @@ fn bench_query(c: &mut Criterion) {
         (r"drive-only(C:\)", r"C:\"),
     ] {
         let parsed = parse_query(query).unwrap();
+        eprintln!(
+            "{label}: {} matches",
+            run_query(&idx, r"C:\", &parsed, None, SortSpec::default(), 0, Some(0)).total
+        );
         path.bench_function(label, |b| {
             b.iter(|| {
                 let out = run_query(
@@ -170,6 +174,49 @@ fn bench_query(c: &mut Criterion) {
         });
     }
     path.finish();
+
+    // Boolean queries and Everything 1.5 sub-path wildcards. An OR of terms
+    // with literals scans the names for each; `kernel32|kernel32` is
+    // `rare(kernel32)` spelled as an OR, so it shows what the expression
+    // costs over the plain query. A NOT tests every name, like a wildcard
+    // with no literal. The sub-path wildcards prefilter by their last part.
+    let mut boolean = c.benchmark_group("query_2M_bool");
+    boolean.sample_size(20);
+    for (label, query) in [
+        ("or(kernel32|report)", "kernel32|report"),
+        ("or(*.dll|*.txt)", "*.dll|*.txt"),
+        ("and-not(document !report)", "document !report"),
+        ("not(!kernel32)", "!kernel32"),
+        (
+            "groups(<kernel32 dll>|<report v3>)",
+            "<kernel32 dll>|<report v3>",
+        ),
+        ("or-same(kernel32|kernel32)", "kernel32|kernel32"),
+        (r"subpath(bin_x64_05\*.dll)", r"bin_x64_05\*.dll"),
+        (r"subpath(**\bin_x64_05\*.dll)", r"**\bin_x64_05\*.dll"),
+        (r"subpath(module_group_007\**)", r"module_group_007\**"),
+    ] {
+        let parsed = parse_query(query).unwrap();
+        eprintln!(
+            "{label}: {} matches",
+            run_query(&idx, r"C:\", &parsed, None, SortSpec::default(), 0, Some(0)).total
+        );
+        boolean.bench_function(label, |b| {
+            b.iter(|| {
+                let out = run_query(
+                    black_box(&idx),
+                    r"C:\",
+                    black_box(&parsed),
+                    None,
+                    SortSpec::default(),
+                    0,
+                    Some(100),
+                );
+                black_box(out.total)
+            })
+        });
+    }
+    boolean.finish();
 
     // Broad limit=None: reconstructs and sorts the ENTIRE match set (~2M paths),
     // the "dump everything" workload (export / `goz foo | wc`) where path

@@ -2979,6 +2979,20 @@ mod tests {
             ("notes dm:today", &[][..]),
             ("folder: dm:today", &["docs"][..]),
             ("dm:2026-10-01..2026-11-03", &[r"docs\notes.txt"][..]),
+            // In an expression, a date is a term like any other: a NOT of
+            // one admits the entries whose date is unknown.
+            (
+                "dm:today|notes",
+                &["docs", r"docs\notes.txt", r"docs\sub\Report.PDF"][..],
+            ),
+            (
+                "!dm:today",
+                &[r"docs\notes.txt", r"docs\sub", "photo.JPG"][..],
+            ),
+            (
+                "<notes dm:lastmonth>|dm:unknown",
+                &[r"docs\notes.txt", r"docs\sub"][..],
+            ),
         ] {
             let parsed = crate::query::parse_query_at(query, false, &clock).unwrap();
             for key in [SortKey::Name, SortKey::Path, SortKey::DateModified] {

@@ -399,6 +399,32 @@ fn bench_sorts(c: &mut Criterion) {
         }
     }
     other.finish();
+
+    // Boolean queries sort like any other: an OR scans the names for both
+    // needles, a NOT tests every name, and either can take the name-level
+    // path or the best rows.
+    let either = parse_query("e|kernel").unwrap();
+    let not_e = parse_query("!e").unwrap();
+    let mut boolean = c.benchmark_group("sort_bool");
+    boolean.sample_size(10);
+    for (label, parsed) in [("e|kernel", &either), ("!e", &not_e)] {
+        for (key_label, key, dir) in [
+            ("name", SortKey::Name, SortDir::Asc),
+            ("size", SortKey::Size, SortDir::Desc),
+            ("date", SortKey::DateModified, SortDir::Desc),
+        ] {
+            for limit in [Some(100), None] {
+                let id = format!(
+                    "{key_label} {label} n={}",
+                    limit.map_or("all".into(), |l: u32| l.to_string())
+                );
+                boolean.bench_function(BenchmarkId::from_parameter(id), |b| {
+                    b.iter(|| run(parsed, key, dir, limit))
+                });
+            }
+        }
+    }
+    boolean.finish();
 }
 
 criterion_group!(benches, bench_sorts);
