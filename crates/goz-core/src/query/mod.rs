@@ -19,6 +19,8 @@ mod lex;
 pub mod parse;
 #[cfg(test)]
 mod parse_v060;
+mod text;
+mod value;
 
 /// Case folding lives at the crate root (`crate::fold`) so the index can build
 /// its folded shadow arena without depending on the query module; re-exported
@@ -31,7 +33,7 @@ pub use engine::{
     CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, mtime_key, resolve_scope, run_query,
     run_query_refs, size_key,
 };
-pub use expr::{Expr, Leaf, Target};
+pub use expr::{Anchors, Expr, Leaf, LenOf, Skip, Target};
 pub use parse::{
     Filters, Kind, ParsedQuery, QueryError, SizeRange, Wildcard, parse_query, parse_query_at,
     parse_query_with_case,

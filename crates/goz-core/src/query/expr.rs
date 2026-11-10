@@ -6,8 +6,9 @@
 //! substrings, wildcards, the `ext:`, `size:`, `dm:` and kind filters), and
 //! for those the lowering leaves no expression at all: the query is the one
 //! goz has always built, and runs the same prefilters and fast paths. What a
-//! bucket cannot hold (an OR, a NOT, a group or filter inside one) stays an
-//! expression, ANDed with the buckets, for the engine to evaluate.
+//! bucket cannot hold (an OR, a NOT, a group, a term with a modifier, a
+//! second `ext:` or `size:`) stays an expression, ANDed with the buckets, for
+//! the engine to evaluate.
 
 use super::dates::DateFilter;
 use super::glob::Wildcard;
@@ -26,31 +27,135 @@ pub enum Expr {
     Leaf(Leaf),
 }
 
-/// What a text term is matched against.
+/// What a text term is matched against: the parts of an entry's full path
+/// Everything names (DESIGN.md §2.4 of the query-language work).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     /// The name.
     Name,
     /// The full path, mount prefix included.
     FullPath,
+    /// A file's name without its extension; a folder's whole name.
+    Stem,
+    /// A file's extension, the text after its name's last dot; a folder,
+    /// or a file whose name holds no dot, has none.
+    Extension,
+    /// The full path of the folder holding the entry, with no separator at
+    /// its end (`C:\Windows` for `C:\Windows\notepad.exe`).
+    Location,
+    /// The name of the folder holding the entry: the last part of its
+    /// location.
+    ParentName,
 }
 
-/// One term. Text is folded iff the query is case-insensitive, as the
-/// buckets' is; `ext:` values always are.
+impl Target {
+    /// Whether the name alone gives the target, so a term on it can be
+    /// decided in the pass over the distinct names.
+    pub fn by_name(self) -> bool {
+        self == Target::Name
+    }
+}
+
+/// Where a text term's match must stand in its target: `start` and `end`
+/// at the target's ends (`startwith:`, `endwith:`, both for `whole:`),
+/// `word_start` and `word_end` at word boundaries (`prefix:`, `suffix:`,
+/// both for `ww:`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Anchors {
+    pub start: bool,
+    pub end: bool,
+    pub word_start: bool,
+    pub word_end: bool,
+}
+
+impl Anchors {
+    /// Whether the match may stand anywhere.
+    pub fn is_free(self) -> bool {
+        self == Anchors::default()
+    }
+}
+
+/// The characters of the target a match may skip between the needle's
+/// (`ignore-punctuation:`, `ignore-whitespace:`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Skip {
+    pub punct: bool,
+    pub space: bool,
+}
+
+impl Skip {
+    pub fn is_none(self) -> bool {
+        self == Skip::default()
+    }
+}
+
+/// Which length a `len:` term compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LenOf {
+    Name,
+    FullPath,
+    Location,
+    Extension,
+}
+
+/// One term. Text is folded unless the term matches case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Leaf {
-    /// The target holds `needle`.
-    Text { target: Target, needle: Vec<u8> },
-    /// A name or sub-path wildcard (the wildcard knows which).
-    Glob(Wildcard),
+    /// The target holds `needle` (folded unless `case`), where `anchors`
+    /// say, skipping in the target what `skip` says. An empty needle
+    /// matches a target that exists and is not empty.
+    Text {
+        target: Target,
+        needle: Vec<u8>,
+        case: bool,
+        anchors: Anchors,
+        skip: Skip,
+    },
+    /// The target matches a wildcard (folded unless `case`): the name or a
+    /// sub-path of the full path, as the wildcard knows, or the whole of
+    /// another target.
+    Glob {
+        target: Target,
+        glob: Wildcard,
+        case: bool,
+    },
     /// Files or folders only.
     Kind(Kind),
-    /// The extension is one of these (never empty).
-    Ext(Vec<Vec<u8>>),
+    /// A file whose extension is one of `values` (folded unless `case`;
+    /// never empty): a value of `k` dot-separated parts names the name's
+    /// last `k`, a value may hold wildcards, and an empty value names a
+    /// name with no dot. Folders have no extension.
+    Ext { values: Vec<Vec<u8>>, case: bool },
     /// The size is known and in range.
     Size(SizeRange),
+    /// The size is unknown: a folder's (goz does not sum them), or a file's
+    /// not read yet.
+    SizeUnknown,
     /// The date modified passes.
     Date(DateFilter),
+    /// A length, in UTF-16 units, is in range.
+    Len { of: LenOf, range: SizeRange },
+    /// The entry's folder is one of these, given by absolute full path,
+    /// folded, `\` for every separator and none at the end.
+    Parent(Vec<Vec<u8>>),
+    /// One of the entry's folders, up to the root, is one of these.
+    Ancestor(Vec<Vec<u8>>),
+    /// The entry is on this drive (an ASCII letter, lower-cased): `d:`.
+    Drive(u8),
+}
+
+impl Leaf {
+    /// A name or full-path substring term with no modifier: what the
+    /// buckets hold.
+    pub fn plain(target: Target, needle: Vec<u8>, case: bool) -> Leaf {
+        Leaf::Text {
+            target,
+            needle,
+            case,
+            anchors: Anchors::default(),
+            skip: Skip::default(),
+        }
+    }
 }
 
 impl Expr {
@@ -152,8 +257,9 @@ pub(super) fn simplify(e: Expr) -> Expr {
 
 /// Moves each top-level conjunct of `e` (simplified) that a bucket of `q`
 /// holds exactly into that bucket, in query order, and leaves the rest as
-/// `q.expr`. The kind, `ext:` and `size:` filters keep their last term, as
-/// they always have; `dm:` terms all apply.
+/// `q.expr`. The first `ext:` and the first `size:` fill their buckets and
+/// any other is an expression term, so that all of them must match, as in
+/// Everything; two different kinds match nothing; `dm:` terms all apply.
 pub(super) fn lower(e: Expr, q: &mut ParsedQuery) {
     let conjuncts = match e {
         Expr::True => Vec::new(),
@@ -164,18 +270,44 @@ pub(super) fn lower(e: Expr, q: &mut ParsedQuery) {
     for conjunct in conjuncts {
         match conjunct {
             Expr::Leaf(Leaf::Text {
-                target: Target::Name,
+                target: target @ (Target::Name | Target::FullPath),
                 needle,
-            }) => q.name_terms.push(needle),
-            Expr::Leaf(Leaf::Text {
-                target: Target::FullPath,
-                needle,
-            }) => q.path_terms.push(needle),
-            Expr::Leaf(Leaf::Glob(w)) if w.is_name() => q.wildcards.push(w),
-            Expr::Leaf(Leaf::Glob(w)) => q.path_wildcards.push(w),
-            Expr::Leaf(Leaf::Kind(kind)) => q.filters.kind = Some(kind),
-            Expr::Leaf(Leaf::Ext(exts)) => q.filters.ext = Some(exts),
-            Expr::Leaf(Leaf::Size(range)) => q.filters.size = Some(range),
+                case,
+                anchors,
+                skip,
+            }) if case == q.match_case && anchors.is_free() && skip.is_none() => {
+                if target == Target::Name {
+                    q.name_terms.push(needle);
+                } else {
+                    q.path_terms.push(needle);
+                }
+            }
+            Expr::Leaf(Leaf::Glob {
+                target: Target::Name | Target::FullPath,
+                glob,
+                case,
+            }) if case == q.match_case => {
+                if glob.is_name() {
+                    q.wildcards.push(glob);
+                } else {
+                    q.path_wildcards.push(glob);
+                }
+            }
+            Expr::Leaf(Leaf::Kind(kind)) => match q.filters.kind {
+                None => q.filters.kind = Some(kind),
+                Some(have) if have == kind => {}
+                // A file is never a folder.
+                Some(_) => rest.push(Expr::False),
+            },
+            Expr::Leaf(Leaf::Ext {
+                values,
+                case: false,
+            }) if q.filters.ext.is_none() && values.iter().all(|v| is_plain_ext(v)) => {
+                q.filters.ext = Some(values);
+            }
+            Expr::Leaf(Leaf::Size(range)) if q.filters.size.is_none() => {
+                q.filters.size = Some(range);
+            }
             Expr::Leaf(Leaf::Date(date)) => {
                 q.filters.date = Some(q.filters.date.map_or(date, |d| d.and(date)));
             }
@@ -189,13 +321,26 @@ pub(super) fn lower(e: Expr, q: &mut ParsedQuery) {
     };
 }
 
-/// How many terms `e`'s leaves count for the term cap: one each, and an
-/// `ext:` one per value, since each costs a candidate one test.
+/// Whether `ext:` value `v` names one extension plainly: not empty, and no
+/// wildcard.
+pub(super) fn is_plain_ext(v: &[u8]) -> bool {
+    !v.is_empty() && !v.iter().any(|&b| b == b'*' || b == b'?')
+}
+
+/// How many terms `e`'s leaves count for the term cap: one each, since each
+/// costs a candidate one test. An `ext:` list's plain values are one lookup
+/// however many (a set, see `cexpr::ExtMatcher`), and each of its wildcard
+/// values one test more.
 pub(super) fn leaf_terms(e: &Expr) -> usize {
     let mut n = 0;
     e.for_each_leaf(&mut |leaf| {
         n += match leaf {
-            Leaf::Ext(exts) => exts.len(),
+            Leaf::Ext { values, .. } => {
+                1 + values
+                    .iter()
+                    .filter(|v| v.iter().any(|&b| b == b'*' || b == b'?'))
+                    .count()
+            }
             _ => 1,
         }
     });
@@ -207,10 +352,7 @@ mod tests {
     use super::*;
 
     fn name(s: &str) -> Expr {
-        Expr::Leaf(Leaf::Text {
-            target: Target::Name,
-            needle: s.as_bytes().to_vec(),
-        })
+        Expr::Leaf(Leaf::plain(Target::Name, s.as_bytes().to_vec(), false))
     }
 
     #[test]

@@ -10,10 +10,10 @@
 //! `FolderPaths`), plus its own name.
 
 use super::budget::{Budget, Stopped, Watch};
-use super::cexpr::{self, CNode, Scratch, Subject};
+use super::cexpr::{self, CNode, ExtMatcher, Scratch, Source, Subject, Volume};
 use super::folder_rank::FolderRanks;
 use super::glob::{CodePointBuf, Glob, decode_into};
-use super::parse::{Filters, Kind, ParsedQuery, SizeRange, Wildcard};
+use super::parse::{Kind, ParsedQuery, SizeRange, Wildcard};
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
 use crate::types::{EntryIdx, Frn, NIL, SortDir, SortKey, SortSpec};
@@ -134,12 +134,29 @@ pub struct CompiledQuery<'a> {
     expr_entry: Option<CNode<'a>>,
     /// Whether `expr_entry` reads full paths.
     expr_paths: bool,
+    /// The mount prefix as typed, for a full path a term matching case
+    /// compares in a query that does not (see [`Subject`]).
+    raw_prefix: Vec<u8>,
+    /// The kind every match has: the kind filter's, or files for an `ext:`
+    /// filter, since a folder has no extension.
+    kind: Option<Kind>,
+    /// The `ext:` filter, compiled.
+    ext: Option<ExtMatcher>,
+    /// Where a top-level `parent:` or `ancestor:` term says the matches
+    /// lie, which the scan walks instead of the volume.
+    source: Option<Source>,
 }
 
 impl<'a> CompiledQuery<'a> {
-    /// Compiles `parsed` for the volume mounted at `mount_prefix` (`C:\`, or a
-    /// mount folder such as `C:\mnt\data\`), to run within `budget`.
-    pub fn new(parsed: &'a ParsedQuery, mount_prefix: &str, budget: &'a Budget<'a>) -> Self {
+    /// Compiles `parsed` for `index`, the volume mounted at `mount_prefix`
+    /// (`C:\`, or a mount folder such as `C:\mnt\data\`), to run within
+    /// `budget`.
+    pub fn new(
+        index: &VolumeIndex,
+        parsed: &'a ParsedQuery,
+        mount_prefix: &str,
+        budget: &'a Budget<'a>,
+    ) -> Self {
         // The prefilter is the longest literal from any name term, wildcard, or
         // single `ext:` value;
         // every match must contain it, so scanning for it yields a superset of
@@ -214,16 +231,31 @@ impl<'a> CompiledQuery<'a> {
         // The expression, with the path terms this volume's prefix decides
         // folded to constants: one that folds to `False` leaves the volume
         // nothing to read, as a path term of another drive does.
-        let expr = parsed
-            .expr
-            .as_ref()
-            .map(|e| cexpr::compile(e, &prefix, parts_are_names));
+        let folded_prefix = if parsed.match_case {
+            fold(mount_prefix.as_bytes())
+        } else {
+            prefix.clone()
+        };
+        let volume = Volume {
+            index,
+            raw_prefix: mount_prefix.as_bytes(),
+            folded_prefix: &folded_prefix,
+            parts_are_names,
+        };
+        let expr = parsed.expr.as_ref().map(|e| cexpr::compile(e, &volume));
         let expr_admits = !matches!(expr, Some(CNode::False));
         let (expr_name, expr_entry) = match expr {
             Some(e) if expr_admits => cexpr::split(e),
             _ => (None, None),
         };
+        // An `ext:` filter keeps files, as a folder has no extension.
+        let (kind, kinds_agree) = match (parsed.filters.kind, parsed.filters.ext.is_some()) {
+            (Some(Kind::Folder), true) => (None, false),
+            (None, true) => (Some(Kind::File), true),
+            (kind, _) => (kind, true),
+        };
         let volume_admits = expr_admits
+            && kinds_agree
             && parsed.path_terms.iter().all(|t| term_admits(t, &prefix))
             && path_wildcard_ends.iter().all(|(lead, _)| {
                 lead.as_deref().is_none_or(|lead| {
@@ -254,6 +286,14 @@ impl<'a> CompiledQuery<'a> {
         }
 
         Self {
+            source: expr_entry.as_ref().and_then(cexpr::source),
+            raw_prefix: mount_prefix.as_bytes().to_vec(),
+            kind,
+            ext: parsed
+                .filters
+                .ext
+                .as_ref()
+                .map(|values| ExtMatcher::new(values, false)),
             budget,
             name_finders: parsed
                 .name_terms
@@ -494,7 +534,12 @@ fn page_refs(
     fast: bool,
     budget: &Budget,
 ) -> Result<RefOutcome, Stopped> {
-    let compiled = CompiledQuery::new(parsed, mount_prefix, budget);
+    let compiled = CompiledQuery::new(index, parsed, mount_prefix, budget);
+    // A top-level `ancestor:` is a scope: its subtree is walked as one is.
+    let scope = scope.or(match compiled.source {
+        Some(Source::Subtree(dir)) => Some(dir),
+        _ => None,
+    });
     // A scope at the root admits every entry with a path, as no scope does,
     // so it goes: kept, it would bar the name-level path, and `-path C:\ e`
     // ran three times slower than `e`.
@@ -554,10 +599,10 @@ fn files_size(index: &VolumeIndex, entries: impl Iterator<Item = EntryIdx>) -> u
 /// Whether every predicate of `parsed` is decided by the file name alone, so
 /// the query can run over the distinct names instead of the entries: no
 /// scope, no path term the mount prefix leaves open, no kind, size or date
-/// filter, and no entry without a path (an orphan, or one in a parent cycle)
-/// whose presentability would need a per-entry walk. Extensions, wildcards
-/// and case sensitivity are properties of the name and pass, and so does an
-/// expression whose terms all are.
+/// filter (an `ext:` filter keeps files), and no entry without a path (an
+/// orphan, or one in a parent cycle) whose presentability would need a
+/// per-entry walk. Extensions, wildcards and case sensitivity are properties
+/// of the name and pass, and so does an expression whose terms all are.
 fn is_name_level(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
@@ -567,7 +612,7 @@ fn is_name_level(
     scope.is_none()
         && compiled.volume_admits
         && !compiled.tests_paths()
-        && parsed.filters.kind.is_none()
+        && compiled.kind.is_none()
         && parsed.filters.size.is_none()
         && parsed.filters.date.is_none()
         && compiled.expr_entry.is_none()
@@ -611,7 +656,14 @@ fn name_matches_as<const EXTRA: bool>(
             || wildcards_match(&parsed.wildcards, hay, &mut scratch.cps, compiled.budget))
         // The ext check folds the extension, so it runs after the
         // allocation-free predicates that reject most names.
-        && ext_matches(&parsed.filters, index.name_raw(id), &mut scratch.ext)
+        && compiled.ext.as_ref().is_none_or(|ext| {
+            ext.matches(
+                index.name_raw(id),
+                &mut scratch.ext,
+                &mut scratch.text_cps,
+                compiled.budget,
+            )
+        })
         && (!EXTRA
             || !compiled.name_extra
             || name_extra_matches(index, parsed, compiled, id, hay, scratch))
@@ -633,7 +685,7 @@ fn name_extra_matches(
     (compiled.name_parts.is_empty()
         || last_part_matches(&compiled.name_parts, hay, &mut scratch.cps, compiled.budget))
         && compiled.expr_name.as_ref().is_none_or(|e| {
-            e.eval(&mut Subject::name(
+            e.eval(&mut Subject::name_level(
                 index,
                 id,
                 parsed.match_case,
@@ -646,11 +698,13 @@ fn name_extra_matches(
 /// Whether entry `idx` matches `e`, the expression's terms on the entry,
 /// reading its full path through `folders` when a term asks.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn entry_expr_matches(
     e: &CNode,
     index: &VolumeIndex,
     idx: EntryIdx,
     match_case: bool,
+    raw_prefix: &[u8],
     budget: &Budget,
     folders: &mut Option<FolderPaths>,
     scratch: &mut Scratch,
@@ -665,6 +719,7 @@ fn entry_expr_matches(
         index,
         idx,
         match_case,
+        raw_prefix,
         budget,
         scratch,
         &mut full_path,
@@ -1123,6 +1178,7 @@ fn top_k_applies(
     sort.key != SortKey::Path
         && limit.is_some_and(|l| (offset as usize).saturating_add(l as usize) <= TOP_K_MAX)
         && scope.is_none()
+        && compiled.source.is_none()
         && !compiled.needles(parsed).is_empty()
         && compiled.volume_admits
         && !compiled.tests_paths()
@@ -1422,6 +1478,33 @@ fn scan_with(
     // verify the rest per hit.
     if subtree_done {
         // Scoped walk answered the query; the scan paths are skipped.
+    } else if let Some(Source::Children(dirs)) = &compiled.source {
+        // A top-level `parent:` term: only those folders' children can
+        // match, a few entries however big the volume.
+        'dirs: for &dir in dirs {
+            for idx in index.children(dir) {
+                if watch.tick() {
+                    break 'dirs;
+                }
+                if index.is_synthetic(idx) {
+                    continue;
+                }
+                if let Some(c) = evaluate(
+                    index,
+                    parsed,
+                    compiled,
+                    idx,
+                    scope,
+                    &mut scope_memo,
+                    &mut dir_paths,
+                    &mut folders,
+                    false,
+                    &mut scratch,
+                ) {
+                    candidates.push(c);
+                }
+            }
+        }
     } else if !compiled.needles(parsed).is_empty() {
         // The scan cost is proportional to the unique-name bytes (~1/3 of
         // the total on a real volume); a hit fans out to every entry bearing
@@ -1688,7 +1771,7 @@ fn evaluate(
     scratch: &mut Scratch,
 ) -> Option<Candidate> {
     let entry = index.entry(idx);
-    if !kind_matches(parsed.filters.kind, entry.is_dir()) {
+    if !kind_matches(compiled.kind, entry.is_dir()) {
         return None;
     }
     // Each column is read only when its filter asks: a broad query visits
@@ -1757,6 +1840,7 @@ fn evaluate(
             index,
             idx,
             parsed.match_case,
+            &compiled.raw_prefix,
             compiled.budget,
             folders,
             scratch,
@@ -1780,27 +1864,6 @@ pub(super) fn kind_matches(kind: Option<Kind>, is_dir: bool) -> bool {
 /// we cannot confirm the predicate, so we do not claim a match.
 pub(super) fn size_matches(range: SizeRange, size: Option<u64>) -> bool {
     size.is_some_and(|s| range.contains(s))
-}
-
-/// Extension matching is always case-insensitive (es semantics): the filter
-/// values are folded at parse time, so the candidate extension is folded here
-/// unconditionally, even under a case-sensitive query.
-fn ext_matches(filters: &Filters, name: &[u8], scratch: &mut Vec<u8>) -> bool {
-    let Some(exts) = &filters.ext else {
-        return true;
-    };
-    ext_in(exts, name, scratch)
-}
-
-/// Whether the extension of `name` (raw), folded into `scratch`, is one of
-/// `exts` (folded).
-pub(super) fn ext_in(exts: &[Vec<u8>], name: &[u8], scratch: &mut Vec<u8>) -> bool {
-    let Some(dot) = name.iter().rposition(|&b| b == b'.') else {
-        return false; // no extension → cannot match an ext: filter
-    };
-    scratch.clear();
-    crate::fold::fold_into(&name[dot + 1..], scratch);
-    exts.iter().any(|e| e.as_slice() == scratch.as_slice())
 }
 
 fn fold(bytes: &[u8]) -> Vec<u8> {
@@ -2631,7 +2694,7 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let spent = cancelled_by(&cancel);
         let needs = |budget: &Budget, folder: Frn| {
-            let compiled = CompiledQuery::new(&parsed, r"C:\", budget);
+            let compiled = CompiledQuery::new(&idx, &parsed, r"C:\", budget);
             let mut folders = FolderPaths::new(&idx, &compiled.prefix, true);
             folders.load(&idx, idx.head_of(folder).unwrap());
             folders.decide_needs(&compiled);
@@ -3228,12 +3291,12 @@ mod tests {
         );
         assert_eq!(hits(r"D:\", r"c:\docs|photo"), ["photo.JPG"]);
         let parsed = parse_query(r"c:\docs|photo").unwrap();
-        let on_d = CompiledQuery::new(&parsed, r"D:\", &UNLIMITED);
+        let on_d = CompiledQuery::new(&idx, &parsed, r"D:\", &UNLIMITED);
         assert!(is_name_level(&idx, &parsed, &on_d, None), "names decide it");
         assert!(hits(r"C:\", r"!c:\").is_empty());
         assert_eq!(hits(r"D:\", r"!c:\").len(), 5);
         let parsed = parse_query(r"!c:\").unwrap();
-        assert!(!CompiledQuery::new(&parsed, r"C:\", &UNLIMITED).volume_admits);
+        assert!(!CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED).volume_admits);
     }
 
     /// An OR whose every branch holds a needle scans the folded names for
@@ -3261,13 +3324,13 @@ mod tests {
             (r"report|notes docs\", 2),
         ] {
             let parsed = parse_query(query).unwrap();
-            let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            let compiled = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);
             let planned = compiled
                 .union
                 .len()
                 .max(usize::from(compiled.prefilter.is_some()));
             assert_eq!(planned, needles, "{query}");
-            let mut unplanned = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            let mut unplanned = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);
             unplanned.prefilter = None;
             unplanned.union.clear();
             let found = |compiled: &CompiledQuery| {
@@ -3427,7 +3490,7 @@ mod tests {
             (r"zz|*\sub\*.pdf", Some(".pdf"), false),
         ] {
             let parsed = parse_query(query).unwrap();
-            let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            let compiled = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);
             let union = compiled.union.iter().any(|n| n == b"zz");
             let prefilter = compiled
                 .prefilter
@@ -3442,7 +3505,7 @@ mod tests {
                 name_level,
                 "{query}"
             );
-            let mut unplanned = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            let mut unplanned = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);
             unplanned.prefilter = None;
             unplanned.union.clear();
             let found = |compiled: &CompiledQuery| {
@@ -3454,7 +3517,7 @@ mod tests {
                 found
             };
             assert_eq!(found(&compiled), found(&unplanned), "{query}");
-            let below = CompiledQuery::new(&parsed, "C:", &UNLIMITED);
+            let below = CompiledQuery::new(&idx, &parsed, "C:", &UNLIMITED);
             assert!(
                 !is_name_level(&idx, &parsed, &below, None),
                 "{query} under C:"
@@ -3561,7 +3624,7 @@ mod tests {
                 "file:|ghost",
             ] {
                 let parsed = parse_query(q).unwrap();
-                let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+                let compiled = CompiledQuery::new(idx, &parsed, r"C:\", &UNLIMITED);
                 let walked = |scope| {
                     let mut found: Vec<EntryIdx> = scan(idx, &parsed, &compiled, scope)
                         .iter()
@@ -4177,7 +4240,8 @@ mod tests {
     fn the_path_walk_takes_the_longest_piece_the_prefix_lacks() {
         let piece = |query: &str, prefix: &str| {
             let parsed = parse_query(query).unwrap();
-            CompiledQuery::new(&parsed, prefix, &UNLIMITED)
+            let idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+            CompiledQuery::new(&idx, &parsed, prefix, &UNLIMITED)
                 .path_piece
                 .map(|p| String::from_utf8(p).unwrap())
         };
@@ -4210,16 +4274,17 @@ mod tests {
 
     /// A path term the mount prefix holds is in every full path on the
     /// volume, so `C:\ report` is decided by names alone, as `report` is, and
-    /// runs per distinct name. Another drive's term still empties the volume,
-    /// and under `case:` a lowercase drive is not in `C:\`.
+    /// runs per distinct name, and so is the drive term `c:`. Another
+    /// drive's term still empties the volume, and under `case:` a lowercase
+    /// drive is not in `C:\`. A lone `\` keeps folders (Everything 1.5).
     #[test]
     fn a_path_term_the_prefix_holds_leaves_the_query_to_names() {
         let mut idx = sample_index();
         idx.optimize_storage();
         let report = parse_query("report").unwrap();
-        for query in [r"C:\ report", r"\ report", "path:c: report"] {
+        for query in [r"C:\ report", "c: report", "path:c: report"] {
             let parsed = parse_query(query).unwrap();
-            let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            let compiled = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);
             assert!(is_name_level(&idx, &parsed, &compiled, None), "{query}");
             assert_eq!(
                 hits_under(&idx, r"C:\", &parsed),
@@ -4227,11 +4292,23 @@ mod tests {
                 "{query}"
             );
         }
+        let folders = parse_query(r"\ report").unwrap();
+        assert!(!is_name_level(
+            &idx,
+            &folders,
+            &CompiledQuery::new(&idx, &folders, r"C:\", &UNLIMITED),
+            None
+        ));
+        let report_folders = parse_query("folder: report").unwrap();
+        assert_eq!(
+            hits_under(&idx, r"C:\", &folders),
+            hits_under(&idx, r"C:\", &report_folders)
+        );
         let other_drive = parse_query(r"C:\ report").unwrap();
         assert!(!is_name_level(
             &idx,
             &other_drive,
-            &CompiledQuery::new(&other_drive, r"D:\", &UNLIMITED),
+            &CompiledQuery::new(&idx, &other_drive, r"D:\", &UNLIMITED),
             None
         ));
         assert!(hits_under(&idx, r"D:\", &other_drive).is_empty());
@@ -4375,6 +4452,8 @@ mod tests {
             if match_case {
                 terms.push("case:".into());
             }
+            // A lone separator keeps folders, as in Everything 1.5.
+            let folders_only = terms.iter().any(|t| t == "\\");
             let query = terms.join(" ");
             let parsed = parse_query(&query).unwrap();
             let folders: Vec<EntryIdx> = entries.iter().copied().filter(|&e| idx.entry(e).is_dir()).collect();
@@ -4396,6 +4475,7 @@ mod tests {
                     let name = fold(idx.entry(e).name());
                     let full_text = String::from_utf8(full.clone()).unwrap();
                     scope.is_none_or(|s| is_below(&idx, e, s))
+                        && (!folders_only || idx.entry(e).is_dir())
                         && parsed.name_terms.iter().all(|t| holds(&name, t))
                         && parsed.path_terms.iter().all(|t| holds(&full, t))
                         && patterns
@@ -4444,7 +4524,7 @@ mod tests {
             prop_assume!(!folders.is_empty());
             let scope = *scope_pick.get(&folders);
             let parsed = parse_query(query).unwrap();
-            let compiled = CompiledQuery::new(&parsed, r"C:\", &UNLIMITED);
+            let compiled = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);
             let found = |floor| {
                 let mut found: Vec<EntryIdx> = scan_with(&idx, &parsed, &compiled, Some(scope), floor)
                     .iter()
@@ -4498,7 +4578,7 @@ mod tests {
     /// and the ones the built-path keys give, over both directions and a few
     /// slices, or `None` when every page agrees.
     fn path_pages_differ(index: &VolumeIndex, parsed: &ParsedQuery) -> Option<String> {
-        let compiled = CompiledQuery::new(parsed, r"C:\", &UNLIMITED);
+        let compiled = CompiledQuery::new(index, parsed, r"C:\", &UNLIMITED);
         for dir in [SortDir::Asc, SortDir::Desc] {
             let sort = SortSpec {
                 key: SortKey::Path,
@@ -4829,41 +4909,117 @@ mod tests {
 
     // -- boolean queries against a naive evaluator ---------------------------
 
-    /// The naive reference for boolean queries: random trees, random
-    /// expressions of every term kind S1 knows, printed to query text and
-    /// parsed back, run through every way a page is gathered, and compared
-    /// with a plain evaluation of the expression over every entry and a plain
-    /// sort of what matches.
+    /// The engine against a naive reference over random trees and random
+    /// queries of every kind of term S1 and S2 read: operators and groups,
+    /// name and path text and wildcards, every modifier (`case:`, `path:`,
+    /// `nopath:`, the word and anchor modifiers, `nopunc:`, `nows:`) and kind
+    /// prefix (`file:`, `folder:`, `dir:`, `no-file:`, `no-folder:`), the
+    /// functions (`ext:`, `size:`, the lengths, `dm:`, `parent:`,
+    /// `ancestor:`, the name parts), drive terms, the lone `\` and a macro.
+    /// The reference reads each term with code of its own (a DP for
+    /// wildcards, a search of every placement for skips, path strings built
+    /// by `path_of`), and the engine must give its matches, totals, summed
+    /// sizes and every sorted page, whichever way it runs.
     mod boolean_reference {
         use super::*;
+        use crate::query::dates::tests::FixedClock;
         use crate::query::glob::tests::{reference_match, reference_sub_path};
         use prop::sample::Index;
 
-        /// A query as the test builds it.
+        /// A prefix over a term or a group.
+        #[derive(Clone, Copy, Debug)]
+        enum P {
+            Case(bool),
+            Path(bool),
+            Ww,
+            Prefix,
+            Suffix,
+            Whole,
+            StartWith,
+            EndWith,
+            NoPunc,
+            NoWs,
+            File,
+            Folder,
+            Dir,
+            NoFile,
+            NoFolder,
+        }
+
+        impl P {
+            fn text(self) -> &'static str {
+                match self {
+                    P::Case(true) => "case:",
+                    P::Case(false) => "nocase:",
+                    P::Path(true) => "path:",
+                    P::Path(false) => "nopath:",
+                    P::Ww => "ww:",
+                    P::Prefix => "prefix:",
+                    P::Suffix => "suffix:",
+                    P::Whole => "whole:",
+                    P::StartWith => "startwith:",
+                    P::EndWith => "endwith:",
+                    P::NoPunc => "nopunc:",
+                    P::NoWs => "nows:",
+                    P::File => "file:",
+                    P::Folder => "folder:",
+                    P::Dir => "dir:",
+                    P::NoFile => "no-file:",
+                    P::NoFolder => "no-folder:",
+                }
+            }
+        }
+
+        /// A function on a part of the full path.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Part {
+            Name,
+            Stem,
+            Extension,
+            FullPath,
+            Location,
+            ParentName,
+        }
+
+        /// A length function.
+        #[derive(Clone, Copy, Debug)]
+        enum LenFn {
+            Len,
+            Name,
+            FullPath,
+            Location,
+            Extension,
+        }
+
+        /// One term.
+        #[derive(Clone, Debug)]
+        enum L {
+            /// Search text: a wildcard when it holds `*` or `?`.
+            Text(String),
+            Part(Part, String),
+            /// `ext:` values, as written.
+            Ext(Vec<String>),
+            /// `size:` values as written, and the ranges the test means.
+            Size(Vec<(String, SizeRange)>),
+            SizeUnknown,
+            /// A length function, its value as written, and its range.
+            Len(LenFn, String, SizeRange),
+            /// `dm:` as written, and the FILETIME range it means.
+            Date(String, SizeRange),
+            Drive(char),
+            /// `\` alone.
+            Lone,
+            /// `parent:` or `ancestor:` (`true`) of a folder: the path as
+            /// written, and the folded path the test means.
+            Folder(bool, String, String),
+            /// `exe:`.
+            Macro,
+        }
+
         #[derive(Clone, Debug)]
         enum Q {
-            /// The name holds the text.
-            Word(String),
-            /// The full path holds the text: one with a separator, or under
-            /// `path:` (`prefixed`).
-            Path {
-                text: String,
-                prefixed: bool,
-            },
-            /// A name wildcard.
-            Glob(String),
-            /// A sub-path wildcard, under `path:` when it has neither a
-            /// separator nor `**`.
-            SubGlob {
-                text: String,
-                prefixed: bool,
-            },
-            /// `ext:` values.
-            Ext(Vec<String>),
-            /// `size:` and the range the test means by it.
-            Size(String, SizeRange),
-            /// `file:` (true) or `folder:`.
-            Kind(bool),
+            Leaf(L),
+            Prefixed(P, Box<Q>),
             /// `<>`.
             Empty,
             Not(Box<Q>),
@@ -4876,6 +5032,7 @@ mod tests {
         #[derive(Clone, Debug)]
         enum Spec {
             Leaf(u8, Index, Index, Index, u64, u64),
+            Prefixed(u8, Box<Spec>),
             Not(Box<Spec>),
             And(Vec<Spec>),
             Or(Vec<Spec>),
@@ -4883,7 +5040,7 @@ mod tests {
 
         fn spec() -> impl Strategy<Value = Spec> {
             let leaf = (
-                0u8..8,
+                0u8..16,
                 any::<Index>(),
                 any::<Index>(),
                 any::<Index>(),
@@ -4891,9 +5048,10 @@ mod tests {
                 any::<u64>(),
             )
                 .prop_map(|(kind, pick, a, b, flip, n)| Spec::Leaf(kind, pick, a, b, flip, n));
-            leaf.prop_recursive(3, 6, 3, |inner| {
+            leaf.prop_recursive(3, 8, 3, |inner| {
                 prop_oneof![
                     inner.clone().prop_map(|s| Spec::Not(Box::new(s))),
+                    (0u8..17, inner.clone()).prop_map(|(p, s)| Spec::Prefixed(p, Box::new(s))),
                     prop::collection::vec(inner.clone(), 2..4).prop_map(Spec::And),
                     prop::collection::vec(inner, 2..4).prop_map(Spec::Or),
                 ]
@@ -4901,10 +5059,16 @@ mod tests {
         }
 
         /// What the terms are cut from: each presentable entry's name and
-        /// full path, as typed.
+        /// full path as typed, and each folder's full path.
         struct Vocabulary {
             names: Vec<Vec<char>>,
             paths: Vec<Vec<char>>,
+            folders: Vec<String>,
+            /// Whether `parent:` and `ancestor:` can name the folders: the
+            /// prefix ends with a separator, as every mount prefix the daemon
+            /// passes does.
+            absolute: bool,
+            mtimes: Vec<i64>,
         }
 
         fn cut(chars: &[char], a: Index, b: Index) -> &[char] {
@@ -4935,139 +5099,213 @@ mod tests {
             out
         }
 
+        fn chars(s: &str) -> Vec<char> {
+            s.chars().collect()
+        }
+
+        /// A size value as written and the range it means: a comparison, a
+        /// range, bytes, a unit's granule, a constant, or an empty value.
+        fn size_value(n: u64) -> (String, SizeRange) {
+            let k = 1 + n % 40;
+            let m = k + (n >> 8) % 20;
+            let r = |min, max| SizeRange { min, max };
+            match (n >> 16) % 12 {
+                0 => (format!(">{k}"), r(k + 1, u64::MAX)),
+                1 => (format!("<{k}"), r(0, k - 1)),
+                2 => (format!(">={k}"), r(k, u64::MAX)),
+                3 => (format!("<={k}"), r(0, k)),
+                4 => (format!("{k}..{m}"), r(k, m)),
+                5 => (format!("{m}-{k}"), r(k, m)),
+                6 => ("1kb".into(), r(1024, 2047)),
+                7 => ("=1kb".into(), r(1024, 1024)),
+                8 => ("tiny".into(), r(1, 10_240)),
+                9 => ("empty".into(), r(0, 0)),
+                10 => (String::new(), r(1, u64::MAX)),
+                _ => (format!("{k}"), r(k, k)),
+            }
+        }
+
         fn materialize(spec: &Spec, v: &Vocabulary) -> Q {
             match spec {
                 Spec::Not(s) => Q::Not(Box::new(materialize(s, v))),
                 Spec::And(items) => Q::And(items.iter().map(|s| materialize(s, v)).collect()),
                 Spec::Or(items) => Q::Or(items.iter().map(|s| materialize(s, v)).collect()),
+                Spec::Prefixed(p, s) => {
+                    let p = [
+                        P::Case(true),
+                        P::Case(false),
+                        P::Path(true),
+                        P::Path(false),
+                        P::Ww,
+                        P::Prefix,
+                        P::Suffix,
+                        P::Whole,
+                        P::StartWith,
+                        P::EndWith,
+                        P::NoPunc,
+                        P::NoWs,
+                        P::File,
+                        P::Folder,
+                        P::Dir,
+                        P::NoFile,
+                        P::NoFolder,
+                    ][*p as usize];
+                    Q::Prefixed(p, Box::new(materialize(s, v)))
+                }
+                Spec::Leaf(15, ..) => Q::Empty,
                 Spec::Leaf(kind, pick, a, b, flip, n) => {
                     let name = pick.get(&v.names);
                     let path = pick.get(&v.paths);
-                    match kind {
-                        0 => {
-                            let text = flip_case(cut(name, *a, *b), *flip);
-                            Q::Word(if text.is_empty() { "a".into() } else { text })
-                        }
+                    let nonempty = |s: String| if s.is_empty() { "a".to_string() } else { s };
+                    Q::Leaf(match kind {
+                        0 => L::Text(nonempty(flip_case(cut(name, *a, *b), *flip))),
+                        // With its punctuation and spaces dropped, which only
+                        // a skip (`nopunc:`, `nows:`) finds again.
                         1 => {
-                            let text = flip_case(cut(path, *a, *b), *flip);
-                            let text = if text.is_empty() { "a".into() } else { text };
-                            Q::Path {
-                                prefixed: !text.contains('\\'),
-                                text,
-                            }
+                            let text: String = flip_case(cut(name, *a, *b), *flip)
+                                .chars()
+                                .filter(|&c| word(c) || (n % 2 == 0 && c.is_whitespace()))
+                                .collect();
+                            L::Text(nonempty(text))
                         }
-                        2 => {
-                            let mut text =
-                                wild(&flip_case(name, *flip).chars().collect::<Vec<_>>(), *n);
-                            if text.contains("**") {
-                                text = text.replace("**", "*");
-                            }
-                            Q::Glob(text)
-                        }
+                        2 => L::Text(nonempty(flip_case(cut(path, *a, *b), *flip))),
                         3 => {
-                            // The last `k + 1` parts, or the whole path, with
-                            // wildcards, maybe a `**` part, maybe a separator
-                            // in front or behind.
+                            let text = wild(&chars(&flip_case(name, *flip)), *n);
+                            L::Text(text.replace("**", "*"))
+                        }
+                        4 => {
+                            // The last `k + 1` parts, with wildcards, maybe a
+                            // `**` part, maybe a separator in front or behind.
                             let parts: Vec<String> = flip_case(path, *flip)
                                 .split('\\')
                                 .map(str::to_string)
                                 .collect();
-                            let k = (*n % 4) as usize;
-                            let from = if n % 7 == 0 {
-                                0
-                            } else {
-                                parts.len().saturating_sub(k + 1)
-                            };
-                            let mut parts: Vec<String> = parts[from..].to_vec();
+                            let k = (*n % 3) as usize;
+                            let mut parts: Vec<String> =
+                                parts[parts.len().saturating_sub(k + 1)..].to_vec();
                             if n % 5 == 0 && parts.len() > 2 {
                                 let mid = parts.len() / 2;
                                 parts[mid] = "**".into();
                             }
-                            let joined = parts.join("\\");
-                            let mut text =
-                                wild(&joined.chars().collect::<Vec<_>>(), n.rotate_left(17));
+                            let mut text = wild(&chars(&parts.join("\\")), n.rotate_left(17));
                             if n % 3 == 0 {
                                 text.push('\\');
-                            } else if n % 11 == 0 {
-                                text.insert(0, '\\');
                             }
-                            Q::SubGlob {
-                                prefixed: !text.contains('\\') && !text.contains("**"),
-                                text,
-                            }
-                        }
-                        4 => {
-                            let ext: String = name.iter().rposition(|&c| c == '.').map_or_else(
-                                || "x".to_string(),
-                                |dot| name[dot + 1..].iter().collect(),
-                            );
-                            let ext = flip_case(&ext.chars().collect::<Vec<_>>(), *flip);
-                            let mut values = vec![if n % 2 == 0 { format!(".{ext}") } else { ext }];
-                            if n % 3 == 0 {
-                                values.push("a".into());
-                            }
-                            // An empty value is S2's "no extension"; S1
-                            // leaves it out, as goz always has.
-                            values.retain(|v| !v.trim_start_matches('.').is_empty());
-                            if values.is_empty() {
-                                values = vec!["x".into()];
-                            }
-                            Q::Ext(values)
+                            L::Text(text)
                         }
                         5 => {
-                            let k = 1 + (n % 40);
-                            let m = k + (n >> 8) % 20;
-                            match (n >> 16) % 6 {
-                                0 => Q::Size(
-                                    format!(">{k}"),
-                                    SizeRange {
-                                        min: k + 1,
-                                        max: u64::MAX,
-                                    },
-                                ),
-                                1 => Q::Size(format!("<{k}"), SizeRange { min: 0, max: k - 1 }),
-                                2 => Q::Size(
-                                    format!(">={k}"),
-                                    SizeRange {
-                                        min: k,
-                                        max: u64::MAX,
-                                    },
-                                ),
-                                3 => Q::Size(format!("<={k}"), SizeRange { min: 0, max: k }),
-                                4 => Q::Size(format!("{k}..{m}"), SizeRange { min: k, max: m }),
-                                _ => Q::Size(format!("{k}"), SizeRange { min: k, max: k }),
+                            // Values from the name's extension, written the
+                            // ways Everything reads them.
+                            let lower: String = name.iter().collect();
+                            let ext = lower.rsplit_once('.').map_or("", |(_, e)| e);
+                            let two = lower
+                                .rsplitn(3, '.')
+                                .take(2)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            let ext = flip_case(&chars(ext), *flip);
+                            let mut values = vec![match n % 7 {
+                                0 => format!(".{ext}"),
+                                1 => format!("*.{ext}"),
+                                2 => String::new(),
+                                3 => format!("{}*", ext.chars().take(1).collect::<String>()),
+                                4 => "?".repeat(ext.chars().count().max(1)),
+                                5 => two,
+                                _ => ext,
+                            }];
+                            if (n >> 8) % 3 == 0 {
+                                values.push("b".into());
+                            }
+                            if (n >> 8) % 5 == 0 {
+                                values.push(String::new());
+                            }
+                            L::Ext(values)
+                        }
+                        6 => {
+                            let mut values = vec![size_value(*n)];
+                            if (n >> 24) % 3 == 0 {
+                                values.push(size_value(n.rotate_left(29)));
+                            }
+                            if (n >> 26) % 9 == 0 {
+                                L::SizeUnknown
+                            } else {
+                                L::Size(values)
                             }
                         }
-                        6 => Q::Kind(n % 2 == 0),
-                        _ => Q::Empty,
-                    }
+                        7 => {
+                            let f = [
+                                Part::Name,
+                                Part::Stem,
+                                Part::Extension,
+                                Part::FullPath,
+                                Part::Location,
+                                Part::ParentName,
+                            ][(n % 6) as usize];
+                            let from = if matches!(f, Part::Name | Part::Stem | Part::Extension) {
+                                name
+                            } else {
+                                path
+                            };
+                            let mut text = flip_case(cut(from, *a, *b), *flip);
+                            if (n >> 8) % 7 == 0 && !text.is_empty() {
+                                text = wild(&chars(&text), n.rotate_left(11));
+                            }
+                            L::Part(f, text)
+                        }
+                        8 => {
+                            let f = [
+                                LenFn::Len,
+                                LenFn::Name,
+                                LenFn::FullPath,
+                                LenFn::Location,
+                                LenFn::Extension,
+                            ][(n % 5) as usize];
+                            let k = (n >> 8) % 12;
+                            let m = k + (n >> 16) % 30;
+                            let r = |min, max| SizeRange { min, max };
+                            let (text, range) = match (n >> 24) % 4 {
+                                0 => (format!("{k}"), r(k, k)),
+                                1 => (format!(">{k}"), r(k + 1, u64::MAX)),
+                                2 => (format!("<={m}"), r(0, m)),
+                                _ => (format!("{k}..{m}"), r(k, m)),
+                            };
+                            L::Len(f, text, range)
+                        }
+                        9 => {
+                            // FILETIME values, exact to the tick.
+                            let t = *pick.get(&v.mtimes) as u64;
+                            let u = t + (n % 3) * ((n >> 8) % 5);
+                            let r = |min, max| SizeRange { min, max };
+                            let (text, range) = match (n >> 16) % 5 {
+                                0 => (format!("{t}"), r(t, t)),
+                                1 => (format!(">={t}"), r(t, u64::MAX)),
+                                2 => (format!("<{t}"), r(0, t - 1)),
+                                3 => (format!("{u}..{t}"), r(t, u)),
+                                _ => (format!("0x{t:x}"), r(t, t)),
+                            };
+                            L::Date(text, range)
+                        }
+                        10 => L::Drive(if n % 2 == 0 { 'C' } else { 'd' }),
+                        11 => L::Lone,
+                        12 | 13 if v.absolute && !v.folders.is_empty() => {
+                            let folded = pick.get(&v.folders).clone();
+                            let mut text = flip_case(&chars(&folded), *flip);
+                            if n % 3 == 0 {
+                                text.push('\\');
+                            }
+                            L::Folder(
+                                *kind == 13,
+                                text,
+                                crate::wtf8::to_string_lossy(&crate::fold::fold(folded.as_bytes())),
+                            )
+                        }
+                        14 => L::Macro,
+                        _ => L::Text(nonempty(flip_case(cut(name, *a, *b), *flip))),
+                    })
                 }
-            }
-        }
-
-        /// Keeps the first `file:`/`folder:`, `ext:` and `size:` and makes
-        /// the others words: a top-level `ext:` or `size:` still keeps its
-        /// last term, as it always has, which S2 replaces with AND.
-        fn one_filter_each(q: &mut Q, seen: &mut [bool; 3]) {
-            let slot = match q {
-                Q::Kind(_) => Some(0),
-                Q::Ext(_) => Some(1),
-                Q::Size(..) => Some(2),
-                Q::Not(inner) => {
-                    one_filter_each(inner, seen);
-                    None
-                }
-                Q::And(items) | Q::Or(items) => {
-                    items.iter_mut().for_each(|i| one_filter_each(i, seen));
-                    None
-                }
-                _ => None,
-            };
-            if let Some(slot) = slot {
-                if seen[slot] {
-                    *q = Q::Word("b".into());
-                }
-                seen[slot] = true;
             }
         }
 
@@ -5075,23 +5313,80 @@ mod tests {
             matches!(q, Q::And(_) | Q::Or(_))
         }
 
+        /// A value or search text as the query writes it: quoted when it
+        /// holds a space.
+        fn quoted(s: &str) -> String {
+            if s.contains(' ') {
+                format!("\"{s}\"")
+            } else {
+                s.to_string()
+            }
+        }
+
+        fn print_leaf(l: &L) -> String {
+            match l {
+                L::Text(s) => quoted(s),
+                L::Part(f, s) => {
+                    let f = match f {
+                        Part::Name => "name:",
+                        Part::Stem => "stem:",
+                        Part::Extension => "extension:",
+                        Part::FullPath => "full-path:",
+                        Part::Location => "location:",
+                        Part::ParentName => "parent-name:",
+                    };
+                    format!("{f}{}", quoted(s))
+                }
+                L::Ext(values) => {
+                    let v: Vec<String> = values.iter().map(|v| quoted(v)).collect();
+                    format!("ext:{}", v.join(";"))
+                }
+                L::Size(values) => {
+                    let v: Vec<&str> = values.iter().map(|(t, _)| t.as_str()).collect();
+                    format!("size:{}", v.join(";"))
+                }
+                L::SizeUnknown => "size:unknown".into(),
+                L::Len(f, text, _) => {
+                    let f = match f {
+                        LenFn::Len => "len:",
+                        LenFn::Name => "namelen:",
+                        LenFn::FullPath => "fullpathlen:",
+                        LenFn::Location => "path-part-length:",
+                        LenFn::Extension => "extlen:",
+                    };
+                    format!("{f}{text}")
+                }
+                L::Date(text, _) => format!("dm:{text}"),
+                L::Drive(d) => format!("{d}:"),
+                L::Lone => "\\".into(),
+                L::Folder(ancestor, text, _) => {
+                    let f = if *ancestor { "ancestor:" } else { "parent:" };
+                    format!("{f}{}", quoted(text))
+                }
+                L::Macro => "exe:".into(),
+            }
+        }
+
         /// The query text: every group bracketed, or only where Everything's
         /// precedence (OR binds tighter than AND, NOT tighter still) needs it.
+        /// An OR next to a numeric comparison is spaced, so that its `<`
+        /// stays a comparison rather than open a value group.
         fn print(q: &Q, minimal: bool) -> String {
             match q {
-                Q::Word(s) | Q::Glob(s) => s.clone(),
-                Q::Path { text, prefixed } | Q::SubGlob { text, prefixed } => {
-                    if *prefixed {
-                        format!("path:{text}")
-                    } else {
-                        text.clone()
-                    }
-                }
-                Q::Ext(values) => format!("ext:{}", values.join(";")),
-                Q::Size(text, _) => format!("size:{text}"),
-                Q::Kind(true) => "file:".into(),
-                Q::Kind(false) => "folder:".into(),
+                Q::Leaf(l) => print_leaf(l),
                 Q::Empty => "<>".into(),
+                Q::Prefixed(p, inner) => match &**inner {
+                    inner if is_composite(inner) => {
+                        format!("{}<{}>", p.text(), print(inner, minimal))
+                    }
+                    // `case:` alone is the whole-query switch, a goz
+                    // extension (DESIGN.md §3.1): over an empty term it is
+                    // written with an empty group.
+                    Q::Empty if matches!(p, P::Case(true)) => "case:<>".to_string(),
+                    // The prefix alone: white space ends it.
+                    Q::Empty => format!("{} ", p.text()),
+                    inner => format!("{}{}", p.text(), print(inner, minimal)),
+                },
                 Q::Not(inner) if is_composite(inner) => format!("!<{}>", print(inner, minimal)),
                 Q::Not(inner) => format!("!{}", print(inner, minimal)),
                 Q::And(items) => {
@@ -5110,10 +5405,15 @@ mod tests {
                             _ => print(i, minimal),
                         })
                         .collect();
-                    if minimal {
-                        text.join("|")
+                    let sep = if text.iter().any(|t| t.contains(":<") || t.ends_with(' ')) {
+                        " | "
                     } else {
-                        format!("<{}>", text.join("|"))
+                        "|"
+                    };
+                    if minimal {
+                        text.join(sep)
+                    } else {
+                        format!("<{}>", text.join(sep))
                     }
                 }
             }
@@ -5121,60 +5421,290 @@ mod tests {
 
         /// The entry as the reference reads it.
         struct Seen {
-            name: Vec<u8>,
+            name: String,
+            /// The full path as typed.
             full: String,
             is_dir: bool,
             size: Option<u64>,
+            mtime: Option<i64>,
+            /// The parent folder's full path, folded, and every ancestor's.
+            parent: String,
+            ancestors: Vec<String>,
+            prefix: String,
         }
 
-        fn holds(hay: &[u8], needle: &[u8]) -> bool {
-            needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
+        /// The modifiers a term has, the outermost set first.
+        #[derive(Clone, Copy, Default)]
+        struct Ctx {
+            case: Option<bool>,
+            path: Option<bool>,
+            ww: Option<bool>,
+            prefix: Option<bool>,
+            suffix: Option<bool>,
+            whole: Option<bool>,
+            start: Option<bool>,
+            end: Option<bool>,
+            punct: Option<bool>,
+            space: Option<bool>,
+            folder: bool,
+        }
+
+        fn word(c: char) -> bool {
+            c.is_alphanumeric() || unicode_normalization::char::is_combining_mark(c)
+        }
+
+        /// Whether `needle` stands in `hay` where `ctx` says: at each
+        /// placement of its characters at positions `p0 < p1 < ...`, only
+        /// characters a skip allows lie between them, and the anchors hold.
+        fn holds_at(hay: &[char], needle: &[char], ctx: Ctx) -> bool {
+            let on = |o: Option<bool>| o == Some(true);
+            let skippable = |c: char| {
+                (on(ctx.punct) && !word(c) && !c.is_whitespace())
+                    || (on(ctx.space) && c.is_whitespace())
+            };
+            let (start, end) = (on(ctx.whole) || on(ctx.start), on(ctx.whole) || on(ctx.end));
+            let (ws, we) = (on(ctx.ww) || on(ctx.prefix), on(ctx.ww) || on(ctx.suffix));
+            fn place(
+                hay: &[char],
+                needle: &[char],
+                k: usize,
+                from: usize,
+                skippable: &dyn Fn(char) -> bool,
+                done: &mut dyn FnMut(usize) -> bool,
+            ) -> bool {
+                if k == needle.len() {
+                    return done(from);
+                }
+                for p in from..hay.len() {
+                    if hay[p] == needle[k] && place(hay, needle, k + 1, p + 1, skippable, done) {
+                        return true;
+                    }
+                    if !skippable(hay[p]) {
+                        return false;
+                    }
+                }
+                false
+            }
+            (0..hay.len()).any(|s| {
+                hay[s] == needle[0]
+                    && (!start || hay[..s].iter().all(|&c| skippable(c)))
+                    && (!ws || s == 0 || !word(hay[s - 1]))
+                    && place(hay, needle, 1, s + 1, &skippable, &mut |after| {
+                        (!end || hay[after..].iter().all(|&c| skippable(c)))
+                            && (!we || after == hay.len() || !word(hay[after]))
+                    })
+            })
+        }
+
+        fn fold_str(s: &str) -> String {
+            crate::wtf8::to_string_lossy(&crate::fold::fold(s.as_bytes()))
+        }
+
+        fn utf16(s: &str) -> u64 {
+            s.encode_utf16().count() as u64
+        }
+
+        /// The location of a full path: up to its last separator.
+        fn location(full: &str) -> &str {
+            full.rfind('\\').map_or("", |i| &full[..i])
+        }
+
+        /// A name's stem, extension (`None` for a folder or a name with no
+        /// dot), as Everything parts them.
+        fn stem(e: &Seen) -> &str {
+            match e.name.rfind('.') {
+                Some(dot) if !e.is_dir => &e.name[..dot],
+                _ => &e.name,
+            }
+        }
+
+        fn extension(e: &Seen) -> Option<&str> {
+            (!e.is_dir)
+                .then(|| e.name.rfind('.').map(|dot| &e.name[dot + 1..]))
+                .flatten()
         }
 
         /// Whether `q` matches the entry, worked out plainly. `case`: the
         /// query matches case.
-        fn eval(q: &Q, e: &Seen, case: bool) -> bool {
-            let fold = |b: &[u8]| {
-                if case {
-                    b.to_vec()
-                } else {
-                    crate::fold::fold(b)
-                }
-            };
-            let chars = |b: &[u8]| {
-                String::from_utf8(b.to_vec())
-                    .unwrap()
-                    .chars()
-                    .collect::<Vec<char>>()
-            };
+        fn eval(q: &Q, e: &Seen, case: bool, ctx: Ctx) -> bool {
             match q {
-                Q::Word(s) => holds(&fold(&e.name), &fold(s.as_bytes())),
-                Q::Path { text, .. } => {
-                    holds(e.full.as_bytes(), &fold(text.replace('/', "\\").as_bytes()))
+                Q::Not(inner) => !eval(inner, e, case, ctx),
+                Q::And(items) => items.iter().all(|i| eval(i, e, case, ctx)),
+                Q::Or(items) => items.iter().any(|i| eval(i, e, case, ctx)),
+                Q::Prefixed(p, inner) => {
+                    let mut c = ctx;
+                    let set = |slot: &mut Option<bool>, on: bool| {
+                        slot.get_or_insert(on);
+                    };
+                    match p {
+                        P::Case(on) => set(&mut c.case, *on),
+                        P::Path(on) => set(&mut c.path, *on),
+                        P::Ww => set(&mut c.ww, true),
+                        P::Prefix => set(&mut c.prefix, true),
+                        P::Suffix => set(&mut c.suffix, true),
+                        P::Whole => set(&mut c.whole, true),
+                        P::StartWith => set(&mut c.start, true),
+                        P::EndWith => set(&mut c.end, true),
+                        P::NoPunc => set(&mut c.punct, true),
+                        P::NoWs => set(&mut c.space, true),
+                        // ANDed with what follows.
+                        P::File | P::NoFolder => return !e.is_dir && eval(inner, e, case, ctx),
+                        P::Dir => return e.is_dir && eval(inner, e, case, ctx),
+                        // Carried down to every term below.
+                        P::Folder | P::NoFile => c.folder = true,
+                    }
+                    eval(inner, e, case, c)
                 }
-                Q::Glob(p) => {
-                    reference_match(&chars(&fold(p.as_bytes())), &chars(&fold(&e.name)), false)
+                Q::Empty => {
+                    let whole = ctx.whole == Some(true)
+                        || (ctx.start == Some(true) && ctx.end == Some(true));
+                    (!ctx.folder || e.is_dir) && !whole
                 }
-                Q::SubGlob { text, .. } => {
-                    let pattern = String::from_utf8(fold(text.as_bytes())).unwrap();
-                    reference_sub_path(&pattern, &e.full)
+                Q::Leaf(l) => (!ctx.folder || e.is_dir) && eval_leaf(l, e, case, ctx),
+            }
+        }
+
+        fn eval_leaf(l: &L, e: &Seen, case: bool, ctx: Ctx) -> bool {
+            let case = ctx.case.unwrap_or(case);
+            let fold = |s: &str| if case { s.to_string() } else { fold_str(s) };
+            match l {
+                L::Lone => e.is_dir,
+                L::Drive(d) if ctx.path != Some(false) => {
+                    e.prefix
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(d))
+                        && e.prefix.as_bytes().get(1) == Some(&b':')
                 }
-                Q::Ext(values) => {
-                    let Some(dot) = e.name.iter().rposition(|&b| b == b'.') else {
+                L::Drive(d) => fold(&e.name).contains(&fold(&format!("{d}:"))),
+                // A separator alone keeps folders; a letter and a colon is a
+                // drive, unless `nopath:` keeps the term on the name.
+                L::Text(t) if t == "\\" || t == "/" => e.is_dir,
+                L::Text(t)
+                    if ctx.path != Some(false)
+                        && t.len() == 2
+                        && t.as_bytes()[0].is_ascii_alphabetic()
+                        && t.as_bytes()[1] == b':' =>
+                {
+                    eval_leaf(&L::Drive(t.as_bytes()[0] as char), e, case, ctx)
+                }
+                L::Text(t) => {
+                    let t = t.replace('/', "\\");
+                    let wildcard = t.contains(['*', '?']);
+                    let path = ctx
+                        .path
+                        .unwrap_or(t.contains('\\') || (wildcard && t.contains("**")));
+                    if wildcard {
+                        if path {
+                            reference_sub_path(&fold(&t), &fold(&e.full))
+                        } else {
+                            reference_match(&chars(&fold(&t)), &chars(&fold(&e.name)), false)
+                        }
+                    } else {
+                        let hay = if path { &e.full } else { &e.name };
+                        holds_at(&chars(&fold(hay)), &chars(&fold(&t)), ctx)
+                    }
+                }
+                L::Part(f, v) => {
+                    let full = e.full.as_str();
+                    let target: Option<&str> = match f {
+                        Part::Name => Some(&e.name),
+                        Part::Stem => Some(stem(e)),
+                        Part::Extension => extension(e),
+                        Part::FullPath => Some(full),
+                        Part::Location => Some(location(full)),
+                        Part::ParentName => {
+                            let loc = location(full);
+                            Some(loc.rfind('\\').map_or(loc, |i| &loc[i + 1..]))
+                        }
+                    };
+                    let Some(target) = target else {
                         return false;
                     };
-                    let ext = crate::fold::fold(&e.name[dot + 1..]);
-                    values
-                        .iter()
-                        .map(|v| crate::fold::fold(v.trim_start_matches('.').as_bytes()))
-                        .any(|v| v == ext)
+                    let v = if *f == Part::FullPath || *f == Part::Location {
+                        v.replace('/', "\\")
+                    } else {
+                        v.clone()
+                    };
+                    if v.is_empty() {
+                        return matches!(
+                            f,
+                            Part::Name | Part::FullPath | Part::Location | Part::ParentName
+                        ) || !target.is_empty();
+                    }
+                    if v.contains(['*', '?']) {
+                        if *f == Part::FullPath {
+                            reference_sub_path(&fold(&v), &fold(target))
+                        } else {
+                            reference_match(&chars(&fold(&v)), &chars(&fold(target)), false)
+                        }
+                    } else {
+                        holds_at(&chars(&fold(target)), &chars(&fold(&v)), ctx)
+                    }
                 }
-                Q::Size(_, range) => e.size.is_some_and(|s| range.contains(s)),
-                Q::Kind(file) => e.is_dir != *file,
-                Q::Empty => true,
-                Q::Not(inner) => !eval(inner, e, case),
-                Q::And(items) => items.iter().all(|i| eval(i, e, case)),
-                Q::Or(items) => items.iter().any(|i| eval(i, e, case)),
+                L::Ext(values) => {
+                    if e.is_dir {
+                        return false;
+                    }
+                    let case = ctx.case.unwrap_or(false);
+                    let fold = |s: &str| if case { s.to_string() } else { fold_str(s) };
+                    let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
+                    while values.len() > 1 && values.last() == Some(&"") {
+                        values.pop();
+                    }
+                    let values: Vec<&str> = values
+                        .iter()
+                        .map(|v| {
+                            v.strip_prefix("*.")
+                                .or_else(|| v.strip_prefix('.'))
+                                .unwrap_or(v)
+                        })
+                        .collect();
+                    let name = fold(&e.name);
+                    values.iter().any(|v| {
+                        let v = fold(v);
+                        if v.is_empty() {
+                            !name.contains('.')
+                        } else if v.contains(['*', '?']) {
+                            let ext = name.rsplit_once('.').map_or("", |(_, x)| x);
+                            reference_match(&chars(&v), &chars(ext), false)
+                        } else {
+                            name.ends_with(&format!(".{v}"))
+                        }
+                    })
+                }
+                L::Size(values) => {
+                    !e.is_dir
+                        && e.size
+                            .is_some_and(|s| values.iter().any(|(_, r)| r.contains(s)))
+                }
+                L::SizeUnknown => !e.is_dir && e.size.is_none(),
+                L::Len(f, _, range) => {
+                    let len = match f {
+                        LenFn::Len if ctx.path == Some(true) => Some(utf16(&e.full)),
+                        LenFn::Len | LenFn::Name => Some(utf16(&e.name)),
+                        LenFn::FullPath => Some(utf16(&e.full)),
+                        LenFn::Location => Some(utf16(location(&e.full))),
+                        LenFn::Extension if e.is_dir => None,
+                        LenFn::Extension => Some(extension(e).map_or(0, utf16)),
+                    };
+                    len.is_some_and(|l| range.contains(l))
+                }
+                L::Date(_, range) => e.mtime.is_some_and(|t| t >= 0 && range.contains(t as u64)),
+                L::Folder(false, _, folded) => e.parent == *folded,
+                L::Folder(true, _, folded) => e.ancestors.contains(folded),
+                // `exe:` alone: its extensions, and an empty term, which
+                // under `whole:` matches nothing.
+                L::Macro => {
+                    !(ctx.whole == Some(true) || (ctx.start == Some(true) && ctx.end == Some(true)))
+                        && !e.is_dir
+                        && fold_str(&e.name).rsplit_once('.').is_some_and(|(_, x)| {
+                            [
+                                "bat", "cmd", "exe", "msi", "msp", "msu", "ps1", "scr", "vbs",
+                            ]
+                            .contains(&x)
+                        })
+                }
             }
         }
 
@@ -5212,17 +5742,35 @@ mod tests {
             keyed.into_iter().map(|(_, e)| e).collect()
         }
 
+        /// The folded full path of a folder, as `parent:` names it: the
+        /// prefix, its separator dropped, for the root.
+        fn folder_path(idx: &VolumeIndex, dir: EntryIdx, prefix: &str) -> Option<String> {
+            let full = if dir == idx.root() {
+                prefix.trim_end_matches('\\').as_bytes().to_vec()
+            } else {
+                slow_full_path(idx, dir, prefix, false)?
+            };
+            Some(fold_str(&String::from_utf8(full).ok()?))
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(1024))]
 
             #[test]
-            fn boolean_queries_agree_with_a_naive_evaluator(
+            fn queries_agree_with_a_naive_evaluator(
                 nodes in prop::collection::vec(
-                    (any::<Index>(), "[aAbBé.]{1,4}", any::<bool>()),
+                    (
+                        any::<Index>(),
+                        "[aAbBé. _-]{1,4}(\\.(exe|txt|TXT|bat|a))?",
+                        any::<bool>(),
+                    ),
                     1..30,
                 ),
                 orphans in prop::collection::vec("[aAbB]{1,3}", 0..3),
-                stats in prop::collection::vec(prop::option::of((0u64..40, 1i64..40)), 30),
+                stats in prop::collection::vec(
+                    prop::option::of((prop_oneof![0u64..40, 1000u64..2100], 0i64..40)),
+                    30,
+                ),
                 shape in spec(),
                 mount in 0usize..5,
                 case in prop::bool::weighted(0.15),
@@ -5233,51 +5781,88 @@ mod tests {
                 limit in prop::option::of(0u32..8),
             ) {
                 let (mut idx, entries) = random_tree(&nodes, &orphans, padded);
+                // FILETIMEs of nine digits and more, which `dm:` reads as
+                // ticks.
+                const T0: i64 = 1_000_000_000;
                 for (i, stat) in stats.iter().enumerate().take(nodes.len()) {
                     if let Some((size, mtime)) = stat {
-                        idx.set_stat(frn(1000 + i as u64), *size, *mtime);
+                        idx.set_stat(frn(1000 + i as u64), *size, T0 + *mtime);
                     }
                 }
                 if ordered {
                     idx.optimize_storage();
                 }
-                let prefix = [r"C:\", r"C:\", r"C:\Mnt\aB\", r"C:\Mnt\aB\", "C:"][mount];
+                let prefix = [r"C:\", r"C:\", r"C:\Mnt\aB\", r"D:\Mnt\aB\", "C:"][mount];
+                let typed = |e: EntryIdx| {
+                    slow_full_path(&idx, e, prefix, false).map(|p| String::from_utf8(p).unwrap())
+                };
                 let vocabulary = Vocabulary {
                     names: entries
                         .iter()
                         .map(|&e| String::from_utf8(idx.entry(e).name().to_vec()).unwrap().chars().collect())
                         .collect(),
-                    paths: entries
+                    paths: entries.iter().filter_map(|&e| typed(e)).map(|p| p.chars().collect()).collect(),
+                    folders: std::iter::once(idx.root())
+                        .chain(entries.iter().copied().filter(|&e| idx.entry(e).is_dir()))
+                        .filter_map(|d| {
+                            if d == idx.root() {
+                                Some(prefix.trim_end_matches('\\').to_string())
+                            } else {
+                                typed(d)
+                            }
+                        })
+                        .collect(),
+                    absolute: prefix.ends_with('\\'),
+                    mtimes: entries
                         .iter()
-                        .filter_map(|&e| slow_full_path(&idx, e, prefix, false))
-                        .map(|p| String::from_utf8(p).unwrap().chars().collect())
+                        .filter_map(|&e| idx.entry(e).mtime())
+                        .chain([T0 + 5])
                         .collect(),
                 };
                 prop_assume!(!vocabulary.paths.is_empty());
-                let mut q = materialize(&shape, &vocabulary);
-                one_filter_each(&mut q, &mut [false; 3]);
+                let q = materialize(&shape, &vocabulary);
                 let mut text = print(&q, minimal);
                 if case {
                     text.push_str(" case:");
                 }
-                let parsed = parse_query(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+                let clock = FixedClock::utc(T0);
+                let parsed = crate::query::parse_query_at(&text, false, &clock)
+                    .unwrap_or_else(|e| panic!("{text}: {e}"));
                 // Brackets where precedence needs none change nothing.
                 let other = print(&q, !minimal) + if case { " case:" } else { "" };
-                prop_assert_eq!(&parse_query(&other).unwrap(), &parsed, "{} vs {}", text, other);
+                prop_assert_eq!(
+                    &crate::query::parse_query_at(&other, false, &clock).unwrap(),
+                    &parsed,
+                    "{} vs {}",
+                    text,
+                    other
+                );
 
                 let mut found: Vec<EntryIdx> = Vec::new();
                 for e in idx.live_entries().filter(|&e| !idx.is_synthetic(e)) {
-                    let Some(full) = slow_full_path(&idx, e, prefix, !case) else {
+                    let Some(full) = typed(e) else {
                         continue;
                     };
                     let entry = idx.entry(e);
+                    let mut ancestors = Vec::new();
+                    let mut cur = entry.parent();
+                    while cur != NIL {
+                        if let Some(p) = folder_path(&idx, cur, prefix) {
+                            ancestors.push(p);
+                        }
+                        cur = idx.entry(cur).parent();
+                    }
                     let seen = Seen {
-                        name: entry.name().to_vec(),
-                        full: String::from_utf8(full).unwrap(),
+                        name: String::from_utf8(entry.name().to_vec()).unwrap(),
+                        full,
                         is_dir: entry.is_dir(),
                         size: entry.size(),
+                        mtime: entry.mtime(),
+                        parent: ancestors.first().cloned().unwrap_or_default(),
+                        ancestors,
+                        prefix: prefix.to_string(),
                     };
-                    if eval(&q, &seen, case) {
+                    if eval(&q, &seen, case, Ctx::default()) {
                         found.push(e);
                     }
                 }

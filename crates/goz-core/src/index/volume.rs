@@ -598,12 +598,25 @@ impl VolumeIndex {
     /// real folded name, so a collision costs one extra compare, never a
     /// wrong directory.
     pub fn child_dir(&self, parent: EntryIdx, folded_name: Vec<u8>) -> Option<EntryIdx> {
-        let key = (parent, dir_key_hash(&folded_name));
-        let cands = self.dir_children.get(&key)?;
-        cands
-            .iter()
+        self.child_dirs(parent, &folded_name).next()
+    }
+
+    /// Every child directory of `parent` whose folded name is `folded_name`:
+    /// more than one only where siblings differ by case alone, which a
+    /// case-sensitive NTFS directory allows. A case-insensitive path names
+    /// them all.
+    pub(crate) fn child_dirs<'a>(
+        &'a self,
+        parent: EntryIdx,
+        folded_name: &'a [u8],
+    ) -> impl Iterator<Item = EntryIdx> + 'a {
+        let key = (parent, dir_key_hash(folded_name));
+        self.dir_children
+            .get(&key)
+            .into_iter()
+            .flatten()
             .copied()
-            .find(|&d| self.folded_name(d) == folded_name.as_slice())
+            .filter(move |&d| self.folded_name(d) == folded_name)
     }
 
     /// Read access to a live entry's fields (for the query engine / tests).

@@ -18,25 +18,40 @@
 //! matches the whole name; a path wildcard matches the end of the full path,
 //! whole part by whole part, its `*` and `?` stopping at `\` and its `**`
 //! not (see the `glob` module); so does a wildcard with `**`, wherever it
-//! stands. The functions `ext:`, `size:` and `dm:` filter
-//! on the extension, size and date modified; `file:` and `folder:` (and
-//! `dir:`) on the kind, and prefix a term or a group like `path:` does. `case:`
-//! and `matchpath:` switch the whole query. An unknown `func:` is refused:
-//! as text it could match nothing, since no name contains `:`.
+//! stands. `d:` alone is everything on drive D:, and `\` alone every
+//! folder.
+//!
+//! Search modifiers prefix a term or a group and say how its text matches:
+//! `case:`, `path:`, `ww:` (whole words), `prefix:` and `suffix:` (word
+//! starts and ends), `whole:`, `startwith:`, `endwith:`, `nopunc:` and
+//! `nows:` (skip punctuation or white space in the name), `starall:`,
+//! `nowildcards:`, `metric:`, each with Everything's aliases and `no`
+//! forms; the outermost of two that disagree wins, and `?mod:` sets one for
+//! the rest of the search. `file:` and `folder:` (and `dir:`) keep files or
+//! folders. Functions test what the name alone does not hold: `ext:`,
+//! `extension:`, `size:`, `dm:`, the lengths (`len:`, ...), `parent:`,
+//! `ancestor:`, and the parts of a full path (`name:`, `stem:`,
+//! `full-path:`, `location:`, `parent-name:`); a function's value may be a
+//! `;` list (any one matches) or a group (`ext:<pdf|txt>`). The macros
+//! `audio:`, `zip:`, `doc:`, `exe:`, `image:` (`pic:`) and `video:` keep
+//! the files of Everything's own filters. `case:` and `matchpath:` with no
+//! text switch the whole query. An unknown `func:` is refused: as text it
+//! could match nothing, since no name contains `:`.
 //!
 //! The parser builds an [`Expr`]; the lowering in the `expr` module then
 //! moves the top-level terms the buckets of [`ParsedQuery`] hold into them,
 //! so that a query with no new syntax is exactly the query goz has always
 //! built.
 //!
-//! Terms are folded at parse time when the query is case-insensitive, so the
-//! engine compares candidate data (folded iff `!match_case`) against
-//! ready-to-use needles. A `dm:` value is resolved here too, to FILETIME
-//! bounds, against the [`LocalClock`] the query is parsed with.
+//! Terms are folded at parse time unless they match case, so the engine
+//! compares candidate data against ready-to-use needles. A `dm:` value is
+//! resolved here too, to FILETIME bounds, against the [`LocalClock`] the
+//! query is parsed with.
 
 use super::dates::{DateFilter, LocalClock, date_filter};
-use super::expr::{self, Expr, Leaf, Target};
-use super::lex::{self, Prefix, Text, Tok, Token};
+use super::expr::{self, Anchors, Expr, Leaf, LenOf, Skip, Target};
+use super::lex::{self, Func, Macro, ModSet, Prefix, Text, Tok, Token};
+use super::value::{self, Number};
 use crate::fold::fold;
 
 pub use super::glob::{CodePointBuf, Wildcard};
@@ -63,7 +78,8 @@ impl SizeRange {
 /// Non-text filters extracted from functions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filters {
-    /// Extensions to accept (folded, no leading dot). Empty `Vec` never
+    /// The extensions a file may have, folded, each naming its name's last
+    /// dot-separated parts (`tar.gz`); folders have none. Empty `Vec` never
     /// occurs: absence is `None`.
     pub ext: Option<Vec<Vec<u8>>>,
     pub size: Option<SizeRange>,
@@ -88,10 +104,10 @@ pub struct ParsedQuery {
     pub path_wildcards: Vec<Wildcard>,
     pub filters: Filters,
     pub match_case: bool,
-    /// What the buckets cannot hold: an OR, a NOT, a group or a filter inside
-    /// one, as an expression ANDed with the buckets. `None` for a query of
-    /// terms that must all match, which is every query goz read before it
-    /// had operators.
+    /// What the buckets cannot hold: an OR, a NOT, a group, a term with a
+    /// modifier, a second filter, as an expression ANDed with the buckets.
+    /// `None` for a query of terms that must all match, which is every query
+    /// goz read before it had operators.
     pub expr: Option<Expr>,
 }
 
@@ -118,7 +134,11 @@ pub enum QueryError {
     /// A `func:` goz does not know, carried with its colon. Searching it as text
     /// would match nothing, since no name contains `:`.
     #[error(
-        "unknown search function '{0}'; goz supports ext:, size:, dm:, path:, file:, folder:, dir:, case: and matchpath:"
+        "unknown search function or modifier '{0}'; goz supports ext:, extension:, size:, dm:, \
+         len:, parent:, ancestor:, name:, stem:, full-path:, location:, parent-name:, the macros \
+         audio:, zip:, doc:, exe:, image: and video:, and the modifiers case:, path:, file:, \
+         folder:, ww:, prefix:, suffix:, whole:, startwith:, endwith:, nopunc:, nows:, starall:, \
+         nowildcards: and metric: (each with Everything's aliases and no- forms), and matchpath:"
     )]
     UnknownFunction(String),
     /// A `dm:` term in a query parsed without a [`LocalClock`] to resolve it.
@@ -162,15 +182,15 @@ const MAX_QUERY_TERMS: usize = 256;
 pub(crate) const MAX_DEPTH: usize = 64;
 
 /// How many terms `q` holds, as [`MAX_QUERY_TERMS`] counts them: name and path
-/// terms, wildcards and `ext:` values, since each costs a candidate one test,
-/// and each term of the expression. A top-level `size:`, `dm:` or kind filter
-/// costs the same whatever its value.
+/// terms and wildcards, since each costs a candidate one test, and each term
+/// of the expression. A top-level `ext:`, `size:`, `dm:` or kind filter
+/// costs one test whatever its value, and an `ext:` list is one lookup.
 fn term_count(q: &ParsedQuery) -> usize {
     q.name_terms.len()
         + q.path_terms.len()
         + q.wildcards.len()
         + q.path_wildcards.len()
-        + q.filters.ext.as_ref().map_or(0, Vec::len)
+        + usize::from(q.filters.ext.is_some())
         + q.expr.as_ref().map_or(0, expr::leaf_terms)
 }
 
@@ -213,13 +233,10 @@ fn parse(
         at: 0,
         depth: 0,
         match_case,
+        match_path: lexed.match_path.unwrap_or(false),
         clock,
     };
-    let top = Mods {
-        path: lexed.match_path.unwrap_or(false),
-        folder: false,
-    };
-    let e = parser.expr(0, top)?;
+    let e = parser.expr(0, Mods::default())?;
     if let Some(stray) = parser.peek() {
         // Only a `>` with no group to close stops the top level.
         return Err(QueryError::Unbalanced {
@@ -245,12 +262,15 @@ fn parse(
 }
 
 /// What the prefixes around a term set for it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Mods {
-    /// `path:`, or the `matchpath:` directive: text matches the full path.
-    path: bool,
+    /// The modifiers, the outermost set first.
+    set: ModSet,
     /// `folder:`: the term matches folders only.
     folder: bool,
+    /// Inside a function's value group (`ext:<pdf|txt>`): the function
+    /// whose values the group's text is.
+    func: Option<Func>,
 }
 
 /// The binary operators.
@@ -269,6 +289,8 @@ struct Parser<'t, 'c> {
     /// The groups and prefixes open around the token at `at`.
     depth: usize,
     match_case: bool,
+    /// The `matchpath:` directive.
+    match_path: bool,
     clock: Option<&'c dyn LocalClock>,
 }
 
@@ -331,16 +353,16 @@ impl<'t> Parser<'t, '_> {
     /// everything (`foo|`, `|foo`, `<>`).
     fn operand(&mut self, mods: Mods) -> Result<Expr, QueryError> {
         let Some(t) = self.peek() else {
-            return Ok(empty(mods));
+            return self.empty(mods);
         };
         match &t.kind {
-            Tok::Or | Tok::And | Tok::Close => Ok(empty(mods)),
+            Tok::Or | Tok::And | Tok::Close => self.empty(mods),
             Tok::Not => self.negation(mods),
             Tok::Open => self.group(mods),
             Tok::Prefix(prefix) => self.prefixed(*prefix, mods),
             Tok::Text(text) => {
                 self.at += 1;
-                self.text(text, mods)
+                self.text(t, text, mods)
             }
         }
     }
@@ -354,7 +376,7 @@ impl<'t> Parser<'t, '_> {
             self.at += 1;
             nots += 1;
             if !self.joined() {
-                break empty(mods);
+                break self.empty(mods)?;
             }
             if self.peek().is_some_and(|t| t.kind == Tok::Not) {
                 continue;
@@ -384,17 +406,22 @@ impl<'t> Parser<'t, '_> {
 
     /// A prefix and what it applies to.
     ///
-    /// `path:` and `folder:` are modifiers that reach every term below them,
-    /// through NOTs and groups: `folder:!temp` is `!folder:temp`, matching
-    /// every file and every folder not named temp. `file:` and `dir:` are
-    /// filters ANDed with what follows them: `file:!temp` matches the files
-    /// not named temp, and no folder. A live Everything 1.5 answers these
-    /// differently in just this way (DESIGN.md §2.1, the S1 battery).
+    /// Modifiers, `path:` and `folder:` among them, reach every term below
+    /// them, through NOTs and groups: `folder:!temp` is `!folder:temp`,
+    /// matching every file and every folder not named temp. `file:`, `dir:`
+    /// and the macros are filters ANDed with what follows them: `file:!temp`
+    /// matches the files not named temp, and no folder. A live Everything
+    /// 1.5 answers these differently in just this way (DESIGN.md §2.1, the
+    /// S1 battery).
     fn prefixed(&mut self, prefix: Prefix, mods: Mods) -> Result<Expr, QueryError> {
         self.at += 1;
         self.enter()?;
         let e = match prefix {
-            Prefix::Path => self.prefixed_operand(Mods { path: true, ..mods }),
+            Prefix::Mod(m, on) => {
+                let mut inner = mods;
+                inner.set.set_outer(m, on);
+                self.prefixed_operand(inner)
+            }
             Prefix::Folder => self.prefixed_operand(Mods {
                 folder: true,
                 ..mods
@@ -407,7 +434,8 @@ impl<'t> Parser<'t, '_> {
                 Expr::Leaf(Leaf::Kind(Kind::Folder)),
                 self.prefixed_operand(mods)?,
             )),
-            Prefix::Ext | Prefix::Size | Prefix::Date => self.function(prefix, mods),
+            Prefix::Macro(m) => Ok(Expr::and(macro_ext(m), self.prefixed_operand(mods)?)),
+            Prefix::Func(func) => self.function(func, mods),
         }?;
         self.depth -= 1;
         Ok(e)
@@ -419,241 +447,329 @@ impl<'t> Parser<'t, '_> {
         if self.joined() {
             self.operand(mods)
         } else {
-            Ok(empty(mods))
+            self.empty(mods)
         }
     }
 
-    /// A function's value, after its own `!`s, which negate it.
-    fn function(&mut self, prefix: Prefix, mods: Mods) -> Result<Expr, QueryError> {
+    /// A function's value, after its own `!`s, which negate it: its text,
+    /// or a group of values (`ext:<pdf|txt>`).
+    fn function(&mut self, func: Func, mods: Mods) -> Result<Expr, QueryError> {
         let mut nots = 0usize;
         while self.peek().is_some_and(|t| t.kind == Tok::Not) {
             self.at += 1;
             nots += 1;
         }
-        let Some(Token {
-            kind: Tok::Text(value),
-            ..
-        }) = self.peek()
-        else {
-            // The lexer reads a value after every function prefix.
-            return Err(QueryError::Malformed {
-                what: prefix.spelling(),
-                detail: "expected a value".to_string(),
-            });
+        let inner = Mods {
+            func: Some(func),
+            ..mods
         };
-        self.at += 1;
-        let value = &value.text;
-        let leaf = match prefix {
-            Prefix::Ext => {
-                let exts: Vec<Vec<u8>> = value
-                    .split(|&b| b == b';')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| fold(trim_dots(s)))
-                    .collect();
-                if exts.is_empty() {
-                    // `ext:` with no value filters nothing, as it never has.
-                    Expr::True
-                } else {
-                    Expr::Leaf(Leaf::Ext(exts))
-                }
+        let e = match self.peek() {
+            Some(t) if t.kind == Tok::Open && !t.spaced => self.group(inner)?,
+            Some(
+                t @ Token {
+                    kind: Tok::Text(value),
+                    ..
+                },
+            ) => {
+                self.at += 1;
+                self.value(func, value, t.global, mods)?
             }
-            Prefix::Size => Expr::Leaf(Leaf::Size(parse_size(&String::from_utf8_lossy(value))?)),
-            _ => Expr::Leaf(Leaf::Date(date_filter(
-                &String::from_utf8_lossy(value),
-                self.clock.ok_or(QueryError::NoClock)?,
-            )?)),
+            // The lexer reads a value or a value group after every function
+            // prefix.
+            _ => {
+                return Err(QueryError::Malformed {
+                    what: func.spelling(),
+                    detail: "expected a value".to_string(),
+                });
+            }
         };
-        let leaf = with_folder(leaf, mods);
-        Ok(if nots % 2 == 1 { leaf.not() } else { leaf })
+        Ok(if nots % 2 == 1 { e.not() } else { e })
     }
 
-    /// A text term: a name or path substring, or a name or sub-path wildcard.
-    ///
-    /// A term with a separator, or under `path:` or `matchpath:`, matches the
-    /// full path; `/` is a separator like `\`, since no name contains either.
-    /// `*` and `?` make a wildcard, in quotes too, as in Everything, unless an
-    /// `&ast:` or `&quest:` entity made them literal; a wildcard with `**`
-    /// matches sub-paths, as one with a separator does.
-    fn text(&self, text: &Text, mods: Mods) -> Result<Expr, QueryError> {
+    /// An empty term under `mods`: everything (or every folder under
+    /// `folder:`), but nothing under `whole:`, as no name is empty (L8:131,
+    /// while `startwith:` and `ww:` alone match everything, L8:133-134); or,
+    /// in a function's value group, the function's empty value
+    /// (`ext:<pdf|>`).
+    fn empty(&self, mods: Mods) -> Result<Expr, QueryError> {
+        self.empty_under(mods, ModSet::default())
+    }
+
+    /// [`Parser::empty`] under the `?mod:`s of `global` too.
+    fn empty_under(&self, mods: Mods, global: ModSet) -> Result<Expr, QueryError> {
+        match mods.func {
+            Some(func) => self.value(func, &Text::default(), global, mods),
+            None => {
+                let set = global.over(mods.set);
+                let whole = set.whole == Some(true)
+                    || (set.start_with == Some(true) && set.end_with == Some(true));
+                let e = if whole { Expr::False } else { Expr::True };
+                Ok(with_kind(e, mods, global))
+            }
+        }
+    }
+
+    /// A text token: a search term, or in a function's value group one of
+    /// the function's values.
+    fn text(&self, token: &Token, text: &Text, mods: Mods) -> Result<Expr, QueryError> {
+        if let Some(func) = mods.func {
+            return self.value(func, text, token.global, mods);
+        }
+        let set = token.global.over(mods.set);
         let bytes = &text.text;
         if bytes.is_empty() {
-            return Ok(empty(mods));
+            return self.empty_under(mods, token.global);
         }
-        let fold_term =
-            |s: &[u8]| -> Vec<u8> { if self.match_case { s.to_vec() } else { fold(s) } };
-        let wildcard = !text.literal_wild && bytes.iter().any(|&b| b == b'*' || b == b'?');
-        let is_path = mods.path
-            || bytes.iter().any(|&b| b == b'\\' || b == b'/')
-            || (wildcard && bytes.windows(2).any(|pair| pair == b"**"));
-        let leaf = if is_path {
-            let unslashed: Vec<u8> = bytes
+        let leaf = if is_lone_separator(bytes) {
+            // `\` or `/` alone is every folder (Everything's quick folder
+            // search), quoted or under any modifier, `path:` and `nopath:`
+            // included (L7:419-424, L8:102-108).
+            Leaf::Kind(Kind::Folder)
+        } else if set.path != Some(false)
+            && bytes.len() == 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+        {
+            // `d:` alone is everything on that drive.
+            Leaf::Drive(bytes[0].to_ascii_lowercase())
+        } else {
+            return Ok(with_kind(
+                self.term(None, bytes, text.literal_wild, set),
+                mods,
+                token.global,
+            ));
+        };
+        Ok(with_kind(Expr::Leaf(leaf), mods, token.global))
+    }
+
+    /// A text term on `target`, or, for `None`, search text: the name, or
+    /// the full path when it holds a separator, `path:` or `matchpath:` says
+    /// so, or it is a wildcard with `**`; `nopath:` keeps it on the name. `/`
+    /// is a separator like `\`, since no name contains either. `*` and `?`
+    /// make a wildcard, in quotes too, as in Everything, unless an `&ast:` or
+    /// `&quest:` entity or `nowildcards:` made them literal; a wildcard
+    /// matches the whole of its target, so the word and anchor modifiers do
+    /// not apply to it, as in Everything (`ww:ev*` is `ev*`).
+    fn term(&self, target: Option<Target>, bytes: &[u8], literal_wild: bool, set: ModSet) -> Expr {
+        let case = set.case.unwrap_or(self.match_case);
+        let wildcard = set.wildcards != Some(false)
+            && !literal_wild
+            && bytes.iter().any(|&b| b == b'*' || b == b'?');
+        let target = target.unwrap_or_else(|| {
+            let separator = bytes.iter().any(|&b| b == b'\\' || b == b'/');
+            let path = set.path.unwrap_or_else(|| {
+                self.match_path
+                    || separator
+                    || (wildcard && bytes.windows(2).any(|pair| pair == b"**"))
+            });
+            if path { Target::FullPath } else { Target::Name }
+        });
+        if bytes.is_empty()
+            && matches!(
+                target,
+                Target::Name | Target::FullPath | Target::Location | Target::ParentName
+            )
+        {
+            // Every entry has a name, a full path and a location, none
+            // empty, and an empty value matches any text but the empty one.
+            return Expr::True;
+        }
+        let unslashed: Vec<u8> = if matches!(target, Target::FullPath | Target::Location) {
+            bytes
                 .iter()
                 .map(|&b| if b == b'/' { b'\\' } else { b })
-                .collect();
-            let path = fold_term(&unslashed);
-            if wildcard {
-                Leaf::Glob(Wildcard::sub_path(&path))
+                .collect()
+        } else {
+            bytes.to_vec()
+        };
+        let text = if case { unslashed } else { fold(&unslashed) };
+        if wildcard {
+            let glob = if target == Target::FullPath {
+                Wildcard::sub_path(&text, set.star_all == Some(true))
             } else {
-                Leaf::Text {
-                    target: Target::FullPath,
-                    needle: path,
-                }
+                Wildcard::name(&text)
+            };
+            return Expr::Leaf(Leaf::Glob { target, glob, case });
+        }
+        let on = |o: Option<bool>| o == Some(true);
+        let words = on(set.whole_words);
+        Expr::Leaf(Leaf::Text {
+            target,
+            needle: text,
+            case,
+            anchors: Anchors {
+                start: on(set.whole) || on(set.start_with),
+                end: on(set.whole) || on(set.end_with),
+                word_start: words || on(set.word_start),
+                word_end: words || on(set.word_end),
+            },
+            skip: Skip {
+                punct: on(set.skip_punct),
+                space: on(set.skip_space),
+            },
+        })
+    }
+
+    /// A function's value: a `;` list of values any one of which matches,
+    /// under the modifiers of `global` (the `?mod:`s before it) over `mods`.
+    fn value(
+        &self,
+        func: Func,
+        text: &Text,
+        global: ModSet,
+        mods: Mods,
+    ) -> Result<Expr, QueryError> {
+        let set = global.over(mods.set);
+        let e = if func == Func::Ext {
+            ext_leaf(text, set)
+        } else {
+            let mut items = Vec::new();
+            for item in text.items() {
+                items.push(self.item(func, item, text.literal_wild, set)?);
             }
-        } else if wildcard {
-            Leaf::Glob(Wildcard::name(&fold_term(bytes)))
-        } else {
-            Leaf::Text {
-                target: Target::Name,
-                needle: fold_term(bytes),
+            items.into_iter().reduce(Expr::or).unwrap_or(Expr::False)
+        };
+        Ok(with_kind(e, mods, global))
+    }
+
+    /// One value of a function's list.
+    fn item(
+        &self,
+        func: Func,
+        item: &[u8],
+        literal_wild: bool,
+        set: ModSet,
+    ) -> Result<Expr, QueryError> {
+        let what = func.spelling();
+        let target = match func {
+            Func::Name => Target::Name,
+            Func::Stem => Target::Stem,
+            Func::FullPath => Target::FullPath,
+            Func::Location => Target::Location,
+            Func::ParentName => Target::ParentName,
+            Func::Extension => Target::Extension,
+            Func::Parent | Func::Ancestor => {
+                let path = value::folder_path(item, what)?;
+                return Ok(Expr::Leaf(if func == Func::Parent {
+                    Leaf::Parent(vec![path])
+                } else {
+                    Leaf::Ancestor(vec![path])
+                }));
+            }
+            // `value` reads an `ext:` list whole.
+            Func::Ext => return Ok(ext_leaf(&Text::default(), set)),
+            Func::Date => {
+                // A value's own `!` negates it, here as before the list.
+                let (nots, item) = bangs(item);
+                let leaf = Expr::Leaf(Leaf::Date(date_filter(
+                    &String::from_utf8_lossy(item),
+                    self.clock.ok_or(QueryError::NoClock)?,
+                )?));
+                return Ok(if nots % 2 == 1 { leaf.not() } else { leaf });
+            }
+            Func::Size
+            | Func::Len
+            | Func::NameLen
+            | Func::PathLen
+            | Func::LocationLen
+            | Func::ExtLen => {
+                let (nots, item) = bangs(item);
+                let s = String::from_utf8_lossy(item);
+                let leaf = if func == Func::Size {
+                    match value::number(&s, what, true, set.metric == Some(true))? {
+                        Number::Range(range) => Expr::Leaf(Leaf::Size(range)),
+                        Number::Unknown => Expr::Leaf(Leaf::SizeUnknown),
+                    }
+                } else {
+                    let of = match func {
+                        Func::NameLen => LenOf::Name,
+                        Func::PathLen => LenOf::FullPath,
+                        Func::LocationLen => LenOf::Location,
+                        Func::ExtLen => LenOf::Extension,
+                        // `len:` measures what a term would match: the full
+                        // path under `path:`.
+                        _ if set.path.unwrap_or(self.match_path) => LenOf::FullPath,
+                        _ => LenOf::Name,
+                    };
+                    match value::number(&s, what, false, false)? {
+                        Number::Range(range) => Expr::Leaf(Leaf::Len { of, range }),
+                        // A length is always known.
+                        Number::Unknown => Expr::False,
+                    }
+                };
+                return Ok(if nots % 2 == 1 { leaf.not() } else { leaf });
             }
         };
-        Ok(with_folder(Expr::Leaf(leaf), mods))
+        Ok(self.term(Some(target), item, literal_wild, set))
     }
 }
 
-/// An empty term under `mods`: everything, or every folder under `folder:`.
-fn empty(mods: Mods) -> Expr {
-    with_folder(Expr::True, mods)
+/// `item` without its leading `!`s, and how many there were.
+fn bangs(item: &[u8]) -> (usize, &[u8]) {
+    let n = item.iter().take_while(|&&b| b == b'!').count();
+    (n, &item[n..])
 }
 
-/// `e` restricted to folders when a `folder:` reaches it.
-fn with_folder(e: Expr, mods: Mods) -> Expr {
-    if mods.folder {
-        Expr::and(Expr::Leaf(Leaf::Kind(Kind::Folder)), e)
+/// Whether `bytes` is one separator, `\` or `/`.
+fn is_lone_separator(bytes: &[u8]) -> bool {
+    bytes == b"\\" || bytes == b"/"
+}
+
+/// The `ext:` term of `text`'s list: its values with their leading `.`s and
+/// `*`s dropped, folded unless `case:` (only a modifier: `ext:` ignores the
+/// whole-query `case:` switch, as it always has); a value holding a wildcard
+/// an entity made literal is dropped, as no extension holds one. An empty
+/// item names no extension (`ext:txt;;exe`, L2:106), but empty items at the
+/// end of a list are dropped (`ext:txt;exe;;` keeps two, L8:117), unless the
+/// list holds nothing else (`ext:;` is no extension, L2:107).
+fn ext_leaf(text: &Text, set: ModSet) -> Expr {
+    let case = set.case.unwrap_or(false);
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    let mut items: Vec<&[u8]> = text.items().collect();
+    while items.len() > 1 && items.last().is_some_and(|i| i.is_empty()) {
+        items.pop();
+    }
+    for item in items {
+        let v = value::ext_value(item);
+        if text.literal_wild && v.iter().any(|&b| b == b'*' || b == b'?') {
+            continue;
+        }
+        let v = if case { v.to_vec() } else { fold(v) };
+        if !values.contains(&v) {
+            values.push(v);
+        }
+    }
+    if values.is_empty() {
+        Expr::False
     } else {
-        e
+        Expr::Leaf(Leaf::Ext { values, case })
     }
 }
 
-/// `s` without its leading dots: `ext:.pdf` is `ext:pdf`.
-fn trim_dots(s: &[u8]) -> &[u8] {
-    let start = s.iter().position(|&b| b != b'.').unwrap_or(s.len());
-    &s[start..]
+/// The files a macro keeps: those with one of its extensions.
+fn macro_ext(m: Macro) -> Expr {
+    Expr::Leaf(Leaf::Ext {
+        values: m
+            .extensions()
+            .split(';')
+            .map(|v| v.as_bytes().to_vec())
+            .collect(),
+        case: false,
+    })
 }
 
-const KB: u64 = 1024;
-const MB: u64 = 1024 * KB;
-const GB: u64 = 1024 * MB;
-const TB: u64 = 1024 * GB;
-
-/// Parses an es-style `size:` expression: a bare number, a comparison
-/// (`>`, `>=`, `<`, `<=`, `=`), a range `a..b`, or a named constant
-/// (`empty`, `tiny`, …, `gigantic`). Numbers accept `kb`/`mb`/`gb`/`tb`
-/// (1024-based) suffixes.
-fn parse_size(value: &str) -> Result<SizeRange, QueryError> {
-    let v = value.trim();
-    let malformed = |detail: &str| QueryError::Malformed {
-        what: "size:",
-        detail: detail.to_string(),
-    };
-
-    // Named constants.
-    match v.to_ascii_lowercase().as_str() {
-        "empty" => return Ok(SizeRange { min: 0, max: 0 }),
-        "tiny" => {
-            return Ok(SizeRange {
-                min: 0,
-                max: 10 * KB,
-            });
-        }
-        "small" => {
-            return Ok(SizeRange {
-                min: 10 * KB,
-                max: 100 * KB,
-            });
-        }
-        "medium" => {
-            return Ok(SizeRange {
-                min: 100 * KB,
-                max: MB,
-            });
-        }
-        "large" => {
-            return Ok(SizeRange {
-                min: MB,
-                max: 16 * MB,
-            });
-        }
-        "huge" => {
-            return Ok(SizeRange {
-                min: 16 * MB,
-                max: 128 * MB,
-            });
-        }
-        "gigantic" => {
-            return Ok(SizeRange {
-                min: 128 * MB,
-                max: u64::MAX,
-            });
-        }
-        _ => {}
-    }
-
-    // Range a..b (either side optional).
-    if let Some((lo, hi)) = v.split_once("..") {
-        let min = if lo.trim().is_empty() {
-            0
-        } else {
-            parse_bytes(lo).ok_or_else(|| malformed(lo))?
-        };
-        let max = if hi.trim().is_empty() {
-            u64::MAX
-        } else {
-            parse_bytes(hi).ok_or_else(|| malformed(hi))?
-        };
-        return Ok(SizeRange { min, max });
-    }
-
-    // Comparison operators. Order matters: two-char ops before their one-char
-    // prefixes so `>=` is not read as `>` plus a stray `=`.
-    for op in [">=", "<=", ">", "<"] {
-        if let Some(rest) = v.strip_prefix(op) {
-            let n = parse_bytes(rest).ok_or_else(|| malformed(rest))?;
-            return Ok(match op {
-                ">=" => SizeRange {
-                    min: n,
-                    max: u64::MAX,
-                },
-                ">" => SizeRange {
-                    min: n.saturating_add(1),
-                    max: u64::MAX,
-                },
-                "<=" => SizeRange { min: 0, max: n },
-                // The only remaining op.
-                _ => SizeRange {
-                    min: 0,
-                    max: n.saturating_sub(1),
-                },
-            });
-        }
-    }
-
-    // Bare number or `=N` → exact.
-    let rest = v.strip_prefix('=').unwrap_or(v);
-    let n = parse_bytes(rest).ok_or_else(|| malformed(v))?;
-    Ok(SizeRange { min: n, max: n })
-}
-
-/// Parses `"10mb"` / `"1024"` / `"2gb"` into a byte count (1024-based units).
-fn parse_bytes(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let lower = s.to_ascii_lowercase();
-    let (num, mult) = if let Some(n) = lower.strip_suffix("tb") {
-        (n, TB)
-    } else if let Some(n) = lower.strip_suffix("gb") {
-        (n, GB)
-    } else if let Some(n) = lower.strip_suffix("mb") {
-        (n, MB)
-    } else if let Some(n) = lower.strip_suffix("kb") {
-        (n, KB)
-    } else if let Some(n) = lower.strip_suffix('b') {
-        (n, 1)
+/// `e` restricted to folders when a `folder:` reaches it, or to the kind a
+/// `?file:` or `?folder:` before it names.
+fn with_kind(e: Expr, mods: Mods, global: ModSet) -> Expr {
+    let kind = if mods.folder {
+        Some(Kind::Folder)
     } else {
-        (lower.as_str(), 1)
+        global.kind
     };
-    let num = num.trim();
-    let value: u64 = num.parse().ok()?;
-    value.checked_mul(mult)
+    match kind {
+        Some(kind) => Expr::and(Expr::Leaf(Leaf::Kind(kind)), e),
+        None => e,
+    }
 }
 
 #[cfg(test)]
@@ -669,17 +785,21 @@ mod tests {
         q(s).expr.unwrap_or_else(|| panic!("{s} has no expression"))
     }
 
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+
     fn name(s: &str) -> Expr {
-        Expr::Leaf(Leaf::Text {
-            target: Target::Name,
-            needle: fold(s.as_bytes()),
-        })
+        Expr::Leaf(Leaf::plain(Target::Name, fold(s.as_bytes()), false))
     }
 
     fn path(s: &str) -> Expr {
-        Expr::Leaf(Leaf::Text {
-            target: Target::FullPath,
-            needle: fold(s.as_bytes()),
+        Expr::Leaf(Leaf::plain(Target::FullPath, fold(s.as_bytes()), false))
+    }
+
+    fn ext(values: &[&str]) -> Expr {
+        Expr::Leaf(Leaf::Ext {
+            values: values.iter().map(|v| v.as_bytes().to_vec()).collect(),
+            case: false,
         })
     }
 
@@ -733,14 +853,8 @@ mod tests {
         assert_eq!(
             p.expr,
             Some(or([
-                Expr::Leaf(Leaf::Text {
-                    target: Target::Name,
-                    needle: b"Report".to_vec()
-                }),
-                Expr::Leaf(Leaf::Text {
-                    target: Target::Name,
-                    needle: b"x".to_vec()
-                }),
+                Expr::Leaf(Leaf::plain(Target::Name, b"Report".to_vec(), true)),
+                Expr::Leaf(Leaf::plain(Target::Name, b"x".to_vec(), true)),
             ]))
         );
     }
@@ -822,9 +936,18 @@ mod tests {
         assert_eq!(
             q("size:tiny").filters.size,
             Some(SizeRange {
-                min: 0,
+                min: 1,
                 max: 10 * KB
-            })
+            }),
+            "tiny leaves out empty files, as in Everything"
+        );
+        assert_eq!(
+            q("size:1kb").filters.size,
+            Some(SizeRange {
+                min: KB,
+                max: 2 * KB - 1
+            }),
+            "a value alone names its last digit's granule"
         );
         assert_eq!(
             q("size:1024").filters.size,
@@ -1023,23 +1146,22 @@ mod tests {
             ex("folder:<a|ext:pdf>"),
             or([
                 and([kind(Kind::Folder), name("a")]),
-                and([
-                    kind(Kind::Folder),
-                    Expr::Leaf(Leaf::Ext(vec![b"pdf".to_vec()]))
-                ]),
+                and([kind(Kind::Folder), ext(&["pdf"])]),
             ])
         );
         assert_eq!(
-            ex("ext:!pdf"),
-            Expr::Leaf(Leaf::Ext(vec![b"pdf".to_vec()])).not()
+            q("ext:!pdf").filters.ext,
+            Some(vec![b"!pdf".to_vec()]),
+            "an extension's ! is text (L7:523)"
         );
+        assert_eq!(ex("!ext:pdf"), ext(&["pdf"]).not());
         assert_eq!(
             ex("size:!=1kb"),
             Expr::Leaf(Leaf::Size(SizeRange { min: KB, max: KB })).not()
         );
         assert_eq!(
             ex("ext:pdf|txt"),
-            or([Expr::Leaf(Leaf::Ext(vec![b"pdf".to_vec()])), name("txt")]),
+            or([ext(&["pdf"]), name("txt")]),
             "a | ends a function's value"
         );
         assert_eq!(
@@ -1125,8 +1247,18 @@ mod tests {
             Err(QueryError::UnknownFunction("dc:".to_string()))
         );
         assert_eq!(
-            parse_query("report Parent:foo"),
-            Err(QueryError::UnknownFunction("Parent:".to_string()))
+            parse_query("report Bogus:foo"),
+            Err(QueryError::UnknownFunction("Bogus:".to_string()))
+        );
+        assert!(
+            matches!(
+                parse_query("report Parent:foo"),
+                Err(QueryError::Malformed {
+                    what: "parent:",
+                    ..
+                })
+            ),
+            "parent: takes an absolute path"
         );
         assert_eq!(
             parse_query("a|!dc:x"),
@@ -1137,10 +1269,11 @@ mod tests {
         assert_eq!(q(r":\docs").path_terms, vec![br":\docs".to_vec()]);
         assert_eq!(q(r#""a:b""#).name_terms, vec![b"a:b".to_vec()]);
         assert_eq!(q("file:a:b").name_terms, vec![b"a:b".to_vec()], "a value");
-        assert!(matches!(
-            parse_query("case:2"),
-            Err(QueryError::Malformed { what: "case:", .. })
-        ));
+        assert_eq!(
+            ex("case:2"),
+            Expr::Leaf(Leaf::plain(Target::Name, b"2".to_vec(), true)),
+            "case: with text other than 0 or 1 is the per-term modifier"
+        );
     }
 
     /// The `-case` switch is the parser's default, and a `case:` directive in
@@ -1337,19 +1470,28 @@ mod tests {
         );
     }
 
-    /// A long `ext:` list costs each candidate a test per value, so its values
-    /// count toward the cap; `size:` and `file:` do not.
+    /// An `ext:` list's plain values are one lookup in a set however many
+    /// there are, as a macro's are, so the list counts once toward the cap;
+    /// each wildcard value is a test of its own and counts.
     #[test]
-    fn ext_values_count_toward_the_term_cap() {
-        let exts = |n: usize| {
-            let list: Vec<String> = (0..n).map(|i| format!("e{i}")).collect();
-            format!("a size:>1kb file: ext:{}", list.join(";"))
+    fn ext_lists_count_once_and_their_wildcards_each() {
+        let exts = |n: usize, wild: &str| {
+            let list: Vec<String> = (0..n).map(|i| format!("e{i}{wild}")).collect();
+            format!("ext:{}", list.join(";"))
         };
-        assert!(parse_query(&exts(MAX_QUERY_TERMS - 1)).is_ok());
+        assert_eq!(term_count(&q(&format!("a {}", exts(10_000, "")))), 2);
         assert_eq!(
-            parse_query(&exts(MAX_QUERY_TERMS)),
+            term_count(&q(&format!("a ext:x {}", exts(10_000, "")))),
+            3,
+            "a second list is a term of the expression"
+        );
+        let wild = |n: usize| format!("a ext:x {}", exts(n, "*"));
+        assert!(parse_query(&wild(MAX_QUERY_TERMS - 3)).is_ok());
+        assert_eq!(
+            parse_query(&wild(MAX_QUERY_TERMS - 2)),
             Err(QueryError::TooManyTerms(MAX_QUERY_TERMS + 1))
         );
+        assert_eq!(term_count(&q("x audio:")), 2, "a macro's 40 values");
     }
 
     /// `matchpath:` sends all the search text to the full path, wherever it
@@ -1370,26 +1512,465 @@ mod tests {
         ));
     }
 
-    /// The kind, `ext:` and `size:` filters keep their last top-level term
-    /// and `dm:` terms all apply, as they always have; the same filters
-    /// inside an expression are its terms.
+    /// Several `ext:`, `size:` and kind filters must all match, as in
+    /// Everything (`ext:txt ext:exe` finds nothing, L1:249; `file: folder:`
+    /// nothing, L1:110), where v0.6.0 kept the last of each: the first
+    /// fills its bucket and the others are terms of the expression, or
+    /// `False` for a second, different kind. `dm:` terms all applied
+    /// already.
     #[test]
-    fn top_level_filters_keep_their_old_meaning() {
-        let p = q("file: folder: ext:a ext:b size:1 size:2 x");
-        assert_eq!(p.filters.kind, Some(Kind::Folder));
-        assert_eq!(p.filters.ext, Some(vec![b"b".to_vec()]));
-        assert_eq!(p.filters.size, Some(SizeRange { min: 2, max: 2 }));
-        assert_eq!(p.expr, None);
-        let p = q("<file: x> folder:");
+    fn several_filters_all_apply() {
+        let p = q("ext:a ext:b size:1 size:2 x");
+        assert_eq!(p.filters.ext, Some(vec![b"a".to_vec()]));
+        assert_eq!(p.filters.size, Some(SizeRange { min: 1, max: 1 }));
         assert_eq!(
-            p.filters.kind,
-            Some(Kind::Folder),
-            "a group at the top is its terms"
+            p.expr,
+            Some(and([
+                ext(&["b"]),
+                Expr::Leaf(Leaf::Size(SizeRange { min: 2, max: 2 }))
+            ]))
         );
+        let p = q("file: folder: x");
+        assert_eq!(p.filters.kind, Some(Kind::File));
+        assert_eq!(p.expr, Some(Expr::False), "nothing is both");
+        let p = q("file: file: x");
+        assert_eq!((p.filters.kind, p.expr), (Some(Kind::File), None));
+        assert_eq!(q("<file: x> folder:").expr, Some(Expr::False));
         assert_eq!(
             ex("file:|folder:"),
             or([kind(Kind::File), kind(Kind::Folder)])
         );
+    }
+
+    /// A text leaf on `target` with `needle` (folded unless `case`),
+    /// anchored and skipping as given.
+    fn text(target: Target, needle: &str, case: bool, anchors: Anchors, skip: Skip) -> Expr {
+        let needle = if case {
+            needle.as_bytes().to_vec()
+        } else {
+            fold(needle.as_bytes())
+        };
+        Expr::Leaf(Leaf::Text {
+            target,
+            needle,
+            case,
+            anchors,
+            skip,
+        })
+    }
+
+    const FREE: Anchors = Anchors {
+        start: false,
+        end: false,
+        word_start: false,
+        word_end: false,
+    };
+    const NO_SKIP: Skip = Skip {
+        punct: false,
+        space: false,
+    };
+
+    /// `case:` and `nocase:` per term, over the query's default; the
+    /// outermost of two that disagree wins (L1:85-97).
+    #[test]
+    fn case_per_term_and_the_outermost_wins() {
+        let foo = |case| text(Target::Name, "Foo", case, FREE, NO_SKIP);
+        assert_eq!(ex("case:Foo"), foo(true));
+        assert_eq!(ex("::case:Foo"), foo(true));
+        assert_eq!(ex("case:nocase:Foo"), foo(true));
+        assert_eq!(
+            q("nocase:case:Foo").name_terms,
+            [b"foo".to_vec()],
+            "the query's own case, so the bucket's"
+        );
+        let p = q("nocase:Foo case:");
+        assert!(p.match_case);
+        assert_eq!(p.expr, Some(foo(false)), "nocase: under the switch");
+        let p = q("no-case:Foo case:");
+        assert_eq!(p.expr, Some(foo(false)));
+        assert_eq!(
+            q("Foo case:").name_terms,
+            [b"Foo".to_vec()],
+            "the switch still fills the bucket"
+        );
+        assert_eq!(
+            ex("case:<Foo|BAR>"),
+            or([foo(true), text(Target::Name, "BAR", true, FREE, NO_SKIP)])
+        );
+        assert_eq!(
+            ex("!case:Foo"),
+            ex("case:!Foo"),
+            "a modifier reaches through a NOT"
+        );
+        // `?case:` holds for the terms after it (L1:93).
+        assert_eq!(
+            q("Foo ?case: Bar").expr,
+            Some(text(Target::Name, "Bar", true, FREE, NO_SKIP))
+        );
+    }
+
+    /// `path:` sends a term to the full path, `nopath:` keeps one with a
+    /// separator on the name (where nothing holds a separator, L2:140).
+    #[test]
+    fn path_and_nopath_per_term() {
+        assert_eq!(q("path:words").path_terms, [b"words".to_vec()]);
+        assert_eq!(q(r"\:words").path_terms, [b"words".to_vec()]);
+        assert_eq!(
+            q(r"nopath:windows\cmd.exe").name_terms,
+            [br"windows\cmd.exe".to_vec()]
+        );
+        let p = q("nopath:x matchpath:");
+        assert_eq!(p.name_terms, [b"x".to_vec()], "nopath: over matchpath:");
+        assert_eq!(q("?path: words ever").path_terms.len(), 2);
+    }
+
+    /// The word and anchor modifiers set where a match must stand; a
+    /// wildcard matches the whole name and ignores them (L1:145-146,
+    /// L2:158).
+    #[test]
+    fn anchors_and_skips_per_term() {
+        let anchored = |start, end, word_start, word_end| Anchors {
+            start,
+            end,
+            word_start,
+            word_end,
+        };
+        let ever = |a| text(Target::Name, "ever", false, a, NO_SKIP);
+        for (query, anchors) in [
+            ("ww:ever", anchored(false, false, true, true)),
+            ("whole-words:ever", anchored(false, false, true, true)),
+            ("prefix:ever", anchored(false, false, true, false)),
+            ("suffix:ever", anchored(false, false, false, true)),
+            ("whole:ever", anchored(true, true, false, false)),
+            ("startwith:ever", anchored(true, false, false, false)),
+            ("endwith:ever", anchored(false, true, false, false)),
+            ("prefix:suffix:ever", anchored(false, false, true, true)),
+            ("ww:noprefix:ever", anchored(false, false, true, true)),
+            ("noww:prefix:ever", anchored(false, false, true, false)),
+        ] {
+            assert_eq!(ex(query), ever(anchors), "{query}");
+        }
+        assert_eq!(
+            ex("nopunc:spiderman"),
+            text(
+                Target::Name,
+                "spiderman",
+                false,
+                FREE,
+                Skip {
+                    punct: true,
+                    space: false
+                }
+            )
+        );
+        assert_eq!(
+            ex("nows:nopunc:spiderman"),
+            text(
+                Target::Name,
+                "spiderman",
+                false,
+                FREE,
+                Skip {
+                    punct: true,
+                    space: true
+                }
+            )
+        );
+        let p = q("ww:ev*");
+        assert!(p.expr.is_none() && p.wildcards[0].matches(b"ever.txt"));
+        let p = q("startwith:*ver");
+        assert!(p.wildcards[0].matches(b"forever") && !p.wildcards[0].matches(b"ever.txt"));
+        assert_eq!(
+            q("path:startwith:c:\\users").expr,
+            Some(text(
+                Target::FullPath,
+                r"c:\users",
+                false,
+                anchored(true, false, false, false),
+                NO_SKIP
+            ))
+        );
+    }
+
+    /// `star-all:` lets a sub-path wildcard's `*` cross folders;
+    /// `no-wildcards:` makes `*` and `?` text (L7:476-482).
+    #[test]
+    fn wildcard_switches() {
+        let p = q(r"starall:w\*.exe");
+        assert!(p.path_wildcards[0].matches(br"c:\fx\w\windows\sub\a.exe"));
+        let p = q(r"w\*.exe");
+        assert!(!p.path_wildcards[0].matches(br"c:\fx\w\windows\sub\a.exe"));
+        assert_eq!(q("nowildcards:*.exe").name_terms, [b"*.exe".to_vec()]);
+        assert_eq!(q("no-filename-wildcards:a?b").name_terms, [b"a?b".to_vec()]);
+        assert!(q("filename-wildcards:*.exe").wildcards[0].matches(b"a.exe"));
+    }
+
+    /// The kind prefixes and their `no-` forms, as a live Everything reads
+    /// them: `no-file:` is `folder:`, `no-folder:` is `file:` (L7:452-454,
+    /// L8:98-101); `?file:` holds for the terms after it.
+    #[test]
+    fn kinds_and_their_no_forms() {
+        assert_eq!(q("no-file:x"), q("folder:x"));
+        assert_eq!(q("nofolders:x"), q("file:x"));
+        assert_eq!(ex("nofile:!dot"), ex("folder:!dot"));
+        assert_eq!(q("nofolder:!dot"), q("file:!dot"));
+        assert_eq!(q("files-only:"), q("file:"));
+        assert_eq!(q("folders-only:"), q("folder:"));
+        let p = q("?file: dot");
+        assert_eq!((p.filters.kind, p.name_terms.len()), (Some(Kind::File), 1));
+        assert_eq!(q("?folder: dot ?file: x").expr, Some(Expr::False));
+        assert!(matches!(
+            parse_query("no-dir:"),
+            Err(QueryError::UnknownFunction(_))
+        ));
+    }
+
+    /// `d:` alone is a drive; `\` or `/` alone keeps folders, quoted and
+    /// under any modifier (L7:419-424, L8:102-110); `\\` is a path term.
+    #[test]
+    fn drive_terms_and_the_lone_separator() {
+        assert_eq!(ex("d:"), Expr::Leaf(Leaf::Drive(b'd')));
+        assert_eq!(ex("C:"), Expr::Leaf(Leaf::Drive(b'c')));
+        assert_eq!(ex("!d:"), Expr::Leaf(Leaf::Drive(b'd')).not());
+        assert_eq!(q(r"c:\").path_terms, [br"c:\".to_vec()]);
+        assert!(matches!(
+            parse_query("c:spider").map(|p| p.name_terms),
+            Ok(t) if t == [b"c:spider".to_vec()]
+        ));
+        for folders in [
+            r"\",
+            "/",
+            r#""\""#,
+            r"path:\",
+            r"nopath:\",
+            r"case:\",
+            r"<\>",
+        ] {
+            let p = q(folders);
+            assert_eq!(p.filters.kind, Some(Kind::Folder), "{folders}");
+            assert!(p.is_text_empty(), "{folders}");
+        }
+        assert_eq!(ex(r"!\"), kind(Kind::Folder).not());
+        assert_eq!(q(r"\\").path_terms, [br"\\".to_vec()]);
+    }
+
+    /// The functions of a full path's parts, each a text leaf on its target
+    /// with the same modifiers as a search term; an empty value is any such
+    /// text that exists (L7:425-442).
+    #[test]
+    fn name_part_functions() {
+        let on = |target, needle: &str| text(target, needle, false, FREE, NO_SKIP);
+        assert_eq!(q("name:Spider").name_terms, [b"spider".to_vec()]);
+        assert_eq!(q("basename:x").name_terms, [b"x".to_vec()]);
+        assert_eq!(ex("stem:x"), on(Target::Stem, "x"));
+        assert_eq!(ex("extension:t"), on(Target::Extension, "t"));
+        assert_eq!(q(r"full-path:w\cmd").path_terms, [br"w\cmd".to_vec()]);
+        assert_eq!(ex("location:windows"), on(Target::Location, "windows"));
+        assert_eq!(ex("pp:windows"), on(Target::Location, "windows"));
+        assert_eq!(ex("parent-name:x"), on(Target::ParentName, "x"));
+        assert_eq!(
+            ex("ww:stem:x"),
+            text(
+                Target::Stem,
+                "x",
+                false,
+                Anchors {
+                    word_start: true,
+                    word_end: true,
+                    ..FREE
+                },
+                NO_SKIP
+            ),
+            "a modifier before the function reaches its value"
+        );
+        assert_eq!(ex("name:a;b"), or([name("a"), name("b")]), "a list");
+        assert_eq!(ex("stem:"), on(Target::Stem, ""));
+        assert!(q("name:").is_text_empty());
+        assert!(q("location:").is_text_empty());
+        assert_eq!(q("name:!x").name_terms, [b"!x".to_vec()], "the ! is text");
+        assert!(matches!(
+            ex("stem:x*"),
+            Expr::Leaf(Leaf::Glob {
+                target: Target::Stem,
+                ..
+            })
+        ));
+        assert_eq!(ex("whole:"), Expr::False, "no name is empty (L8:131)");
+        assert_eq!(ex("whole:\"\""), Expr::False);
+        assert_eq!(q("startwith:").expr, None, "everything (L8:133)");
+    }
+
+    /// `ext:` values (L1:240-263, L2:102-107, L7:521-535, L8:111-118).
+    #[test]
+    fn ext_values_as_everything_reads_them() {
+        let e = |query: &str| match q(query) {
+            ParsedQuery {
+                filters: Filters { ext: Some(v), .. },
+                expr: None,
+                ..
+            } => v
+                .iter()
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .collect::<Vec<_>>(),
+            p => match p.expr {
+                Some(Expr::Leaf(Leaf::Ext { values, .. })) => values
+                    .iter()
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .collect(),
+                other => panic!("{query}: {other:?}"),
+            },
+        };
+        assert_eq!(e("ext:TXT;Exe"), ["txt", "exe"]);
+        assert_eq!(
+            e("ext:.txt;*.pdf;*jpg"),
+            ["txt", "pdf", "*jpg"],
+            "*jpg a wildcard"
+        );
+        assert_eq!(e("ext:"), [""], "no extension");
+        assert_eq!(e("ext:;"), [""]);
+        assert_eq!(e("ext:txt;;exe"), ["txt", "", "exe"]);
+        assert_eq!(e("ext:txt;exe;;"), ["txt", "exe"], "trailing empties go");
+        assert_eq!(e("ext:txt;TXT"), ["txt"], "each once");
+        assert_eq!(e("ext:mp*;t?t"), ["mp*", "t?t"]);
+        assert_eq!(e("ext:*.*"), ["*"]);
+        assert_eq!(e("ext:!txt"), ["!txt"], "the ! is text (L7:523)");
+        assert_eq!(e("ext:tar.gz"), ["tar.gz"]);
+        assert_eq!(
+            ex("case:ext:TXT"),
+            Expr::Leaf(Leaf::Ext {
+                values: vec![b"TXT".to_vec()],
+                case: true
+            })
+        );
+        assert_eq!(q("ext:TXT case:").filters.ext, Some(vec![b"txt".to_vec()]));
+        assert_eq!(
+            ex("ext:<txt|exe>"),
+            or([ext(&["txt"]), ext(&["exe"])]),
+            "a value group"
+        );
+        assert_eq!(ex("ext:&ast:"), Expr::False, "no extension holds a *");
+        // A macro is an `ext:` list like any other: alone at the top, it
+        // fills the filter.
+        let audio = q("audio:x");
+        assert_eq!(audio.filters.ext.map(|v| v.len()), Some(40));
+        assert_eq!((audio.name_terms, audio.expr), (vec![b"x".to_vec()], None));
+        let Expr::Or(items) = ex("audio:|x") else {
+            panic!()
+        };
+        assert!(matches!(&items[0], Expr::Leaf(Leaf::Ext { values, .. }) if values.len() == 40));
+        assert_eq!(q("pic:"), q("image:"));
+    }
+
+    /// Numeric values: `size:` with granules, units, constants, lists and
+    /// groups; the lengths; `metric:`; a `!` that negates.
+    #[test]
+    fn numeric_functions() {
+        let size = |min, max| Expr::Leaf(Leaf::Size(SizeRange { min, max }));
+        assert_eq!(
+            ex("size:1kb;2kb"),
+            or([size(KB, 2 * KB - 1), size(2 * KB, 3 * KB - 1)])
+        );
+        assert_eq!(ex("size:<1kb|2kb>"), ex("size:1kb;2kb"));
+        assert_eq!(ex("size:!1kb"), size(KB, 2 * KB - 1).not());
+        assert_eq!(ex("size:!=1kb"), size(KB, KB).not());
+        assert_eq!(ex("size:unknown"), Expr::Leaf(Leaf::SizeUnknown));
+        assert_eq!(
+            q("size:").filters.size,
+            Some(SizeRange {
+                min: 1,
+                max: u64::MAX
+            })
+        );
+        assert_eq!(
+            q("metric:size:1kb").filters.size,
+            Some(SizeRange {
+                min: 1000,
+                max: 1999
+            })
+        );
+        assert!(matches!(
+            parse_query("size:>=10kb..1mb"),
+            Err(QueryError::Malformed { what: "size:", .. })
+        ));
+        let len = |of, min, max| {
+            Expr::Leaf(Leaf::Len {
+                of,
+                range: SizeRange { min, max },
+            })
+        };
+        assert_eq!(ex("len:7"), len(LenOf::Name, 7, 7));
+        assert_eq!(ex("path:len:>100"), len(LenOf::FullPath, 101, u64::MAX));
+        assert_eq!(ex("len:7 matchpath:"), len(LenOf::FullPath, 7, 7));
+        assert_eq!(ex("namelen:7"), len(LenOf::Name, 7, 7));
+        assert_eq!(ex("fullpathlen:<=9"), len(LenOf::FullPath, 0, 9));
+        assert_eq!(ex("path-part-length:3"), len(LenOf::Location, 3, 3));
+        assert_eq!(ex("extlen:3"), len(LenOf::Extension, 3, 3));
+        assert_eq!(ex("len:!7"), len(LenOf::Name, 7, 7).not());
+        assert_eq!(
+            ex("len:7;10"),
+            or([len(LenOf::Name, 7, 7), len(LenOf::Name, 10, 10)])
+        );
+        assert!(matches!(
+            parse_query("len:1kb"),
+            Err(QueryError::Malformed { what: "len:", .. })
+        ));
+    }
+
+    /// `parent:` and `ancestor:` take absolute folders, case-insensitively,
+    /// a separator at the end or not, as a list or a group (L1:370-384,
+    /// L7:497-509); a relative one is refused.
+    #[test]
+    fn folder_functions() {
+        let parent = |p: &str| Expr::Leaf(Leaf::Parent(vec![p.as_bytes().to_vec()]));
+        assert_eq!(ex(r"parent:C:\W\Windows\"), parent(r"c:\w\windows"));
+        assert_eq!(ex(r"infolder:C:\W"), parent(r"c:\w"));
+        assert_eq!(ex(r"nosubfolders:C:/W"), parent(r"c:\w"));
+        assert_eq!(ex(r#"parent:"C:\First Level""#), parent(r"c:\first level"));
+        assert_eq!(
+            ex(r"parent:C:\a;C:\b"),
+            or([parent(r"c:\a"), parent(r"c:\b")])
+        );
+        assert_eq!(ex(r"parent:<C:\a|C:\b>"), ex(r"parent:C:\a;C:\b"));
+        assert_eq!(
+            ex(r"ancestor:C:\W"),
+            Expr::Leaf(Leaf::Ancestor(vec![br"c:\w".to_vec()]))
+        );
+        for relative in [
+            r"parent:w\windows",
+            "parent:windows",
+            r"ancestor:\x",
+            r"parent:!C:\x",
+        ] {
+            assert!(
+                matches!(parse_query(relative), Err(QueryError::Malformed { .. })),
+                "{relative}"
+            );
+        }
+    }
+
+    /// `dm:` lists and groups, and a value's own `!`, through the parser.
+    #[test]
+    fn date_lists_groups_and_negation() {
+        use crate::query::dates::tests::{FixedClock, ft};
+        let clock = FixedClock::utc(ft("2026-11-04T10:00:00"));
+        let at = |text| parse_query_at(text, false, &clock).unwrap().expr;
+        let year = |y: &str| {
+            Expr::Leaf(Leaf::Date(DateFilter::Within {
+                min: ft(&format!("{y}-01-01T00:00:00")),
+                max: ft(&format!("{}-01-01T00:00:00", y.parse::<i64>().unwrap() + 1)) - 1,
+            }))
+        };
+        assert_eq!(at("dm:2020;2024"), Some(or([year("2020"), year("2024")])));
+        assert_eq!(at("dm:<2020|2024>"), at("dm:2020;2024"));
+        assert_eq!(at("dm:!2020"), Some(year("2020").not()));
+        assert_eq!(
+            at("dm:2020;!2024"),
+            Some(or([year("2020"), year("2024").not()]))
+        );
+        assert!(matches!(
+            parse_query_at("dm:<today|>now>", false, &clock),
+            Err(QueryError::GroupExpansion { .. })
+        ));
     }
 
     /// The pure-AND guarantee: a query written only with v0.6.0's syntax,
@@ -1398,7 +1979,10 @@ mod tests {
     /// prefilters and fast paths. The spellings left out are the ones
     /// DESIGN.md §5.3 changes on purpose: path wildcards (C1), quoted
     /// wildcards (C2), and `|`, `!`, `< >`, keyword operators and entities,
-    /// which v0.6.0 refused (C3); a function's value never holds another
+    /// which v0.6.0 refused (C3); `ext:` values with a wildcard, an empty
+    /// item, an inner dot or a repeat (C4); a second `ext:`, `size:` or
+    /// kind (C5); the size constants (C6); `d:` alone (C7); `case:x` (C8);
+    /// `lastweek` and its kin (C9). A function's value never holds another
     /// prefix, which v0.6.0 read as text matching nothing.
     mod guarantee {
         use super::*;
@@ -1414,14 +1998,25 @@ mod tests {
                 "[a-z]{1,4}[\\\\/][a-z]{0,4}",
                 "[cC]:\\\\[a-z]{0,4}",
                 "\\\\[a-z]{1,4}\\\\",
-                "ext:[a-zA-Z.;]{0,6}",
-                "ext:\"[a-z ]{1,4}\"",
+                // `ext:` values with no wildcard, empty item or inner dot,
+                // each named once: what S2 reads as v0.6.0 did (C4).
+                (
+                    prop::collection::btree_set("[a-z]{1,4}", 1..4),
+                    any::<bool>()
+                )
+                    .prop_map(|(values, dot)| {
+                        let dot = if dot { "." } else { "" };
+                        let values: Vec<String> =
+                            values.iter().map(|v| format!("{dot}{v}")).collect();
+                        format!("ext:{}", values.join(";"))
+                    }),
+                "ext:\"[a-z]{1,4}\"",
                 "(file|folder|dir|FILE):[a-z]{1,4}",
-                "path:[a-z\\\\]{0,6}",
+                // Not `path:\` alone, which keeps folders (C7).
+                "path:([a-z][a-z\\\\]{0,5})?",
                 prop::sample::select(vec![
                     "size:>1mb",
                     "size:1kb..2mb",
-                    "size:tiny",
                     "size:<=100",
                     "size:1024",
                     "size:abc",
@@ -1442,12 +2037,10 @@ mod tests {
                     "case:1",
                     "CASE:",
                     "case:\"1\"",
-                    "case:x",
                     "dc:x",
                     "Parent:x",
                     "12:30",
                     ":x",
-                    "x:",
                     "matchpath:x",
                     "\"\"",
                 ])
@@ -1465,6 +2058,28 @@ mod tests {
                 match_path in any::<bool>(),
                 match_case in any::<bool>(),
             ) {
+                // A second `ext:`, `size:` or kind now ANDs with the first,
+                // where v0.6.0 kept the last (C5): keep the first of each.
+                let mut seen = [false; 3];
+                let parts: Vec<&String> = parts
+                    .iter()
+                    .filter(|p| {
+                        let lower = p.to_ascii_lowercase();
+                        let class = if lower.starts_with("ext:") {
+                            0
+                        } else if lower.starts_with("size:") {
+                            1
+                        } else if ["file:", "folder:", "dir:"]
+                            .iter()
+                            .any(|k| lower.starts_with(k))
+                        {
+                            2
+                        } else {
+                            return true;
+                        };
+                        !std::mem::replace(&mut seen[class], true)
+                    })
+                    .collect();
                 let mut query = String::new();
                 for (part, gap) in parts.iter().zip(&spaces) {
                     query.push_str(part);

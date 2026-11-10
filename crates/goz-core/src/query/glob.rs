@@ -120,8 +120,9 @@ impl Wildcard {
     }
 
     /// A sub-path pattern, from bytes already folded iff the query is
-    /// case-insensitive, with `/` already written as `\`.
-    pub(crate) fn sub_path(pattern: &[u8]) -> Self {
+    /// case-insensitive, with `/` already written as `\`. `star_all`
+    /// (`star-all:`): every `*` crosses separators, as `**` does.
+    pub(crate) fn sub_path(pattern: &[u8], star_all: bool) -> Self {
         let pattern = pattern.strip_prefix(b"\\").unwrap_or(pattern);
         let mut source = pattern.to_vec();
         if source.last() == Some(&b'\\') {
@@ -132,7 +133,7 @@ impl Wildcard {
         let flush = |stars: &mut usize, toks: &mut Vec<Tok>| {
             match *stars {
                 0 => {}
-                1 => toks.push(Tok::Run),
+                1 if !star_all => toks.push(Tok::Run),
                 _ => toks.push(Tok::RunAll),
             }
             *stars = 0;
@@ -650,7 +651,7 @@ pub(crate) mod tests {
             r"c:\fx\words\never.txt",
         ];
         let hits = |pattern: &str| -> Vec<&str> {
-            let w = Wildcard::sub_path(pattern.as_bytes());
+            let w = Wildcard::sub_path(pattern.as_bytes(), false);
             assert!(!w.is_name(), "{pattern}");
             paths
                 .iter()
@@ -732,18 +733,18 @@ pub(crate) mod tests {
 
     #[test]
     fn a_sub_path_pattern_compiles_its_ends() {
-        let w = Wildcard::sub_path(br"\windows\*\");
+        let w = Wildcard::sub_path(br"\windows\*\", false);
         assert_eq!(w.pattern(), br"windows\*\**");
         assert_eq!(w.leading_literal(), br"windows\");
         assert_eq!(w.trailing_literal(), b"");
         assert_eq!(w.name_literal(), None, "the last part is **");
         assert_eq!(
-            Wildcard::sub_path(b"**x.sys").name_literal(),
+            Wildcard::sub_path(b"**x.sys", false).name_literal(),
             Some(b"x.sys".to_vec()),
             "the name ends with it"
         );
-        assert_eq!(Wildcard::sub_path(b"**cmd*").name_literal(), None);
-        let w = Wildcard::sub_path(br"*\bin_x64_05\*.dll");
+        assert_eq!(Wildcard::sub_path(b"**cmd*", false).name_literal(), None);
+        let w = Wildcard::sub_path(br"*\bin_x64_05\*.dll", false);
         assert_eq!(w.name_literal(), Some(b".dll".to_vec()));
         assert_eq!(w.trailing_literal(), b".dll");
         assert_eq!(
@@ -751,11 +752,11 @@ pub(crate) mod tests {
             [b"bin_x64_05".to_vec(), b".dll".to_vec()]
         );
         assert!(w.single_part().is_none());
-        let one = Wildcard::sub_path(b"*.md");
+        let one = Wildcard::sub_path(b"*.md", false);
         assert!(one.single_part().is_some() && !one.is_name());
-        assert!(Wildcard::sub_path(b"**.md").single_part().is_none());
+        assert!(Wildcard::sub_path(b"**.md", false).single_part().is_none());
         assert_eq!(
-            Wildcard::sub_path(br"a\**x\b?cd").name_literal(),
+            Wildcard::sub_path(br"a\**x\b?cd", false).name_literal(),
             Some(b"cd".to_vec())
         );
     }
@@ -790,7 +791,7 @@ pub(crate) mod tests {
     /// The automaton checks its budget before a long text and as it goes.
     #[test]
     fn a_spent_budget_stops_the_automaton() {
-        let w = Wildcard::sub_path(b"**x");
+        let w = Wildcard::sub_path(b"**x", false);
         let long = xs(10_000);
         assert!(w.matches_decoded(&long, &Budget::unlimited()));
         with_spent_budget(|spent| assert!(!w.matches_decoded(&long, spent)));
@@ -803,7 +804,7 @@ pub(crate) mod tests {
         let parts: Vec<String> = (0..60).map(|i| format!("p{i}")).collect();
         let path = format!(r"c:\{}\end.txt", parts.join(r"\"));
         let pattern = format!(r"**\{}\**.txt", parts[5..55].join(r"\"));
-        let w = Wildcard::sub_path(pattern.as_bytes());
+        let w = Wildcard::sub_path(pattern.as_bytes(), false);
         assert!(w.toks.len() > 128, "three words of states");
         assert!(w.matches(path.as_bytes()));
         assert!(!w.matches(path.replace("p20", "q20").as_bytes()));
@@ -900,7 +901,7 @@ pub(crate) mod tests {
                 pat in "[ab\\\\*?]{0,9}",
                 text in "[ab\\\\é]{0,12}",
             ) {
-                let w = Wildcard::sub_path(pat.as_bytes());
+                let w = Wildcard::sub_path(pat.as_bytes(), false);
                 prop_assert_eq!(
                     w.matches(text.as_bytes()),
                     reference_sub_path(&pat, &text),
@@ -916,7 +917,7 @@ pub(crate) mod tests {
                 text in "[ab\\\\]{60,90}",
             ) {
                 let pattern = format!("**{head}{pat}");
-                let w = Wildcard::sub_path(pattern.as_bytes());
+                let w = Wildcard::sub_path(pattern.as_bytes(), false);
                 prop_assert_eq!(
                     w.matches(text.as_bytes()),
                     reference_sub_path(&pattern, &text)
