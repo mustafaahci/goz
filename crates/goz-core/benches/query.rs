@@ -11,7 +11,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
-use goz_core::query::{Budget, parse_query, run_query, run_query_refs};
+use goz_core::query::{
+    Budget, DateOrder, LocalClock, parse_query, parse_query_at, run_query, run_query_refs,
+};
 use goz_core::types::{Frn, SortSpec};
 use goz_core::usn::record::{FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE};
 use std::hint::black_box;
@@ -91,6 +93,77 @@ fn build_index() -> (VolumeIndex, usize) {
     // query pages from.
     idx.optimize_storage();
     (idx, count)
+}
+
+/// Whether this build reads Everything 1.5's S2 syntax: a back-port of this
+/// file to main, for an A/B of the queries both read alike, sets it false
+/// and leaves out the queries only S2 reads, or reads otherwise.
+const S2: bool = true;
+
+/// FILETIME ticks in an hour.
+const HOUR: i64 = 36_000_000_000;
+
+/// 2026-11-10T12:00:00Z, when the dated index's ages are counted from.
+const NOW: i64 = 134_387_928_000_000_000;
+
+/// The clock the date queries resolve against: [`NOW`] in UTC+3, weeks from
+/// Sunday, dates written month first.
+struct BenchClock;
+
+impl LocalClock for BenchClock {
+    fn now(&self) -> i64 {
+        NOW
+    }
+    fn to_local(&self, utc: i64) -> Option<i64> {
+        utc.checked_add(3 * HOUR)
+    }
+    fn to_utc(&self, local: i64) -> Option<i64> {
+        local.checked_sub(3 * HOUR)
+    }
+    fn week_start(&self) -> u8 {
+        6
+    }
+    fn date_order(&self) -> DateOrder {
+        DateOrder::MonthDayYear
+    }
+}
+
+/// Runs each `(label, query, s2_only)` as a bench of `group`, a page of 100
+/// rows by name, on `idx`; on a build without S2, the S2-only ones are left
+/// out.
+fn bench_group(
+    c: &mut Criterion,
+    group: &str,
+    idx: &VolumeIndex,
+    queries: &[(&str, String, bool)],
+) {
+    let mut group = c.benchmark_group(group);
+    group.sample_size(20);
+    for (label, query, s2_only) in queries {
+        if *s2_only && !S2 {
+            continue;
+        }
+        let parsed = parse_query_at(query, false, &BenchClock).unwrap();
+        eprintln!(
+            "{label}: {} matches",
+            run_query(idx, r"C:\", &parsed, None, SortSpec::default(), 0, Some(0)).total
+        );
+        group.bench_function(*label, |b| {
+            b.iter(|| {
+                let out = run_query(
+                    black_box(idx),
+                    r"C:\",
+                    black_box(&parsed),
+                    None,
+                    SortSpec::default(),
+                    0,
+                    Some(100),
+                );
+                black_box(out.total)
+            })
+        });
+    }
+    group.finish();
 }
 
 fn bench_query(c: &mut Criterion) {
@@ -289,6 +362,106 @@ fn bench_query(c: &mut Criterion) {
         });
     }
     broad.finish();
+
+    // Step S2's modifiers and functions. Those main reads alike run on both
+    // sides of an A/B; the rest (the third field) only on the branch, where
+    // each is weighed against the plain query it refines.
+    let kernel32 = run_query(
+        &idx,
+        r"C:\",
+        &parse_query("kernel32").unwrap(),
+        None,
+        SortSpec::default(),
+        0,
+        Some(1),
+    );
+    let one = String::from_utf8_lossy(
+        kernel32.hits[0]
+            .path
+            .rsplit(|&b| b == b'\\')
+            .next()
+            .unwrap(),
+    )
+    .into_owned();
+    let folder = r"C:\amd64_microsoft-windows-component-005_31bf3856ad364e35_10.0.26100.1_none_deadbeef\subcomponent_003_none_cafef00dbaadf00d";
+    let mods: Vec<(&str, String, bool)> = vec![
+        ("ext(ext:dll)", "ext:dll".into(), false),
+        ("ext-list(ext:dll;txt)", "ext:dll;txt".into(), false),
+        ("kind(file:report)", "file:report".into(), false),
+        ("kind(folder:module)", "folder:module".into(), false),
+        ("size-unknown(size:>1kb)", "size:>1kb".into(), false),
+        ("ww(ww:report)", "ww:report".into(), true),
+        ("prefix(prefix:rep)", "prefix:rep".into(), true),
+        (
+            "startwith(startwith:kernel32)",
+            "startwith:kernel32".into(),
+            true,
+        ),
+        (
+            "whole(whole:kernel32_<n>.dll)",
+            format!("whole:{one}"),
+            true,
+        ),
+        ("case(case:Report)", "case:Report".into(), true),
+        ("nopunc(nopunc:reportv1)", "nopunc:reportv1".into(), true),
+        ("macro(audio:)", "audio:".into(), true),
+        ("macro(exe:|ext:dll)", "exe:|ext:dll".into(), true),
+        ("len(len:>40)", "len:>40".into(), true),
+        (
+            "parent(...005\\subcomponent_003)",
+            format!("parent:{folder}"),
+            true,
+        ),
+        (
+            "parent(...\\bin_x64_03 *.dll)",
+            format!(r"parent:{folder}\module_group_002\bin_x64_03 *.dll"),
+            true,
+        ),
+        (
+            "ancestor(...005\\subcomponent_003 kernel32)",
+            format!("ancestor:{folder} kernel32"),
+            true,
+        ),
+        ("drive(c: kernel32)", "c: kernel32".into(), true),
+        ("lone(\\ module)", r"\ module".into(), true),
+    ];
+    bench_group(c, "query_2M_mods", &idx, &mods);
+    drop(idx);
+
+    // Sizes and dates over the same tree with every file sized (0 to 3 MB)
+    // and dated (over three years before NOW), as an enriched volume is.
+    let (mut idx, _) = build_index();
+    let files: Vec<Frn> = idx
+        .live_entries()
+        .map(|e| idx.entry(e))
+        .filter(|e| !e.is_dir())
+        .map(|e| e.frn())
+        .collect();
+    for f in files {
+        let x = (f.0 & 0xFFFF_FFFF).wrapping_mul(2_654_435_761) >> 7;
+        let age = (x % 1_095) as i64 * 24 * HOUR + (x % 86_400) as i64 * 10_000_000;
+        idx.set_stat(f, x % 3_000_000, NOW - age);
+    }
+    let dates: Vec<(&str, String, bool)> = vec![
+        ("year(dm:2024)", "dm:2024".into(), false),
+        ("after(dm:>2025)", "dm:>2025".into(), false),
+        (
+            "range(dm:2025-11-04..2026-11-04)",
+            "dm:2025-11-04..2026-11-04".into(),
+            false,
+        ),
+        ("name+year(report dm:2025)", "report dm:2025".into(), false),
+        ("size-range(size:1kb..2kb)", "size:1kb..2kb".into(), false),
+        ("size(size:>1mb)", "size:>1mb".into(), false),
+        ("rolling(dm:lastweek)", "dm:lastweek".into(), true),
+        ("month(dm:may)", "dm:may".into(), true),
+        ("hour(dm:2024-05-01T10)", "dm:2024-05-01T10".into(), true),
+        ("age(dm:>30days)", "dm:>30days".into(), true),
+        ("granule(size:1kb)", "size:1kb".into(), true),
+        ("constant(size:tiny)", "size:tiny".into(), true),
+        ("or(dm:2024|size:>2mb)", "dm:2024|size:>2mb".into(), true),
+    ];
+    bench_group(c, "query_dates", &idx, &dates);
 }
 
 criterion_group!(benches, bench_query);
