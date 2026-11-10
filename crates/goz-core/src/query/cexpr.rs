@@ -6,8 +6,8 @@
 //! [`CNode`] tree for one volume: needles become `memmem` finders, and each
 //! path term the volume's mount prefix decides becomes a constant (`C:\` is
 //! in every full path on C: and in none on D:), after which the tree is
-//! folded again, so that `c: report` runs on C: as `report` does, and on D:
-//! reads nothing. [`split`] then parts the top-level terms the name alone
+//! folded again, so that `c:\x|report` runs on D: as `report` does, and
+//! `!c:\` reads nothing on C:. [`split`] then parts the top-level terms the name alone
 //! decides from those that need the entry, so the first can run in the pass
 //! over the distinct names, the fast path of a name-level query.
 //!

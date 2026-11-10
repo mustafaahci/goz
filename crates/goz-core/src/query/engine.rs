@@ -121,6 +121,11 @@ pub struct CompiledQuery<'a> {
     /// [`walk_below_names`]. `None` for a case-sensitive query, whose pieces
     /// the folded arena cannot find.
     path_piece: Option<Vec<u8>>,
+    /// Whether a name has more to pass than the buckets' tests: a path
+    /// wildcard of one part (`name_parts`) or the expression's terms on the
+    /// name (`expr_name`). One flag, so that the test of each name of a query
+    /// without either stays one branch longer than it was.
+    name_extra: bool,
     /// The terms of the query's expression that the name alone decides,
     /// compiled for this volume: tested with the name, so on the pass over
     /// the distinct names too (see [`cexpr`]).
@@ -273,18 +278,25 @@ impl<'a> CompiledQuery<'a> {
             volume_admits,
             path_globs,
             path_wildcard_ends,
-            name_parts,
             path_piece,
             expr_paths: expr_entry.as_ref().is_some_and(CNode::tests_paths),
+            name_extra: !name_parts.is_empty() || expr_name.is_some(),
+            name_parts,
             expr_name,
             expr_entry,
         }
     }
 
-    /// Whether the scan can find its candidates in the folded names: a
-    /// case-insensitive query with a prefilter or a union of needles.
-    fn scans_names(&self, parsed: &ParsedQuery) -> bool {
-        !parsed.match_case && (self.prefilter.is_some() || !self.union.is_empty())
+    /// The needles the folded names are scanned for, each match's name
+    /// holding one: the prefilter, or a union's; none for a case-sensitive
+    /// query, whose needles the folded names cannot hold, or a query with no
+    /// literal to scan for.
+    fn needles(&self, parsed: &ParsedQuery) -> &[Vec<u8>] {
+        match &self.prefilter {
+            _ if parsed.match_case => &[],
+            Some(needle) => std::slice::from_ref(needle),
+            None => &self.union,
+        }
     }
 
     /// Whether a candidate's full path has anything left to decide.
@@ -575,6 +587,20 @@ fn name_matches(
     id: NameId,
     scratch: &mut Scratch,
 ) -> bool {
+    name_matches_as::<true>(index, parsed, compiled, id, scratch)
+}
+
+/// [`name_matches`], stamped out for whether the query may have tests beyond
+/// the buckets' (`EXTRA`): with `EXTRA` false, for a query that has none
+/// (`!compiled.name_extra`), it is the test v0.6.0 ran, not one branch
+/// longer, for the pass over every distinct name that tests nothing else.
+fn name_matches_as<const EXTRA: bool>(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    id: NameId,
+    scratch: &mut Scratch,
+) -> bool {
     let hay = if parsed.match_case {
         index.name_raw(id)
     } else {
@@ -583,12 +609,29 @@ fn name_matches(
     compiled.name_finders.iter().all(|f| f.find(hay).is_some())
         && (parsed.wildcards.is_empty()
             || wildcards_match(&parsed.wildcards, hay, &mut scratch.cps, compiled.budget))
-        && (compiled.name_parts.is_empty()
-            || last_part_matches(&compiled.name_parts, hay, &mut scratch.cps, compiled.budget))
         // The ext check folds the extension, so it runs after the
         // allocation-free predicates that reject most names.
         && ext_matches(&parsed.filters, index.name_raw(id), &mut scratch.ext)
-        // Only a query with operators has an expression.
+        && (!EXTRA
+            || !compiled.name_extra
+            || name_extra_matches(index, parsed, compiled, id, hay, scratch))
+}
+
+/// What name `id` (`hay` as the query compares it) must pass beyond the
+/// buckets' tests: the path wildcards of one part, and the expression's
+/// terms on the name. Kept out of line, as is [`entry_expr_matches`], so that
+/// the test of every name of a query without them stays the code it was.
+#[inline(never)]
+fn name_extra_matches(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+    id: NameId,
+    hay: &[u8],
+    scratch: &mut Scratch,
+) -> bool {
+    (compiled.name_parts.is_empty()
+        || last_part_matches(&compiled.name_parts, hay, &mut scratch.cps, compiled.budget))
         && compiled.expr_name.as_ref().is_none_or(|e| {
             e.eval(&mut Subject::name(
                 index,
@@ -598,6 +641,34 @@ fn name_matches(
                 scratch,
             ))
         })
+}
+
+/// Whether entry `idx` matches `e`, the expression's terms on the entry,
+/// reading its full path through `folders` when a term asks.
+#[inline(never)]
+fn entry_expr_matches(
+    e: &CNode,
+    index: &VolumeIndex,
+    idx: EntryIdx,
+    match_case: bool,
+    budget: &Budget,
+    folders: &mut Option<FolderPaths>,
+    scratch: &mut Scratch,
+) -> bool {
+    let mut full_path = |out: &mut Vec<u8>| {
+        folders
+            .as_mut()
+            .and_then(|f| f.with_full_path(index, idx, |p| out.extend_from_slice(p)))
+            .is_some()
+    };
+    e.eval(&mut Subject::entry(
+        index,
+        idx,
+        match_case,
+        budget,
+        scratch,
+        &mut full_path,
+    ))
 }
 
 /// Whether the last part of `name` matches every one of `parts`: the
@@ -687,40 +758,37 @@ fn for_each_prefilter_hit_in(
     }
 }
 
-/// [`for_each_prefilter_hit_in`] for each of several needles, calling `f`
-/// once per name, however many of them it holds: a union prefilter.
-fn for_each_union_hit_in(
-    index: &VolumeIndex,
-    needles: &[Vec<u8>],
-    ids: Range<usize>,
-    mut f: impl FnMut(NameId),
-) {
-    let base = ids.start;
-    let mut seen = vec![0u64; ids.len().div_ceil(64)];
-    for needle in needles {
-        for_each_prefilter_hit_in(index, needle, ids.clone(), |id| {
-            let at = id as usize - base;
-            let bit = 1u64 << (at % 64);
-            if seen[at / 64] & bit == 0 {
-                seen[at / 64] |= bit;
-                f(id);
-            }
-        });
-    }
+/// The names a scan for several needles has handed on already, so that a
+/// name holding two of them is tested once. A scan for one needle finds each
+/// name once and needs none.
+///
+/// Every scan of the names, for one needle or several, goes through the one
+/// instantiation of [`for_each_prefilter_hit_in`] its pass makes, once per
+/// needle: a second generic path for unions beside it made the compiler stop
+/// inlining each pass's per-name closure into its loop, and a plain query's
+/// pass over every name ran 15% slower.
+struct Seen {
+    base: usize,
+    words: Vec<u64>,
 }
 
-/// Calls `f` once per name with an id in `ids` that the prefilter of
-/// `compiled` finds: its needle's, or its union's. The caller checks
-/// [`CompiledQuery::scans_names`].
-fn for_each_hit_in(
-    index: &VolumeIndex,
-    compiled: &CompiledQuery,
-    ids: Range<usize>,
-    f: impl FnMut(NameId),
-) {
-    match compiled.prefilter.as_deref() {
-        Some(needle) => for_each_prefilter_hit_in(index, needle, ids, f),
-        None => for_each_union_hit_in(index, &compiled.union, ids, f),
+impl Seen {
+    /// The set for a scan of `needles` over the names with ids in `ids`:
+    /// `None` for one needle.
+    fn of(needles: &[Vec<u8>], ids: &Range<usize>) -> Option<Seen> {
+        (needles.len() > 1).then(|| Seen {
+            base: ids.start,
+            words: vec![0; ids.len().div_ceil(64)],
+        })
+    }
+
+    /// Whether `id` comes for the first time, marking it.
+    fn first(&mut self, id: NameId) -> bool {
+        let at = id as usize - self.base;
+        let bit = 1u64 << (at % 64);
+        let first = self.words[at / 64] & bit == 0;
+        self.words[at / 64] |= bit;
+        first
     }
 }
 
@@ -839,18 +907,31 @@ fn match_names(
     parsed: &ParsedQuery,
     compiled: &CompiledQuery,
 ) -> (NameSet, u64) {
+    // Stamped out for the query's shape, so that a query with one needle or
+    // none and no name tests beyond the buckets' runs the loop it always has:
+    // it tests every distinct name, and an instruction more per name showed.
+    match (compiled.needles(parsed).len() > 1, compiled.name_extra) {
+        (false, false) => match_names_as::<false, false>(index, parsed, compiled),
+        (false, true) => match_names_as::<false, true>(index, parsed, compiled),
+        (true, false) => match_names_as::<true, false>(index, parsed, compiled),
+        (true, true) => match_names_as::<true, true>(index, parsed, compiled),
+    }
+}
+
+/// [`match_names`] for a scan of several needles (`UNION`), whose repeats
+/// it skips, and for a query with name tests beyond the buckets' (`EXTRA`).
+fn match_names_as<const UNION: bool, const EXTRA: bool>(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+) -> (NameSet, u64) {
     use rayon::prelude::*;
     let names = index.name_count();
     let per = chunk_words(names);
-    let needle = compiled.prefilter.as_deref().filter(|_| !parsed.match_case);
-    let union: &[Vec<u8>] = if parsed.match_case {
-        &[]
-    } else {
-        &compiled.union
-    };
+    let needles = compiled.needles(parsed);
     // Case-sensitive, or no literal to drive the arena scan: every live name
     // is tested. Dead names are zero-filled and have no entries.
-    let verify = needle.is_none() || !compiled.prefilter_decides_name;
+    let verify = needles.is_empty() || !compiled.prefilter_decides_name;
     let mut words = vec![0u64; names.div_ceil(64)];
     let chunks = words.len().div_ceil(per);
     let (len, total) = on_name_pool(chunks, || {
@@ -863,13 +944,20 @@ fn match_names(
                 let mut scratch = Scratch::default();
                 let mut watch = Watch::new(compiled.budget);
                 let (mut len, mut total) = (0usize, 0u64);
+                let mut seen = if UNION { Seen::of(needles, &ids) } else { None };
                 let mut mark = |id: NameId| {
+                    if UNION
+                        && let Some(seen) = seen.as_mut()
+                        && !seen.first(id)
+                    {
+                        return;
+                    }
                     // Only testing a name costs more with more terms, so only
                     // that counts against the budget. Without it this pass is
                     // bounded by the volume's names, whatever the query.
                     if verify
                         && (watch.tick()
-                            || !name_matches(index, parsed, compiled, id, &mut scratch))
+                            || !name_matches_as::<EXTRA>(index, parsed, compiled, id, &mut scratch))
                     {
                         return;
                     }
@@ -878,15 +966,14 @@ fn match_names(
                     len += 1;
                     total += entries_bearing(index, id);
                 };
-                match needle {
-                    Some(needle) => for_each_prefilter_hit_in(index, needle, ids, &mut mark),
-                    None if !union.is_empty() => {
-                        for_each_union_hit_in(index, union, ids, &mut mark);
-                    }
-                    None => ids
-                        .map(|id| id as NameId)
+                if needles.is_empty() {
+                    ids.map(|id| id as NameId)
                         .filter(|&id| index.name_refcount(id) > 0)
-                        .for_each(&mut mark),
+                        .for_each(&mut mark);
+                } else {
+                    for needle in needles {
+                        for_each_prefilter_hit_in(index, needle, ids.clone(), &mut mark);
+                    }
                 }
                 (len, total)
             })
@@ -1036,7 +1123,7 @@ fn top_k_applies(
     sort.key != SortKey::Path
         && limit.is_some_and(|l| (offset as usize).saturating_add(l as usize) <= TOP_K_MAX)
         && scope.is_none()
-        && compiled.scans_names(parsed)
+        && !compiled.needles(parsed).is_empty()
         && compiled.volume_admits
         && !compiled.tests_paths()
         && !index.may_have_unpresentable()
@@ -1076,6 +1163,7 @@ fn top_k_refs(
     sum_sizes: bool,
 ) -> Result<RefOutcome, Stopped> {
     use rayon::prelude::*;
+    let needles = compiled.needles(parsed);
     let want = offset as usize + limit as usize;
     let names = index.name_count();
     let per = chunk_words(names);
@@ -1102,10 +1190,18 @@ fn top_k_refs(
         let mut no_folders = None;
         let mut watch = Watch::new(compiled.budget);
         let (mut count, mut size) = (0u64, 0u64);
-        for_each_hit_in(index, compiled, chunk_ids(i, per, names), |id| {
+        let ids = chunk_ids(i, per, names);
+        let mut seen = Seen::of(needles, &ids);
+        let mut hit = |id: NameId| {
+            if let Some(seen) = seen.as_mut()
+                && !seen.first(id)
+            {
+                return;
+            }
             // As in `match_names`: only testing a name costs more with more
-            // terms. An entry below costs the same whatever the query, as no
-            // query here tests a path.
+            // terms. An entry below costs little whatever the query: no query
+            // here tests a path, and an expression's terms on the entry are
+            // kind, size and date compares, at most the term cap of them.
             if !compiled.prefilter_decides_name
                 && (watch.tick() || !name_matches(index, parsed, compiled, id, &mut scratch))
             {
@@ -1147,7 +1243,10 @@ fn top_k_refs(
                 }
                 kept.push(c);
             }
-        });
+        };
+        for needle in needles {
+            for_each_prefilter_hit_in(index, needle, ids.clone(), &mut hit);
+        }
         (count, size)
     };
     let (total, total_size) = on_name_pool(chunks, || {
@@ -1208,7 +1307,8 @@ fn scan_cost(
     compiled: &CompiledQuery,
     hits: &mut Option<Vec<NameId>>,
 ) -> usize {
-    if !compiled.scans_names(parsed) {
+    let needles = compiled.needles(parsed);
+    if needles.is_empty() {
         return if compiled.path_piece.is_some() {
             0
         } else {
@@ -1217,10 +1317,15 @@ fn scan_cost(
     }
     let mut ids = Vec::new();
     let mut entries = 0usize;
-    for_each_hit_in(index, compiled, 0..index.name_count(), |id| {
-        entries += index.name_refcount(id) as usize;
-        ids.push(id);
-    });
+    let mut seen = Seen::of(needles, &(0..index.name_count()));
+    for needle in needles {
+        for_each_prefilter_hit(index, needle, |id| {
+            if seen.as_mut().is_none_or(|seen| seen.first(id)) {
+                entries += index.name_refcount(id) as usize;
+                ids.push(id);
+            }
+        });
+    }
     *hits = Some(ids);
     entries
 }
@@ -1317,13 +1422,20 @@ fn scan_with(
     // verify the rest per hit.
     if subtree_done {
         // Scoped walk answered the query; the scan paths are skipped.
-    } else if compiled.scans_names(parsed) {
+    } else if !compiled.needles(parsed).is_empty() {
         // The scan cost is proportional to the unique-name bytes (~1/3 of
         // the total on a real volume); a hit fans out to every entry bearing
         // the name through its same-name chain. The chains are exact, so no
         // per-candidate staleness guard is needed. A scope walk that priced
-        // this scan already found the names.
-        let on_hit = |id: NameId| {
+        // this scan already found the names, each once.
+        let needles = compiled.needles(parsed);
+        let mut seen = Seen::of(needles, &(0..index.name_count()));
+        let mut on_hit = |id: NameId| {
+            if let Some(seen) = seen.as_mut()
+                && !seen.first(id)
+            {
+                return;
+            }
             for idx in index.name_chain(id) {
                 if watch.tick() {
                     return;
@@ -1349,7 +1461,11 @@ fn scan_with(
         };
         match prefilter_hits {
             Some(ids) => ids.into_iter().for_each(on_hit),
-            None => for_each_hit_in(index, compiled, 0..index.name_count(), on_hit),
+            None => {
+                for needle in needles {
+                    for_each_prefilter_hit(index, needle, &mut on_hit);
+                }
+            }
         }
     } else if let Some(piece) = compiled.path_piece.as_deref()
         && walk_below_names(
@@ -1635,24 +1751,18 @@ fn evaluate(
 
     // The expression's terms on the entry go last, once the entry is known
     // to have a path: a NOT must not admit an entry the page cannot list.
-    if let Some(e) = &compiled.expr_entry {
-        let mut full_path = |out: &mut Vec<u8>| {
-            folders
-                .as_mut()
-                .and_then(|f| f.with_full_path(index, idx, |p| out.extend_from_slice(p)))
-                .is_some()
-        };
-        let mut subject = Subject::entry(
+    if let Some(e) = &compiled.expr_entry
+        && !entry_expr_matches(
+            e,
             index,
             idx,
             parsed.match_case,
             compiled.budget,
+            folders,
             scratch,
-            &mut full_path,
-        );
-        if !e.eval(&mut subject) {
-            return None;
-        }
+        )
+    {
+        return None;
     }
 
     Some(Candidate { idx, key: 0 })
