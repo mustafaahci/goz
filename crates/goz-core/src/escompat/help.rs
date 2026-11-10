@@ -109,14 +109,26 @@ const INTRO: &str = "goz prints the full path of every indexed file and folder t
      its name may be left out, so -sortpath is -sort-path. A second leading dash \
      changes nothing, except for goz's own switches such as --json, which must be \
      typed exactly. A value can follow an equals sign, as in -n=5. Two dashes alone \
-     end the switches: the rest is search text. Quote search text that holds < or > \
-     so the shell passes it on.";
+     end the switches: the rest is search text. The search text follows Everything \
+     1.5's syntax, as listed below. cmd and PowerShell take | < and > for \
+     themselves, so escape them, as ^| in cmd, or pass -argv and quote the whole \
+     search text, as in goz -argv \"a b|c\". Without -argv the quotes reach the \
+     search, as in es: \"a|b\" is a phrase whose | is text, and a value is quoted \
+     alone, as in size:\">1mb\". A modifier such as case: or ww: applies to the \
+     term or <group> it prefixes, is turned off by no, as in nocase:, and with a \
+     leading ?, as in ?case:, applies to every later term. Search text goz cannot \
+     search as written, such as an unbalanced <, or a function it lacks, such as \
+     regex: or diacritics:, exits 4.";
 
 const QUICK_FOOTER: &str = "Run goz --help for every switch, the search syntax and the exit codes.";
 
 /// Complete command lines, as typed in cmd or PowerShell, with what each does.
 const EXAMPLES: &[(&str, &str)] = &[
     ("goz report.pdf", "Find names that contain report.pdf"),
+    (
+        r#"goz -argv "report|invoice !draft""#,
+        "Either word, and not draft, in a name",
+    ),
     (
         r"goz -path C:\Users\me invoice",
         r"Find invoice anywhere below C:\Users\me",
@@ -135,27 +147,95 @@ const EXAMPLES: &[(&str, &str)] = &[
 /// Search text as goz receives it.
 const SEARCH_TEXT: &[(&str, &str)] = &[
     ("report", "Names that contain report"),
-    ("report pdf", "Names that contain both words, in any order"),
-    ("\"report pdf\"", "Names that contain that exact phrase"),
-    ("*.cs", "Whole names that match a wildcard, * or ?"),
+    (
+        "report pdf",
+        "Names that contain both words, in any order: AND",
+    ),
+    (
+        "report|pdf",
+        "Names that contain either word: OR, which binds tighter than AND, \
+         so a b|c is a and (b or c)",
+    ),
+    (
+        "!draft",
+        "Names without draft: NOT, where a term starts (wow!.txt is a name)",
+    ),
+    ("<a b>|c", "A group: a and b, or c; !<a|b> is neither"),
+    ("and:, or:, not:", "The operators as words, as in a or: b"),
+    (
+        "\"report pdf\"",
+        "Names that contain that exact phrase; | ! < > in quotes are text",
+    ),
+    (
+        "*.cs",
+        "Whole names that match a wildcard: * any run, ? one character",
+    ),
+    (
+        r"src\*.rs",
+        "With a \\, a wildcard matches the end of the full path, and * and ? \
+         stay inside one folder: the .rs files right in a folder named src",
+    ),
+    (
+        r"src\**\*.rs",
+        "** crosses folders: the .rs files in any folder below src",
+    ),
     (r"docs\api", r"Full paths that contain docs\api"),
     (r"C:\repo\", "Everything below that folder"),
-    ("ext:cs;txt", "Extension is cs or txt"),
+    (r"\", "Folders only"),
+    ("d:", "Everything on drive D:"),
+    (
+        "ext:cs;txt",
+        "Files whose extension is cs or txt; any function takes a ; list",
+    ),
     (
         "size:>1mb",
-        "Larger than 1 MB; also size:<=4kb, size:1kb..2mb or size:huge",
+        "Larger than 1 MB; also size:<=4kb, size:1kb..2mb, size:empty or \
+         size:huge; size:1kb is 1024 to 2047 bytes",
     ),
     (
         "dm:today",
-        "Modified today; also dm:lastweek, dm:2024-05, dm:<30days, \
-         dm:2024-01-01..2024-03-31 or dm:unknown",
+        "Modified today; also dm:lastweek (the last 7 days), dm:prevweek, \
+         dm:2024-05, dm:<30days (newer), dm:2024-01-01..2024-03-31 or \
+         dm:unknown",
     ),
-    ("path:TEXT", "Full paths that contain TEXT"),
+    ("len:>40", "Names longer than 40 characters"),
+    (
+        r"parent:C:\src",
+        r"Entries right in C:\src; ancestor:C:\src is all below it",
+    ),
+    (
+        "path:TEXT",
+        "Full paths that contain TEXT; nopath: tests names only",
+    ),
+    (
+        "name:, stem:, location:",
+        "Text in the name, the name without its extension, or the path of \
+         its folder; also full-path:, parent-name:, extension:",
+    ),
     (
         "file:, folder:, dir:",
         "Only files, or only folders; file:TEXT also needs TEXT in the name",
     ),
-    ("case:", "Match case for this search"),
+    (
+        "audio:, doc:, exe:",
+        "Everything's filters by extension, as are image:, video: and zip:",
+    ),
+    (
+        "case:TEXT",
+        "Match case for this term; case: alone, for the whole search",
+    ),
+    (
+        "ww:TEXT",
+        "TEXT as whole words; prefix: and suffix: at a word's start or end",
+    ),
+    (
+        "startwith:, endwith:",
+        "The name starts or ends with the text; whole: is the whole name",
+    ),
+    (
+        "nopunc:, nows:",
+        "Skip punctuation or white space in the name",
+    ),
     (
         "matchpath:",
         "Match all search text against full paths, as -p does",
@@ -477,13 +557,13 @@ mod tests {
         }
     }
 
-    /// Each example is a command line goz accepts as the search it describes.
+    /// Each example is a command line goz accepts as the search it
+    /// describes, read as goz reads its own.
     #[test]
     fn every_example_parses() {
         for (example, _) in EXAMPLES {
-            let tokens: Vec<&str> = example.split(' ').collect();
-            assert_eq!(tokens[0], "goz", "{example}");
-            match parse_argv(&argv(&tokens[1..])) {
+            assert!(example.starts_with("goz "), "{example}");
+            match crate::escompat::parse_command_line(example) {
                 Ok(Command::Run(plan)) => {
                     assert!(
                         !plan.query.is_empty() || plan.status,
@@ -494,6 +574,20 @@ mod tests {
                 other => panic!("{example}: {other:?}"),
             }
         }
+    }
+
+    /// The OR example searches with the operators, not for a phrase.
+    #[test]
+    fn the_or_example_searches_with_operators() {
+        let (example, _) = EXAMPLES
+            .iter()
+            .find(|(example, _)| example.contains('|'))
+            .expect("an OR example");
+        let Ok(Command::Run(plan)) = crate::escompat::parse_command_line(example) else {
+            panic!("{example}");
+        };
+        assert_eq!(plan.query, "report|invoice !draft");
+        assert!(parse_query(&plan.query).unwrap().expr.is_some());
     }
 
     /// Each search text form parses, and a function form is read as the

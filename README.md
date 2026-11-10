@@ -66,7 +66,11 @@ goz -path C:\Users\me invoice -n 50 -size -dm -sort-path -export-csv out.csv
 
 # filter by date modified: calendar days run between local midnights
 goz invoice dm:lastmonth
-goz "dm:>=2024-01-01" ext:pdf
+goz dm:">=2024-01-01" ext:pdf
+
+# OR, NOT and groups (quoted for the shell, see below)
+goz -argv "report|invoice !draft"
+goz -argv "<ext:pdf size:>1mb>|ext:docx dm:thisyear"
 
 # machine-readable output
 goz --json kernel32.dll
@@ -85,7 +89,42 @@ With `-size` and `-dm` the listing shows `es.exe`'s console columns: the size ri
 
 `goz -h` (or `-?`) prints a quick help and `goz --help` the full reference: every switch, the search syntax and the exit codes. `goz --version` prints the client's version and `goz --server-version` the running daemon's. None of them needs the daemon except `--server-version`.
 
-`dm:` (or `datemodified:`) takes `today`, `yesterday`, `thisweek`, `lastweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear`, a year, month or day (`2024`, `2024-05`, `2024-05-01`), or a duration back from now (`7days`, `last2hours`, `3months`), each optionally after `<`, `<=`, `>` or `>=`, or two of them as a range `2024-01-01..2024-03-31`. Days run between midnights in the machine's time zone, a week starts on the first day of the week of the service's regional format, and a file whose date goz has not read yet matches only `dm:unknown`.
+### Search syntax
+
+goz reads Everything 1.5's search syntax. `goz --help` lists it in short; the rules:
+
+| Syntax | Meaning | Example |
+| --- | --- | --- |
+| space | AND | `report pdf` |
+| `\|` or `or:` | OR. It binds tighter than AND, as in Everything: `a b\|c` is `a` AND (`b` OR `c`). `?and-precedence:` turns that round for the operators after it | `report\|invoice` |
+| `!` or `not:` | NOT, only where a term starts (`wow!.txt` is a name) | `report !draft`, `!ext:tmp` |
+| `< >` | grouping; `<>` is everything | `<ext:pdf size:>1mb>\|ext:docx` |
+| `and:` | AND, as a word | `a and: b` |
+| `"..."` | a phrase: spaces, `\|`, `!`, `<`, `>` inside are text; wildcards stay wildcards | `"annual report"` |
+| `*`, `?` | wildcards. Without `\` they match the whole name. With a `\` they match the end of the full path from any folder boundary, and `*` and `?` stay inside one folder; `**` crosses folders. A trailing `\` means "below" | `*.iso`, `src\*.rs` (right in a `src` folder), `src\**\*.rs` (anywhere below one), `windows\*\` |
+| `\`, `d:` | folders only; everything on drive D: | `\ build`, `d: *.iso` |
+| `&vert:`, `&excl:`, `&lt:`, `&gt:`, `&quot:`, `&sp:`, `&#33:` ... | one literal character | `a&vert:b` |
+
+Modifiers prefix a term or a `<group>` (`case:<Foo Bar>`), stack (`file:case:ww:Report`), take Everything's aliases with or without hyphens, are switched off with `no` (`nocase:`, `no-path:`), and with a leading `?` (`?case:`) apply to every later term:
+`case:` (alone, or `case:0`/`case:1`, it is a whole-search switch, as it always was in goz), `path:`, `file:`/`files:`, `folder:`/`folders:`, `dir:`, `ww:`/`wholeword:`, `prefix:`, `suffix:`, `whole:`/`exact:`, `startwith:`/`^:`, `endwith:`/`$:`, `nopunc:` (`ignore-punctuation:`), `nows:` (`ignore-whitespace:`), `starall:` (`*` crosses folders), `nowildcards:`, `metric:` (1000-based sizes), `no-!:` (the term's `!` is text), and `matchpath:` (every term against full paths, as `-p`).
+
+Functions take a value, a `;` list of values (OR), or a `<...|...>` group of values:
+
+- `ext:pdf;docx`: the extension, files only; `ext:` alone is files without one, `ext:mp?` takes wildcards, `ext:tar.gz` is a suffix. `extension:` is "contains".
+- `size:`: `size:>1mb`, `size:<=4kb`, `size:1kb..2mb`, `size:1.5mb`; `size:1kb` is 1024 to 2047 bytes (one unit of the last digit written), `size:=1024` exact; constants `empty`, `tiny`, `small`, `medium`, `large`, `huge`, `gigantic`, `unknown`. goz keeps no folder sizes, so `size:` never matches a folder.
+- `dm:` (`date:`, `datemodified:`): see below.
+- `len:>40` (the name's length; with `path:` the full path's), `namelen:`, `pathlen:`, `pathpartlen:`, `extlen:`.
+- `parent:C:\src` (`infolder:`): the entries right in that folder; `ancestor:C:\src`: everything below it. Both take an absolute path.
+- `name:`, `stem:`, `full-path:`, `location:` (`pp:`), `parent-name:`: text in that part of the path.
+- `audio:`, `zip:`, `doc:`, `exe:`, `image:` (`pic:`), `video:`: Everything 1.5's own filters, extension lists included; `audio:beatles` is audio AND beatles.
+
+A comparison goes before a value: `=`, `==`, `!=`, `<`, `<=`, `>`, `>=`; `size:!1kb` is any size but that. Ranges are `a..b` (or `a-b`), inclusive, either way round.
+
+`dm:` (or `date:`, `datemodified:`) takes `today`, `yesterday`, `tomorrow`, `now`, `thisweek`/`thismonth`/`thisyear`, `lastweek`/`lastmonth`/`lastyear` (rolling: the last 7 days, month, year, as in Everything 1.5), `prevweek`/`prevmonth`/`prevyear` (the previous calendar period; what goz 0.6 called `last*`), `nextweek`, `prev2months`, `next3days`, `coming2weeks`, an age (`7days`, `last2hours`, `3mo`), `mtd`/`ytd`, month and weekday names (`may`, `dec2025`, `mon` is Monday), a year, month, day or hour (`2024`, `24`, `2024-05`, `2024-05-01`, `20240501`, `2024-05-01T10`, `5/1/2024` in the regional date order), `unknown`, each optionally after a comparison, or as a range `2024-01-01..2024-03-31`. An age compares as an age: `dm:<30days` is newer than 30 days, `dm:>30days` older. Days run between midnights in the machine's time zone, a week starts on the first day of the week of the service's regional format, and a file whose date goz has not read yet matches only `dm:unknown`.
+
+Not supported yet, each refused with exit code `4` and a message naming it: `regex:`, `diacritics:` (goz's matching keeps accents: `cafe` does not find `café`), extended `wildcards:`, group expansion (`gr<a|e>y`), Everything's tree, attribute, content and other-date functions (`depth:`, `attrib:`, `content:`, `dc:`, `da:` ...), quarters, ISO weeks and date wildcards. Unlike Everything, goz refuses malformed search text instead of guessing: an unbalanced `<` or `>` exits `4` with its column.
+
+On the command line, cmd and PowerShell treat `|`, `<` and `>` as their own. Either escape them (`goz report^|invoice` in cmd, `goz 'report|invoice'` in PowerShell) or pass `-argv` and quote the whole search text, which works in both: `goz -argv "report|invoice !draft"`. Without `-argv`, quotes reach the search as in `es.exe`: `goz "a|b"` searches for the phrase `a|b`, and a value with `<` or `>` is quoted alone, as in `goz size:">1mb"`. `-ad`, `-a-d` and `-p` apply to the whole search, operators included.
 
 gozd searches each volume for at most 10 s per query, so one search cannot hold up the index's updates and the other searches for longer. A search that needs more, such as many wildcard terms with no letters to look for, is refused, and goz exits with code 4. A search whose client goes away stops too.
 
