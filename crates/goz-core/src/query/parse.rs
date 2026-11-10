@@ -1,8 +1,9 @@
 //! Query tokenizer and grammar for goz's v1 search syntax.
 //!
 //! Supported: space-separated terms (implicit AND), `"quoted phrases"`,
-//! `*`/`?` wildcards (anchored to the whole name, or to the whole full path
-//! for a path wildcard), path terms (a term
+//! `*`/`?` wildcards (anchored to the whole name, or for a path wildcard to
+//! the end of the full path, part by part, as Everything 1.5 matches them:
+//! see the `glob` module), path terms (a term
 //! containing `\` or `/`, matched against the full path with its drive), and
 //! the functions `ext:`, `size:`, `dm:`, `path:`, `file:`, `folder:`, `case:`,
 //! `matchpath:`, whose value may be quoted. The boolean operators `|` and `!` are rejected
@@ -16,258 +17,10 @@
 //! ready-to-use needles. A `dm:` value is resolved here too, to FILETIME
 //! bounds, against the [`LocalClock`] the query is parsed with.
 
-use super::budget::Budget;
 use super::dates::{DateFilter, LocalClock, date_filter};
 use crate::fold::fold;
-use smallvec::SmallVec;
 
-/// Scratch buffer of decoded code points, reused across candidates so a
-/// wildcard scan doesn't heap-allocate per candidate. NTFS names are <= 255
-/// code points, so a name fits inline; a path wildcard's full path may spill
-/// it once, and `clear` keeps that capacity for the rest of the scan.
-pub type CodePointBuf = SmallVec<[u32; 256]>;
-
-/// Decodes `text` (WTF-8) into `buf`, cleared first, for
-/// [`Wildcard::matches_decoded`]: once per candidate, however many
-/// wildcards test it.
-pub(crate) fn decode_into(text: &[u8], buf: &mut CodePointBuf) {
-    buf.clear();
-    buf.extend(crate::wtf8::CodePoints::new(text));
-}
-
-/// A compiled wildcard pattern, matched against a whole name or, for a path
-/// wildcard, a whole full path.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Wildcard {
-    tokens: Vec<GlobTok>,
-    /// The code points a match has at least: one per literal and `?`.
-    min_len: usize,
-    /// Whether the pattern holds a `*`. Without one, a match has exactly
-    /// `min_len` code points.
-    any_run: bool,
-    /// [`Wildcard::glob_match`] checks its budget each time the text position
-    /// it backtracks to has these low bits clear: about every
-    /// [`GLOB_STEPS_PER_CHECK`] steps, as a backtrack starts a pass of at most
-    /// one step per token.
-    check_mask: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum GlobTok {
-    Lit(u32),
-    /// `?`: exactly one code point.
-    AnyOne,
-    /// `*`: any run of code points (including empty).
-    AnyRun,
-}
-
-impl Wildcard {
-    /// Compiles a pattern whose bytes are already folded iff the query is
-    /// case-insensitive.
-    fn compile(pattern: &[u8]) -> Self {
-        let mut tokens = Vec::new();
-        for cp in crate::wtf8::CodePoints::new(pattern) {
-            match cp {
-                0x2A => {
-                    // '*': collapse runs of '*' into one AnyRun.
-                    if tokens.last() != Some(&GlobTok::AnyRun) {
-                        tokens.push(GlobTok::AnyRun);
-                    }
-                }
-                0x3F => tokens.push(GlobTok::AnyOne),
-                other => tokens.push(GlobTok::Lit(other)),
-            }
-        }
-        let runs = tokens.iter().filter(|t| **t == GlobTok::AnyRun).count();
-        Wildcard {
-            min_len: tokens.len() - runs,
-            any_run: runs > 0,
-            check_mask: (GLOB_STEPS_PER_CHECK / (tokens.len() + 1)).next_power_of_two() - 1,
-            tokens,
-        }
-    }
-
-    /// Matches the whole of `text`, a name or full path that
-    /// [`decode_into`] decoded. Answers `false` once `budget` is spent, as
-    /// the query is then refused whatever this answers.
-    ///
-    /// A text that cannot fit is turned away without a walk. A match that may
-    /// take many steps checks the budget first: [`Wildcard::glob_match`] checks
-    /// only every so many, so a search of many terms over texts too short to
-    /// reach a check of its own ran seconds past its budget.
-    pub(crate) fn matches_decoded(&self, text: &[u32], budget: &Budget) -> bool {
-        let fits = if self.any_run {
-            text.len() >= self.min_len
-        } else {
-            text.len() == self.min_len
-        };
-        // Each code point the `*`s can take is a backtrack, and a pass of at
-        // most one step per token.
-        let costly = || (text.len() - self.min_len) * self.tokens.len() >= GLOB_COSTLY_STEPS;
-        fits && !(costly() && budget.check()) && self.glob_match(text, budget)
-    }
-
-    /// Matches the whole of `name` (WTF-8, folded iff the query is
-    /// case-insensitive) against the pattern. Convenience wrapper that
-    /// allocates a one-off buffer; the search decodes each candidate once
-    /// for all its wildcards instead.
-    pub fn matches(&self, name: &[u8]) -> bool {
-        let mut buf = CodePointBuf::new();
-        decode_into(name, &mut buf);
-        self.matches_decoded(&buf, &Budget::unlimited())
-    }
-
-    /// Iterative glob match with backtracking on the last `*`. Each backtrack
-    /// starts a pass of at most one step per pattern token, so a pattern of
-    /// `k` tokens takes up to `k` steps per code point of the text: fast for
-    /// real patterns, but one built to backtrack against a long full path can
-    /// take minutes, so `budget` is checked as the backtracks add up, and a
-    /// spent one ends the match unmatched.
-    fn glob_match(&self, text: &[u32], budget: &Budget) -> bool {
-        let pat = self.tokens.as_slice();
-        let (mut ti, mut pi) = (0usize, 0usize);
-        let mut star: Option<(usize, usize)> = None; // (pattern idx after '*', text idx)
-        while ti < text.len() {
-            match pat.get(pi) {
-                Some(GlobTok::Lit(c)) if *c == text[ti] => {
-                    pi += 1;
-                    ti += 1;
-                }
-                Some(GlobTok::AnyOne) => {
-                    pi += 1;
-                    ti += 1;
-                }
-                Some(GlobTok::AnyRun) => {
-                    // A last `*` takes all that is left.
-                    if pi + 1 == pat.len() {
-                        return true;
-                    }
-                    star = Some((pi + 1, ti));
-                    pi += 1;
-                }
-                _ => {
-                    // Mismatch: backtrack to the last '*' and consume one more char.
-                    if let Some((sp, st)) = star {
-                        let next = st + 1;
-                        if next & self.check_mask == 0 && budget.check() {
-                            return false;
-                        }
-                        pi = sp;
-                        ti = next;
-                        star = Some((sp, next));
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        }
-        while let Some(GlobTok::AnyRun) = pat.get(pi) {
-            pi += 1;
-        }
-        pi == pat.len()
-    }
-
-    /// The longest run of literal characters in the pattern, as WTF-8 bytes
-    /// (already folded iff the query is case-insensitive). A name matching the
-    /// pattern must contain this substring, so it can drive a prefilter scan.
-    /// `None` if the pattern is all wildcards (e.g. `*`, `?`).
-    pub fn longest_literal(&self) -> Option<Vec<u8>> {
-        let mut best: Vec<u8> = Vec::new();
-        let mut run: Vec<u8> = Vec::new();
-        for tok in &self.tokens {
-            match tok {
-                GlobTok::Lit(cp) => encode_wtf8(*cp, &mut run),
-                _ => {
-                    if run.len() > best.len() {
-                        best = std::mem::take(&mut run);
-                    }
-                    run.clear();
-                }
-            }
-        }
-        if run.len() > best.len() {
-            best = run;
-        }
-        (!best.is_empty()).then_some(best)
-    }
-
-    /// Each maximal run of literal characters holding no `\`, as WTF-8 bytes
-    /// (already folded iff the query is case-insensitive). A full path the
-    /// pattern matches holds each run inside one of its names or inside the
-    /// mount prefix, since a literal matches only itself.
-    pub(crate) fn separator_free_literals(&self) -> Vec<Vec<u8>> {
-        let mut runs = Vec::new();
-        let mut run = Vec::new();
-        for tok in &self.tokens {
-            match tok {
-                GlobTok::Lit(cp) if *cp != u32::from(b'\\') => encode_wtf8(*cp, &mut run),
-                _ if !run.is_empty() => runs.push(std::mem::take(&mut run)),
-                _ => {}
-            }
-        }
-        if !run.is_empty() {
-            runs.push(run);
-        }
-        runs
-    }
-
-    /// The literal characters before the pattern's first `*` or `?`, as WTF-8
-    /// bytes: what every match must start with.
-    pub fn leading_literal(&self) -> Vec<u8> {
-        let mut lit = Vec::new();
-        for tok in &self.tokens {
-            let GlobTok::Lit(cp) = tok else { break };
-            encode_wtf8(*cp, &mut lit);
-        }
-        lit
-    }
-
-    /// The literal characters after the pattern's last `*` or `?`, as WTF-8
-    /// bytes: what every match must end with.
-    pub(crate) fn trailing_literal(&self) -> Vec<u8> {
-        let start = self
-            .tokens
-            .iter()
-            .rposition(|t| !matches!(t, GlobTok::Lit(_)))
-            .map_or(0, |i| i + 1);
-        let mut lit = Vec::new();
-        for tok in &self.tokens[start..] {
-            if let GlobTok::Lit(cp) = tok {
-                encode_wtf8(*cp, &mut lit);
-            }
-        }
-        lit
-    }
-}
-
-/// Encodes one code point as WTF-8 (surrogates permitted).
-fn encode_wtf8(cp: u32, out: &mut Vec<u8>) {
-    if cp < 0x80 {
-        out.push(cp as u8);
-    } else if cp < 0x800 {
-        out.push(0xC0 | (cp >> 6) as u8);
-        out.push(0x80 | (cp & 0x3F) as u8);
-    } else if cp < 0x10000 {
-        out.push(0xE0 | (cp >> 12) as u8);
-        out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
-        out.push(0x80 | (cp & 0x3F) as u8);
-    } else {
-        out.push(0xF0 | (cp >> 18) as u8);
-        out.push(0x80 | ((cp >> 12) & 0x3F) as u8);
-        out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
-        out.push(0x80 | (cp & 0x3F) as u8);
-    }
-}
-
-/// About how many steps [`Wildcard::glob_match`] takes between checks of its
-/// budget: well under a millisecond's worth.
-const GLOB_STEPS_PER_CHECK: usize = 1 << 16;
-
-/// A match that may take this many steps checks its budget before it starts.
-/// That costs a 24 ns clock read against a few microseconds of steps, and it
-/// holds what 256 terms can do to one candidate between checks to about a
-/// millisecond.
-const GLOB_COSTLY_STEPS: usize = 1 << 12;
+pub use super::glob::{CodePointBuf, Wildcard};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -310,8 +63,8 @@ pub struct ParsedQuery {
     pub path_terms: Vec<Vec<u8>>,
     /// Whole-name wildcard patterns (all must match).
     pub wildcards: Vec<Wildcard>,
-    /// Whole-full-path wildcard patterns, from a wildcard with a separator or a
-    /// `path:` value with one (all must match).
+    /// Sub-path wildcard patterns, from a wildcard with a separator or `**`,
+    /// or a `path:` value with a wildcard (all must match).
     pub path_wildcards: Vec<Wildcard>,
     pub filters: Filters,
     pub match_case: bool,
@@ -353,7 +106,7 @@ pub enum QueryError {
 
 /// The most terms one query may hold. The engine tests each candidate against
 /// every term under the volume's index read lock, so a query's cost grows with
-/// its term count. Its [`Budget`] bounds how long it holds the lock, and this
+/// its term count. Its [`super::Budget`] bounds how long it holds the lock, and this
 /// cap bounds the work on each candidate, so the budget is checked often.
 /// Real queries use a few terms.
 const MAX_QUERY_TERMS: usize = 256;
@@ -483,17 +236,17 @@ fn parse(
                     continue;
                 }
                 "path" => {
-                    push_text_term(&mut q, value, tok.quoted, true, &fold_term);
+                    push_text_term(&mut q, value, true, &fold_term);
                     continue;
                 }
                 "file" => {
                     q.filters.kind = Some(Kind::File);
-                    push_text_term(&mut q, value, tok.quoted, match_path, &fold_term);
+                    push_text_term(&mut q, value, match_path, &fold_term);
                     continue;
                 }
                 "folder" | "dir" => {
                     q.filters.kind = Some(Kind::Folder);
-                    push_text_term(&mut q, value, tok.quoted, match_path, &fold_term);
+                    push_text_term(&mut q, value, match_path, &fold_term);
                     continue;
                 }
                 // Not one of the values `match_path_directive` consumed.
@@ -522,7 +275,7 @@ fn parse(
             }
         }
 
-        push_text_term(&mut q, text, tok.quoted, match_path, &fold_term);
+        push_text_term(&mut q, text, match_path, &fold_term);
     }
 
     let terms = term_count(&q);
@@ -536,13 +289,12 @@ fn parse(
 ///
 /// A term with a separator, or any `path:` value (`as_path`), matches the
 /// full path; `/` is a separator like `\`, since no name contains either.
-/// `*` and `?` make a wildcard, matched against the whole name or, for a path,
-/// the whole full path. Quotes keep them literal in a name, but in a path they
-/// stay wildcards: the quotes are there for the spaces in a folder name.
+/// `*` and `?` make a wildcard, in quotes too, as in Everything: a name
+/// wildcard matches the whole name, and a path wildcard, or one with `**`,
+/// the end of the full path (see [`super::glob`]).
 fn push_text_term(
     q: &mut ParsedQuery,
     text: &str,
-    quoted: bool,
     as_path: bool,
     fold_term: &impl Fn(&[u8]) -> Vec<u8>,
 ) {
@@ -550,17 +302,17 @@ fn push_text_term(
         return;
     }
     let is_path = as_path || text.contains(['\\', '/']);
-    let wildcard = text.contains(['*', '?']) && (is_path || !quoted);
-    if is_path {
+    let wildcard = text.contains(['*', '?']);
+    if is_path || (wildcard && text.contains("**")) {
         let path = fold_term(text.replace('/', "\\").as_bytes());
         if wildcard {
-            q.path_wildcards.push(Wildcard::compile(&path));
+            q.path_wildcards.push(Wildcard::sub_path(&path));
         } else {
             q.path_terms.push(path);
         }
     } else if wildcard {
         q.wildcards
-            .push(Wildcard::compile(&fold_term(text.as_bytes())));
+            .push(Wildcard::name(&fold_term(text.as_bytes())));
     } else {
         q.name_terms.push(fold_term(text.as_bytes()));
     }
@@ -569,8 +321,6 @@ fn push_text_term(
 struct Token {
     /// The token with its quotes removed.
     text: String,
-    /// Whether any part of it was quoted.
-    quoted: bool,
     /// Where `text` has the colon of a `func:` prefix: the token's first `:`,
     /// when no quote came before it. A quoted value keeps its spaces, as in
     /// `path:"C:\Program Files"`, while a quoted `"a:b"` stays plain text.
@@ -611,7 +361,6 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
                 if has_content {
                     tokens.push(Token {
                         text: std::mem::take(&mut cur),
-                        quoted: token_quoted,
                         func_colon: func_colon.take(),
                     });
                     token_quoted = false;
@@ -630,7 +379,6 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
     if has_content {
         tokens.push(Token {
             text: cur,
-            quoted: token_quoted,
             func_colon,
         });
     }
@@ -969,22 +717,43 @@ mod tests {
         assert!(p.path_wildcards[0].matches(br"c:\repo\docs\a.md"));
     }
 
-    /// A wildcard with a separator, or in a `path:` value, matches the whole
-    /// full path and never the name, which holds no separator.
+    /// A wildcard with a separator, a `**` or in a `path:` value matches the
+    /// end of the full path, whole part by whole part, and its `*` stops at a
+    /// separator: Everything 1.5's rule, which replaced the old one where `*`
+    /// crossed folders and the pattern had to match the whole full path.
     #[test]
-    fn separator_and_path_wildcards_match_the_full_path() {
+    fn separator_and_path_wildcards_match_sub_paths() {
         let p = q(r"C:\repo\*.cs");
         assert!(p.wildcards.is_empty() && p.path_terms.is_empty());
         let w = &p.path_wildcards[0];
         assert!(w.matches(br"c:\repo\main.cs"));
-        assert!(w.matches(br"c:\repo\sub\main.cs"), "* crosses folders");
+        assert!(
+            !w.matches(br"c:\repo\sub\main.cs"),
+            "* no longer crosses folders"
+        );
         assert!(!w.matches(br"d:\repo\main.cs"));
+        let w = &q(r"repo\*.cs").path_wildcards[0];
+        assert!(w.matches(br"d:\work\repo\main.cs"), "from any part");
+        assert!(!w.matches(br"d:\work\myrepo\main.cs"), "whole parts");
+        assert!(q(r"repo\**\*.cs").path_wildcards[0].matches(br"d:\repo\a\b\main.cs"));
         assert!(q("path:*.md").path_wildcards[0].matches(br"c:\notes\a.md"));
+        let p = q("**cmd*");
+        assert!(p.wildcards.is_empty(), "** makes a sub-path wildcard");
+        assert!(p.path_wildcards[0].matches(br"c:\windows\system32\cmd.exe"));
+        assert_eq!(
+            q(r"\windows\*.exe").path_wildcards[0].pattern(),
+            br"windows\*.exe"
+        );
+        assert_eq!(
+            q(r"windows\*\").path_wildcards[0].pattern(),
+            br"windows\*\**"
+        );
     }
 
     /// Quotes let a value keep its spaces: a quoted term with a separator is a
-    /// path, whose wildcards stay wildcards, and a function's quoted value is
-    /// still that function's. A quoted name keeps `*` literal.
+    /// path, a function's quoted value is still that function's, and `*` and
+    /// `?` stay wildcards in quotes, as in Everything (a quoted name used to
+    /// keep them literal, which matched nothing, since no name holds them).
     #[test]
     fn quoted_paths_and_function_values() {
         assert_eq!(
@@ -1002,7 +771,10 @@ mod tests {
         assert_eq!(p.name_terms, vec![b"my report".to_vec()]);
         assert_eq!(p.filters.kind, Some(Kind::File));
         assert_eq!(q(r#"ext:"rs""#).filters.ext, Some(vec![b"rs".to_vec()]));
-        assert_eq!(q(r#""*.rs""#).name_terms, vec![b"*.rs".to_vec()]);
+        let p = q(r#""*.rs""#);
+        assert!(p.name_terms.is_empty());
+        assert!(p.wildcards[0].matches(b"main.rs"));
+        assert!(q(r#""First Level*""#).wildcards[0].matches(b"first level first"));
     }
 
     /// `dm:` and its es spellings resolve against the clock the query is
@@ -1114,89 +886,9 @@ mod tests {
         ));
     }
 
-    /// A budget already spent, for the tests of what checks one.
-    fn with_spent_budget(test: impl FnOnce(&Budget)) {
-        use std::sync::atomic::AtomicBool;
-        use std::time::{Duration, Instant};
-        let cancelled = AtomicBool::new(true);
-        test(&Budget::until(
-            Instant::now() + Duration::from_secs(3600),
-            &cancelled,
-        ));
-    }
-
-    /// `n` code points of `x`.
-    fn xs(n: usize) -> CodePointBuf {
-        let mut text = CodePointBuf::new();
-        decode_into("x".repeat(n).as_bytes(), &mut text);
-        text
-    }
-
-    /// A match that backtracks checks its budget as it goes, and a spent one
-    /// ends it unmatched: a pattern built to backtrack against a long full
-    /// path could otherwise take minutes over one text.
-    #[test]
-    fn a_spent_budget_ends_a_match_as_it_backtracks() {
-        // 101 tokens check every 1,024 code points.
-        let w = Wildcard::compile(format!("*{}", "?".repeat(100)).as_bytes());
-        let (long, short) = (xs(5000), xs(500));
-        with_spent_budget(|spent| {
-            assert!(!w.glob_match(&long, spent), "past a check");
-            assert!(w.glob_match(&short, spent), "short of one");
-        });
-        assert!(w.glob_match(&long, &Budget::unlimited()));
-    }
-
-    /// A match that may take many steps checks first, even over a text too
-    /// short to reach a check of its own, and one that cannot does not.
-    #[test]
-    fn a_spent_budget_turns_away_a_costly_match() {
-        let costly = Wildcard::compile(format!("*{}", "?".repeat(100)).as_bytes());
-        let text = xs(500);
-        assert!(costly.matches_decoded(&text, &Budget::unlimited()));
-        with_spent_budget(|spent| assert!(!costly.matches_decoded(&text, spent)));
-        let cheap = Wildcard::compile(b"*x");
-        with_spent_budget(|spent| assert!(cheap.matches_decoded(&xs(20), spent)));
-    }
-
     mod arbitrary {
         use super::*;
         use proptest::prelude::*;
-
-        /// Whether `pat` matches the whole of `text`, worked out for every
-        /// pair of positions: slow, but plainly right.
-        fn reference_match(pat: &[u8], text: &[u8]) -> bool {
-            // `rest[i][j]`: whether `pat[i..]` matches `text[j..]`.
-            let mut rest = vec![vec![false; text.len() + 1]; pat.len() + 1];
-            rest[pat.len()][text.len()] = true;
-            for i in (0..pat.len()).rev() {
-                for j in (0..=text.len()).rev() {
-                    let one = j < text.len() && rest[i + 1][j + 1];
-                    rest[i][j] = match pat[i] {
-                        b'*' => rest[i + 1][j] || (j < text.len() && rest[i][j + 1]),
-                        b'?' => one,
-                        c => one && text[j] == c,
-                    };
-                }
-            }
-            rest[0][0]
-        }
-
-        proptest! {
-            /// The matcher, and the length check that turns texts away
-            /// before it, answer as the reference does.
-            #[test]
-            fn wildcards_match_as_the_reference_does(
-                pat in "[ab*?]{0,8}",
-                text in "[ab]{0,10}",
-            ) {
-                let w = Wildcard::compile(pat.as_bytes());
-                prop_assert_eq!(
-                    w.matches(text.as_bytes()),
-                    reference_match(pat.as_bytes(), text.as_bytes())
-                );
-            }
-        }
 
         /// Query text built from the parser's own syntax and arbitrary
         /// characters, so that functions, ranges and wildcards are reached.

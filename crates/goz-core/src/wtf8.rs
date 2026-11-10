@@ -41,7 +41,7 @@ pub fn from_utf16(units: &[u16], out: &mut Vec<u8>) -> bool {
 
 /// Encodes one code point (surrogates permitted, the WTF-8 generalization)
 /// as 1-4 bytes.
-fn encode_code_point(cp: u32, out: &mut Vec<u8>) {
+pub(crate) fn encode_code_point(cp: u32, out: &mut Vec<u8>) {
     if cp < 0x80 {
         out.push(cp as u8);
     } else if cp < 0x800 {

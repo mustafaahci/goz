@@ -11,7 +11,8 @@
 
 use super::budget::{Budget, Stopped, Watch};
 use super::folder_rank::FolderRanks;
-use super::parse::{CodePointBuf, Filters, Kind, ParsedQuery, SizeRange, Wildcard, decode_into};
+use super::glob::{CodePointBuf, decode_into};
+use super::parse::{Filters, Kind, ParsedQuery, SizeRange, Wildcard};
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
 use crate::types::{EntryIdx, Frn, NIL, SortDir, SortKey, SortSpec};
@@ -94,10 +95,11 @@ pub struct CompiledQuery<'a> {
     /// `false` when a path term or path wildcard cannot match anywhere under
     /// `prefix` (see [`term_admits`]), so the volume has no hits.
     volume_admits: bool,
-    /// Each path wildcard's leading and trailing literals: what a matching
-    /// full path starts and ends with. Two byte compares turn most candidates
-    /// away before the wildcard decodes the path.
-    path_wildcard_ends: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Each path wildcard's ends: the literal a matching full path ends
+    /// with, and, for a pattern whose leading literal holds the drive's `:`,
+    /// that literal, which a match must start with. Two byte compares turn
+    /// most candidates away before the wildcard decodes the path.
+    path_wildcard_ends: Vec<(Option<Vec<u8>>, Vec<u8>)>,
     /// The longest separator-free piece of path text that every match must
     /// hold inside one of its names (see [`path_piece`]); drives
     /// [`walk_below_names`]. `None` for a case-sensitive query, whose pieces
@@ -151,11 +153,17 @@ impl<'a> CompiledQuery<'a> {
         } else {
             fold(mount_prefix.as_bytes())
         };
+        let path_wildcard_ends: Vec<(Option<Vec<u8>>, Vec<u8>)> = parsed
+            .path_wildcards
+            .iter()
+            .map(|w| (anchored_lead(w), w.trailing_literal()))
+            .collect();
         let volume_admits = parsed.path_terms.iter().all(|t| term_admits(t, &prefix))
-            && parsed.path_wildcards.iter().all(|w| {
-                let lit = w.leading_literal();
-                let n = lit.len().min(prefix.len());
-                lit[..n] == prefix[..n]
+            && path_wildcard_ends.iter().all(|(lead, _)| {
+                lead.as_deref().is_none_or(|lead| {
+                    let n = lead.len().min(prefix.len());
+                    lead[..n] == prefix[..n]
+                })
             });
 
         let path_piece = (!parsed.match_case)
@@ -182,11 +190,7 @@ impl<'a> CompiledQuery<'a> {
                 && parsed.filters.ext.is_none(),
             prefix,
             volume_admits,
-            path_wildcard_ends: parsed
-                .path_wildcards
-                .iter()
-                .map(|w| (w.leading_literal(), w.trailing_literal()))
-                .collect(),
+            path_wildcard_ends,
             path_piece,
         }
     }
@@ -230,6 +234,17 @@ fn path_piece(parsed: &ParsedQuery, prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     best
+}
+
+/// The leading literal of sub-path wildcard `w` when it holds a `:`: then
+/// the match starts where the full path does, since Windows refuses `:` in a
+/// name, so the only `:` of a full path is the drive's, in its first part,
+/// and a match that covers it starts at that part. Elsewhere the match may
+/// start after any separator, so its leading literal tells nothing about
+/// where the full path starts.
+fn anchored_lead(w: &Wildcard) -> Option<Vec<u8>> {
+    let lead = w.leading_literal();
+    lead.contains(&b':').then_some(lead)
 }
 
 /// Whether path term `term` can match a full path that starts with `prefix`
@@ -1699,12 +1714,16 @@ impl FolderPaths {
         }
         self.with_full_path(index, idx, |full| {
             (!whole || compiled.path_finders.iter().all(|f| f.find(full).is_some()))
-                && compiled
-                    .path_wildcard_ends
-                    .iter()
-                    .all(|(lead, trail)| full.starts_with(lead) && full.ends_with(trail))
+                && compiled.path_wildcard_ends.iter().all(|(lead, trail)| {
+                    lead.as_deref().is_none_or(|lead| full.starts_with(lead))
+                        && full.ends_with(trail)
+                })
                 && (parsed.path_wildcards.is_empty()
-                    || wildcards_match(&parsed.path_wildcards, full, cp_buf, compiled.budget))
+                    // Decoding and matching a path of megabytes, which no
+                    // real path is, checks the budget first, as each term's
+                    // search of such a path does in `decide_needs`.
+                    || !(full.len() > CACHED_PATH_MAX && compiled.budget.check())
+                        && wildcards_match(&parsed.path_wildcards, full, cp_buf, compiled.budget))
         })
         .unwrap_or(false)
     }
@@ -2852,16 +2871,34 @@ mod tests {
         assert!(hits(r"D:\", r"C:\docs").is_empty(), "another drive's path");
     }
 
-    /// A wildcard with a separator matches the whole full path; `*` crosses
-    /// folders, and the drive in front still has to agree.
+    /// A wildcard with a separator matches the end of the full path, whole
+    /// part by whole part, as in Everything 1.5: `*` and `?` stop at a
+    /// separator and `**` does not, a match starts at any part, the mount
+    /// prefix's parts included, and a pattern with the drive starts where
+    /// the full path does, so the drive in front still has to agree.
     #[test]
-    fn path_wildcards_match_the_whole_full_path() {
+    fn path_wildcards_match_sub_paths() {
         let idx = sample_index();
         let hits = |prefix, query| hits_under(&idx, prefix, &parse_query(query).unwrap());
         assert_eq!(hits(r"C:\", r"*\sub\*.pdf"), [r"docs\sub\Report.PDF"]);
         assert_eq!(hits(r"C:\", r"C:\docs\*.txt"), [r"docs\notes.txt"]);
         assert_eq!(hits(r"C:\", "path:*.jpg"), ["photo.JPG"]);
         assert!(hits(r"D:\", r"C:\docs\*.txt").is_empty());
+        assert!(
+            hits(r"C:\", r"C:\docs\*.pdf").is_empty(),
+            "* stops at a separator"
+        );
+        assert_eq!(hits(r"C:\", r"C:\docs\**.pdf"), [r"docs\sub\Report.PDF"]);
+        assert_eq!(hits(r"C:\", r"docs\*"), [r"docs\notes.txt", r"docs\sub"]);
+        assert_eq!(hits(r"C:\", r"docs\*\"), [r"docs\sub\Report.PDF"], "below");
+        assert_eq!(
+            hits(r"C:\mnt\data\", r"data\*.jpg"),
+            ["photo.JPG"],
+            "the prefix's parts count"
+        );
+        assert_eq!(hits(r"C:\", r"\*.jpg"), ["photo.JPG"]);
+        assert_eq!(hits(r"C:\", r"**\report.pdf"), [r"docs\sub\Report.PDF"]);
+        assert_eq!(hits(r"C:\", r#""docs\*.txt""#), [r"docs\notes.txt"]);
     }
 
     /// Windows refuses `:` in a name, so a term's colon is the drive's, and a
@@ -3757,6 +3794,13 @@ mod tests {
                 4 => vec![wildcard(span(0, 1, full.len())), name_term],
                 _ => vec![path_term(span(0, 1, full.len())), wildcard(span(2, 3, full.len()))],
             };
+            // The wildcards as typed, for the reference to match on its own.
+            let patterns: Vec<String> = terms
+                .iter()
+                .filter_map(|t| t.strip_prefix("path:"))
+                .filter(|t| t.contains('*'))
+                .map(str::to_string)
+                .collect();
             if match_case {
                 terms.push("case:".into());
             }
@@ -3766,6 +3810,10 @@ mod tests {
             let scope = scope_pick.filter(|_| !folders.is_empty()).map(|p| *p.get(&folders));
 
             let fold = |b: &[u8]| if parsed.match_case { b.to_vec() } else { crate::fold::fold(b) };
+            let patterns: Vec<String> = patterns
+                .iter()
+                .map(|p| String::from_utf8(fold(p.as_bytes())).unwrap())
+                .collect();
             let holds = |hay: &[u8], t: &[u8]| hay.windows(t.len().max(1)).any(|w| w == t);
             let mut want: Vec<String> = idx
                 .live_entries()
@@ -3775,10 +3823,13 @@ mod tests {
                         return false;
                     };
                     let name = fold(idx.entry(e).name());
+                    let full_text = String::from_utf8(full.clone()).unwrap();
                     scope.is_none_or(|s| is_below(&idx, e, s))
                         && parsed.name_terms.iter().all(|t| holds(&name, t))
                         && parsed.path_terms.iter().all(|t| holds(&full, t))
-                        && parsed.path_wildcards.iter().all(|w| w.matches(&full))
+                        && patterns
+                            .iter()
+                            .all(|p| crate::query::glob::tests::reference_sub_path(p, &full_text))
                 })
                 .map(|e| {
                     let full = slow_full_path(&idx, e, "", false).unwrap();

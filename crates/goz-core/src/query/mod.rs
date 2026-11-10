@@ -2,15 +2,16 @@
 //! scans a [`crate::index::VolumeIndex`] and returns a sorted page of hits.
 //!
 //! [`fold`] provides case folding; [`parse`] turns a query string into a
-//! [`parse::ParsedQuery`] (loudly rejecting unsupported operators), with
-//! [`dates`] resolving each `dm:` value; [`engine`] compiles and runs it
-//! against the index with scope, sort, and pagination, within a
-//! [`budget::Budget`] of time.
+//! [`parse::ParsedQuery`], with [`dates`] resolving each `dm:` value and
+//! `glob` compiling each wildcard; [`engine`] compiles and runs it against
+//! the index with scope, sort, and pagination, within a [`budget::Budget`]
+//! of time.
 
 pub mod budget;
 pub mod dates;
 pub mod engine;
 mod folder_rank;
+mod glob;
 pub mod parse;
 
 /// Case folding lives at the crate root (`crate::fold`) so the index can build
