@@ -5127,13 +5127,14 @@ mod tests {
             Part(Part, String),
             /// `ext:` values, as written.
             Ext(Vec<String>),
-            /// `size:` values as written, and the ranges the test means.
-            Size(Vec<(String, SizeRange)>),
+            /// `size:` values as written, the ranges the test means, and
+            /// whether the value carries its own `!`.
+            Size(Vec<(String, SizeRange)>, bool),
             SizeUnknown,
-            /// A length function, its value as written, and its range.
-            Len(LenFn, String, SizeRange),
-            /// `dm:` as written, and the FILETIME range it means.
-            Date(String, SizeRange),
+            /// A length function, its value as written, its range, and a `!`.
+            Len(LenFn, String, SizeRange, bool),
+            /// `dm:` as written, the FILETIME range it means, and a `!`.
+            Date(String, SizeRange, bool),
             Drive(char),
             /// `\` alone.
             Lone,
@@ -5360,7 +5361,7 @@ mod tests {
                             if (n >> 26) % 9 == 0 {
                                 L::SizeUnknown
                             } else {
-                                L::Size(values)
+                                L::Size(values, (n >> 30) % 4 == 0)
                             }
                         }
                         7 => {
@@ -5400,7 +5401,7 @@ mod tests {
                                 2 => (format!("<={m}"), r(0, m)),
                                 _ => (format!("{k}..{m}"), r(k, m)),
                             };
-                            L::Len(f, text, range)
+                            L::Len(f, text, range, (n >> 30) % 4 == 0)
                         }
                         9 => {
                             // FILETIME values, exact to the tick.
@@ -5414,7 +5415,7 @@ mod tests {
                                 3 => (format!("{u}..{t}"), r(t, u)),
                                 _ => (format!("0x{t:x}"), r(t, t)),
                             };
-                            L::Date(text, range)
+                            L::Date(text, range, (n >> 30) % 4 == 0)
                         }
                         10 => L::Drive(if n % 2 == 0 { 'C' } else { 'd' }),
                         11 => L::Lone,
@@ -5451,6 +5452,11 @@ mod tests {
             }
         }
 
+        /// A value's own `!`.
+        fn bang(neg: bool) -> &'static str {
+            if neg { "!" } else { "" }
+        }
+
         fn print_leaf(l: &L) -> String {
             match l {
                 L::Text(s) => quoted(s),
@@ -5469,12 +5475,12 @@ mod tests {
                     let v: Vec<String> = values.iter().map(|v| quoted(v)).collect();
                     format!("ext:{}", v.join(";"))
                 }
-                L::Size(values) => {
+                L::Size(values, neg) => {
                     let v: Vec<&str> = values.iter().map(|(t, _)| t.as_str()).collect();
-                    format!("size:{}", v.join(";"))
+                    format!("size:{}{}", bang(*neg), v.join(";"))
                 }
                 L::SizeUnknown => "size:unknown".into(),
-                L::Len(f, text, _) => {
+                L::Len(f, text, _, neg) => {
                     let f = match f {
                         LenFn::Len => "len:",
                         LenFn::Name => "namelen:",
@@ -5482,9 +5488,9 @@ mod tests {
                         LenFn::Location => "path-part-length:",
                         LenFn::Extension => "extlen:",
                     };
-                    format!("{f}{text}")
+                    format!("{f}{}{text}", bang(*neg))
                 }
-                L::Date(text, _) => format!("dm:{text}"),
+                L::Date(text, _, neg) => format!("dm:{}{text}", bang(*neg)),
                 L::Drive(d) => format!("{d}:"),
                 L::Lone => "\\".into(),
                 L::Folder(ancestor, text, _) => {
@@ -5533,7 +5539,10 @@ mod tests {
                             _ => print(i, minimal),
                         })
                         .collect();
-                    let sep = if text.iter().any(|t| t.contains(":<") || t.ends_with(' ')) {
+                    let sep = if text
+                        .iter()
+                        .any(|t| t.contains(":<") || t.contains(":!<") || t.ends_with(' '))
+                    {
                         " | "
                     } else {
                         "|"
@@ -5801,13 +5810,15 @@ mod tests {
                         }
                     })
                 }
-                L::Size(values) => {
+                // A value's own `!` keeps the entries that have a value,
+                // and not that one.
+                L::Size(values, neg) => {
                     !e.is_dir
                         && e.size
-                            .is_some_and(|s| values.iter().any(|(_, r)| r.contains(s)))
+                            .is_some_and(|s| values.iter().any(|(_, r)| r.contains(s)) != *neg)
                 }
                 L::SizeUnknown => !e.is_dir && e.size.is_none(),
-                L::Len(f, _, range) => {
+                L::Len(f, _, range, neg) => {
                     let len = match f {
                         LenFn::Len if ctx.path == Some(true) => Some(utf16(&e.full)),
                         LenFn::Len | LenFn::Name => Some(utf16(&e.name)),
@@ -5816,9 +5827,11 @@ mod tests {
                         LenFn::Extension if e.is_dir => None,
                         LenFn::Extension => Some(extension(e).map_or(0, utf16)),
                     };
-                    len.is_some_and(|l| range.contains(l))
+                    len.is_some_and(|l| range.contains(l) != *neg)
                 }
-                L::Date(_, range) => e.mtime.is_some_and(|t| t >= 0 && range.contains(t as u64)),
+                L::Date(_, range, neg) => e
+                    .mtime
+                    .is_some_and(|t| t >= 0 && range.contains(t as u64) != *neg),
                 L::Folder(false, _, folded) => e.parent == *folded,
                 L::Folder(true, _, folded) => e.ancestors.contains(folded),
                 // `exe:` alone: its extensions, and an empty term, which

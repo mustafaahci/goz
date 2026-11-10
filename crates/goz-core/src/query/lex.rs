@@ -687,9 +687,9 @@ impl Lexer {
         Ok(())
     }
 
-    /// `?name:`: the modifier holds for every term after it, as if each
-    /// were prefixed with it, outermost (a later `?name:` of the same
-    /// modifier replaces it).
+    /// `?name:`: the modifier holds for every term after it that does not
+    /// set it itself (`?case: foo nocase:FOO` matches `foo` case and `FOO`
+    /// not, L7:473); a later `?name:` of the same modifier replaces it.
     fn set_global(&mut self, prefix: Prefix) {
         match prefix {
             Prefix::Mod(m, on) => *self.global.slot(m) = Some(on),

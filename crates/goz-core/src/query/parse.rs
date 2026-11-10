@@ -271,6 +271,10 @@ struct Mods {
     /// Inside a function's value group (`ext:<pdf|txt>`): the function
     /// whose values the group's text is.
     func: Option<Func>,
+    /// The kind a `folder:` or `?folder:` puts around a term is put around
+    /// it later, outside the NOT of a value's own `!` (see
+    /// [`Parser::function`]).
+    kindless: bool,
 }
 
 /// The binary operators.
@@ -454,14 +458,28 @@ impl<'t> Parser<'t, '_> {
     /// A function's value, after its own `!`s, which negate it: its text,
     /// or a group of values (`ext:<pdf|txt>`).
     fn function(&mut self, func: Func, mods: Mods) -> Result<Expr, QueryError> {
+        // The `?mod:`s where the prefix stands.
+        let global = self
+            .at
+            .checked_sub(1)
+            .and_then(|at| self.tokens.get(at))
+            .map_or_else(ModSet::default, |t| t.global);
         let mut nots = 0usize;
         while self.peek().is_some_and(|t| t.kind == Tok::Not) {
             self.at += 1;
             nots += 1;
         }
+        // A value's own `!` goes inside the kind around the term:
+        // `folder:len:!0` is the folders whose name is not empty, not every
+        // file and those folders.
+        let negated = nots % 2 == 1;
+        let mods_in = Mods {
+            kindless: mods.kindless || negated,
+            ..mods
+        };
         let inner = Mods {
             func: Some(func),
-            ..mods
+            ..mods_in
         };
         let e = match self.peek() {
             Some(t) if t.kind == Tok::Open && !t.spaced => self.group(inner)?,
@@ -472,7 +490,7 @@ impl<'t> Parser<'t, '_> {
                 },
             ) => {
                 self.at += 1;
-                self.value(func, value, t.global, mods)?
+                self.value(func, value, t.global, mods_in)?
             }
             // The lexer reads a value or a value group after every function
             // prefix.
@@ -483,7 +501,11 @@ impl<'t> Parser<'t, '_> {
                 });
             }
         };
-        Ok(if nots % 2 == 1 { e.not() } else { e })
+        Ok(if negated {
+            with_kind(not_value(func, e), mods, global)
+        } else {
+            e
+        })
     }
 
     /// An empty term under `mods`: everything (or every folder under
@@ -500,7 +522,7 @@ impl<'t> Parser<'t, '_> {
         match mods.func {
             Some(func) => self.value(func, &Text::default(), global, mods),
             None => {
-                let set = global.over(mods.set);
+                let set = mods.set.over(global);
                 let whole = set.whole == Some(true)
                     || (set.start_with == Some(true) && set.end_with == Some(true));
                 let e = if whole { Expr::False } else { Expr::True };
@@ -515,7 +537,7 @@ impl<'t> Parser<'t, '_> {
         if let Some(func) = mods.func {
             return self.value(func, text, token.global, mods);
         }
-        let set = token.global.over(mods.set);
+        let set = mods.set.over(token.global);
         let bytes = &text.text;
         if bytes.is_empty() {
             return self.empty_under(mods, token.global);
@@ -619,7 +641,7 @@ impl<'t> Parser<'t, '_> {
         global: ModSet,
         mods: Mods,
     ) -> Result<Expr, QueryError> {
-        let set = global.over(mods.set);
+        let set = mods.set.over(global);
         let e = if func == Func::Ext {
             ext_leaf(text, set)
         } else {
@@ -665,7 +687,11 @@ impl<'t> Parser<'t, '_> {
                     &String::from_utf8_lossy(item),
                     self.clock.ok_or(QueryError::NoClock)?,
                 )?));
-                return Ok(if nots % 2 == 1 { leaf.not() } else { leaf });
+                return Ok(if nots % 2 == 1 {
+                    not_value(func, leaf)
+                } else {
+                    leaf
+                });
             }
             Func::Size
             | Func::Len
@@ -697,11 +723,42 @@ impl<'t> Parser<'t, '_> {
                         Number::Unknown => Expr::False,
                     }
                 };
-                return Ok(if nots % 2 == 1 { leaf.not() } else { leaf });
+                return Ok(if nots % 2 == 1 {
+                    not_value(func, leaf)
+                } else {
+                    leaf
+                });
             }
         };
         Ok(self.term(Some(target), item, literal_wild, set))
     }
+}
+
+/// A number's or a date's own `!` (`size:!1kb`, `dm:!today`, `extlen:!3`):
+/// the entry has such a value, and not the one written, as Everything reads
+/// it, where `extlen:!3` keeps no folder, since a folder has no extension
+/// (L8:90), while `!extlen:3`, the NOT of the whole term, keeps them all.
+/// goz knows no folder's size, so `size:!1kb` keeps files alone, and no
+/// unknown date passes `dm:!today`. Every entry has a name, a full path and
+/// a location, so their lengths need nothing more.
+fn not_value(func: Func, e: Expr) -> Expr {
+    let any = SizeRange {
+        min: 0,
+        max: u64::MAX,
+    };
+    let known = match func {
+        Func::Size => Expr::Leaf(Leaf::Size(any)),
+        Func::Date => Expr::Leaf(Leaf::Date(DateFilter::Within {
+            min: i64::MIN,
+            max: i64::MAX,
+        })),
+        Func::ExtLen => Expr::Leaf(Leaf::Len {
+            of: LenOf::Extension,
+            range: any,
+        }),
+        _ => Expr::True,
+    };
+    Expr::and(known, e.not())
 }
 
 /// `item` without its leading `!`s, and how many there were.
@@ -761,6 +818,9 @@ fn macro_ext(m: Macro) -> Expr {
 /// `e` restricted to folders when a `folder:` reaches it, or to the kind a
 /// `?file:` or `?folder:` before it names.
 fn with_kind(e: Expr, mods: Mods, global: ModSet) -> Expr {
+    if mods.kindless {
+        return e;
+    }
     let kind = if mods.folder {
         Some(Kind::Folder)
     } else {
@@ -1862,7 +1922,8 @@ mod tests {
     }
 
     /// Numeric values: `size:` with granules, units, constants, lists and
-    /// groups; the lengths; `metric:`; a `!` that negates.
+    /// groups; the lengths; `metric:`; a value's own `!`, which keeps the
+    /// entries that have such a value (`extlen:!3` keeps no folder, L8:90).
     #[test]
     fn numeric_functions() {
         let size = |min, max| Expr::Leaf(Leaf::Size(SizeRange { min, max }));
@@ -1906,6 +1967,36 @@ mod tests {
         assert_eq!(ex("path-part-length:3"), len(LenOf::Location, 3, 3));
         assert_eq!(ex("extlen:3"), len(LenOf::Extension, 3, 3));
         assert_eq!(ex("len:!7"), len(LenOf::Name, 7, 7).not());
+        assert_eq!(
+            ex("extlen:!3"),
+            and([
+                len(LenOf::Extension, 0, u64::MAX),
+                len(LenOf::Extension, 3, 3).not()
+            ])
+        );
+        assert_eq!(ex("!extlen:3"), len(LenOf::Extension, 3, 3).not());
+        // The kind goes around the value's own NOT: folders whose name is
+        // not empty.
+        let p = q("folder:len:!0");
+        assert_eq!(p.filters.kind, Some(Kind::Folder));
+        assert_eq!(p.expr, Some(len(LenOf::Name, 0, 0).not()));
+        assert_eq!(
+            ex("x|folder:len:!0"),
+            or([
+                name("x"),
+                and([kind(Kind::Folder), len(LenOf::Name, 0, 0).not()])
+            ])
+        );
+        let p = q("size:!1kb");
+        assert_eq!(
+            p.filters.size,
+            Some(SizeRange {
+                min: 0,
+                max: u64::MAX
+            }),
+            "a known size"
+        );
+        assert_eq!(p.expr, Some(size(KB, 2 * KB - 1).not()));
         assert_eq!(
             ex("len:7;10"),
             or([len(LenOf::Name, 7, 7), len(LenOf::Name, 10, 10)])
@@ -1962,10 +2053,28 @@ mod tests {
         };
         assert_eq!(at("dm:2020;2024"), Some(or([year("2020"), year("2024")])));
         assert_eq!(at("dm:<2020|2024>"), at("dm:2020;2024"));
-        assert_eq!(at("dm:!2020"), Some(year("2020").not()));
+        // A date's own `!`: a known date, not that one (L8:90's rule).
+        let known = Expr::Leaf(Leaf::Date(DateFilter::Within {
+            min: i64::MIN,
+            max: i64::MAX,
+        }));
+        let p = parse_query_at("dm:!2020", false, &clock).unwrap();
+        assert_eq!(
+            p.filters.date,
+            Some(DateFilter::Within {
+                min: i64::MIN,
+                max: i64::MAX
+            })
+        );
+        assert_eq!(p.expr, Some(year("2020").not()));
+        assert_eq!(
+            at("!dm:2020"),
+            Some(year("2020").not()),
+            "the NOT of the term"
+        );
         assert_eq!(
             at("dm:2020;!2024"),
-            Some(or([year("2020"), year("2024").not()]))
+            Some(or([year("2020"), and([known, year("2024").not()])]))
         );
         assert!(matches!(
             parse_query_at("dm:<today|>now>", false, &clock),
