@@ -145,6 +145,15 @@ pub struct CompiledQuery<'a> {
     /// Where a top-level `parent:` or `ancestor:` term says the matches
     /// lie, which the scan walks instead of the volume.
     source: Option<Source>,
+    /// The expression's terms on the entry, projected onto the name (see
+    /// [`cexpr::name_projection`]): what the name of every match passes,
+    /// beyond [`name_matches`].
+    name_proj: Option<CNode<'a>>,
+    /// Whether the scan, when no needle drives it, finds the names first
+    /// (see [`match_scan_names`]): the query has an expression whose terms
+    /// test the entry, and something to test of the name. A query with no
+    /// expression, which is every query v0.6.0 read, scans as it did.
+    names_first: bool,
 }
 
 impl<'a> CompiledQuery<'a> {
@@ -248,6 +257,13 @@ impl<'a> CompiledQuery<'a> {
             Some(e) if expr_admits => cexpr::split(e),
             _ => (None, None),
         };
+        // The name tests the expression's terms on the entry imply, from a
+        // second compilation, which the split consumes.
+        let name_proj = expr_entry
+            .as_ref()
+            .and(parsed.expr.as_ref())
+            .and_then(|e| cexpr::split(cexpr::compile(e, &volume)).1)
+            .and_then(cexpr::name_projection);
         // An `ext:` filter keeps files, as a folder has no extension.
         let (kind, kinds_agree) = match (parsed.filters.kind, parsed.filters.ext.is_some()) {
             (Some(Kind::Folder), true) => (None, false),
@@ -285,7 +301,16 @@ impl<'a> CompiledQuery<'a> {
             }
         }
 
+        let names_first = expr_entry.is_some()
+            && (name_proj.is_some()
+                || expr_name.is_some()
+                || parsed.filters.ext.is_some()
+                || !parsed.name_terms.is_empty()
+                || !parsed.wildcards.is_empty()
+                || !name_parts.is_empty());
         Self {
+            name_proj,
+            names_first,
             source: expr_entry.as_ref().and_then(cexpr::source),
             raw_prefix: mount_prefix.as_bytes().to_vec(),
             kind,
@@ -1075,6 +1100,62 @@ fn match_names_as<const UNION: bool, const EXTRA: bool>(
     (NameSet { words, len }, total)
 }
 
+/// The names a scan with [`CompiledQuery::names_first`] visits: every live
+/// name that passes [`name_matches`] and the projection of the expression's
+/// terms on the entry, matched in chunks across cores as in [`match_names`],
+/// and how many entries bear them. Only testing a name counts against the
+/// budget, as there.
+fn match_scan_names(
+    index: &VolumeIndex,
+    parsed: &ParsedQuery,
+    compiled: &CompiledQuery,
+) -> (NameSet, u64) {
+    use rayon::prelude::*;
+    let names = index.name_count();
+    let per = chunk_words(names);
+    let mut words = vec![0u64; names.div_ceil(64)];
+    let chunks = words.len().div_ceil(per);
+    let (len, bearing) = on_name_pool(chunks, || {
+        words
+            .par_chunks_mut(per)
+            .enumerate()
+            .map(|(i, words)| {
+                let ids = chunk_ids(i, per, names);
+                let base = ids.start;
+                let mut scratch = Scratch::default();
+                let mut watch = Watch::new(compiled.budget);
+                let (mut len, mut bearing) = (0usize, 0u64);
+                for id in ids.map(|id| id as NameId) {
+                    if index.name_refcount(id) == 0 {
+                        continue;
+                    }
+                    if watch.tick() {
+                        break;
+                    }
+                    let passes = name_matches(index, parsed, compiled, id, &mut scratch)
+                        && compiled.name_proj.as_ref().is_none_or(|p| {
+                            p.eval(&mut Subject::name_level(
+                                index,
+                                id,
+                                parsed.match_case,
+                                compiled.budget,
+                                &mut scratch,
+                            ))
+                        });
+                    if passes {
+                        let at = id as usize - base;
+                        words[at / 64] |= 1 << (at % 64);
+                        len += 1;
+                        bearing += u64::from(index.name_refcount(id));
+                    }
+                }
+                (len, bearing)
+            })
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+    });
+    (NameSet { words, len }, bearing)
+}
+
 /// The summed size of the files bearing a name in `matched`, as
 /// [`files_size`] counts it, chunk by chunk across cores.
 fn names_files_size(index: &VolumeIndex, matched: &NameSet) -> u64 {
@@ -1623,6 +1704,52 @@ fn scan_with(
     {
         // Every match is at or below a name holding the piece, and the walk
         // visited each of those entries once.
+    } else if compiled.names_first {
+        // An expression with terms on the entry: the names that pass the
+        // name's tests and the projection come first, from a pass across
+        // cores, and only their entries are evaluated, their names settled.
+        // When they bear more than a share of the volume, every entry is read
+        // in order instead, those of a name the pass turned away skipped.
+        candidates.clear();
+        let (matched, bearing) = match_scan_names(index, parsed, compiled);
+        let mut visit = |idx: EntryIdx, candidates: &mut Vec<Candidate>| {
+            if index.is_synthetic(idx) {
+                return;
+            }
+            if let Some(c) = evaluate(
+                index,
+                parsed,
+                compiled,
+                idx,
+                scope,
+                &mut scope_memo,
+                &mut dir_paths,
+                &mut folders,
+                true,
+                &mut scratch,
+            ) {
+                candidates.push(c);
+            }
+        };
+        if bearing as usize <= index.len() / PATH_WALK_SHARE {
+            'names: for id in matched.ids() {
+                for idx in index.name_chain(id) {
+                    if watch.tick() {
+                        break 'names;
+                    }
+                    visit(idx, &mut candidates);
+                }
+            }
+        } else {
+            for idx in index.live_entries() {
+                if watch.tick() {
+                    break;
+                }
+                if matched.contains(index.name_id(idx)) {
+                    visit(idx, &mut candidates);
+                }
+            }
+        }
     } else {
         // Slow path: case-sensitive, or no positive substring term (only
         // wildcards / filters / path terms), or a path walk that grew past
@@ -4625,6 +4752,45 @@ mod tests {
             got.sort();
             prop_assert_eq!(out.total as usize, got.len());
             prop_assert_eq!(got, want, "query {:?} under {}", query, prefix);
+        }
+
+        /// A query whose expression tests the entry finds the same entries
+        /// when the scan finds the names first, across cores, as when it
+        /// reads every entry: the names passed on, or every entry with the
+        /// rest skipped once they bear too much of the volume.
+        #[test]
+        fn names_first_finds_what_every_entry_does(
+            nodes in prop::collection::vec(
+                (any::<prop::sample::Index>(), "[aAbB]{1,3}(\\.(txt|exe|a))?", any::<bool>()),
+                1..40,
+            ),
+            stats in prop::collection::vec((0u64..8, 0i64..9), 40),
+            padded in any::<bool>(),
+            query in prop::sample::select(vec![
+                // No needle drives these, and each has a test of the name.
+                "exe:|ext:txt", "audio:|exe:", "case:A <size:|ext:a>", "case:a !ext:",
+                "case:B|ext:TXT", "<ext:txt|exe:> !a", "!a <exe:|size:>3>",
+                "*?* <exe:|folder:>", "nopunc:ab <ext:txt;a|folder:>",
+                "case:A|case:b <size:>2|ext:exe>", "!b <ext:|ext:exe>", "zip:|doc:|exe:",
+                "nows:ab <file:|ext:a>", "a <file:|ext:exe> case:",
+            ]),
+        ) {
+            let (mut idx, _) = random_tree(&nodes, &[], padded);
+            for (i, (size, mtime)) in stats.iter().enumerate().take(nodes.len()) {
+                idx.set_stat(frn(1000 + i as u64), *size, *mtime);
+            }
+            let parsed = parse_query(query).unwrap();
+            let compiled = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);
+            prop_assert!(compiled.names_first && compiled.needles(&parsed).is_empty(), "{}", query);
+            let mut every = CompiledQuery::new(&idx, &parsed, r"C:\", &UNLIMITED);
+            every.names_first = false;
+            let found = |compiled: &CompiledQuery| {
+                let mut found: Vec<EntryIdx> =
+                    scan(&idx, &parsed, compiled, None).iter().map(|c| c.idx).collect();
+                found.sort_unstable();
+                found
+            };
+            prop_assert_eq!(found(&compiled), found(&every), "{}", query);
         }
 
         /// A scoped query finds the same entries however far its walk goes

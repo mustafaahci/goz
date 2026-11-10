@@ -318,6 +318,19 @@ fn all_of(mut items: Vec<CNode<'_>>) -> Option<CNode<'_>> {
     }
 }
 
+/// What the name of every entry `node` matches passes: `node` with each term
+/// the name alone does not decide made `True`, but for `ext:`, whose files
+/// have one of its extensions, so that a name with none of them has no match
+/// whatever its entries are. A NOT keeps none of its terms, as the NOT of a
+/// weaker test is no weaker. `None` when nothing is left: `audio:|video:`
+/// gives the extensions of both lists, `size:>1mb` nothing.
+pub(super) fn name_projection(node: CNode<'_>) -> Option<CNode<'_>> {
+    match node.project() {
+        CNode::True => None,
+        other => Some(other),
+    }
+}
+
 /// Where the candidates of a query with a top-level `parent:` or
 /// `ancestor:` come from: those folders' children, or one folder's subtree,
 /// a scope as `-path` gives one.
@@ -471,6 +484,22 @@ impl<'a> CNode<'a> {
             CNode::PathGlob { .. } => 7,
         };
         (class, 1)
+    }
+
+    /// See [`name_projection`].
+    fn project(self) -> CNode<'a> {
+        if self.decided_by_name() {
+            return self;
+        }
+        match self {
+            // At the name, with no entry, a file's extension.
+            CNode::Ext(_) => self,
+            CNode::And(items) => {
+                CNode::And(items.into_iter().map(CNode::project).collect()).folded()
+            }
+            CNode::Or(items) => CNode::Or(items.into_iter().map(CNode::project).collect()).folded(),
+            _ => CNode::True,
+        }
     }
 
     /// Whether every leaf is decided by the name alone.
