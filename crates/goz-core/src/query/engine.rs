@@ -4644,6 +4644,12 @@ mod tests {
                 "ab", "b.txt", "*.txt", "ab b", "b ext:txt", "b.txt file:", "file:", "folder:",
                 "A case:", r"a\", r"path:*\b*", "ab|b.txt", "!ab", r"a|b\", "<a b>|*.txt",
                 "file:!a", "folder:!b", r"ab !a\", r"**\b*",
+                // S2: functions and modifiers, and the folders a `parent:` or
+                // `ancestor:` names, which may or may not be there.
+                r"parent:C:\a", r"parent:C:\A\b|b", r"ancestor:C:\a", r"ancestor:c:\B a",
+                "ext:txt", "ext:", "ww:a", "prefix:b|suffix:a", "whole:ab", "nopunc:a.t",
+                "len:>3", "stem:a", "extension:t", r"\ a", "c:", "!d:", "audio:|ext:txt",
+                "size:", "case:A|nocase:b",
             ]),
         ) {
             let (idx, entries) = random_tree(&nodes, &orphans, false);

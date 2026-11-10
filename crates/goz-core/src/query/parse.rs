@@ -2225,6 +2225,38 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        /// A few folders and files, dotted, dotless, sized and dated.
+        fn tiny_index() -> crate::index::VolumeIndex {
+            use crate::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
+            use crate::types::Frn;
+            use crate::usn::record::{
+                FILE_ATTRIBUTE_DIRECTORY, ParsedUsnRecord, USN_REASON_FILE_CREATE,
+            };
+            let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+            let frn = |n: u64| Frn(n | (1 << 48));
+            for (n, parent, name, dir) in [
+                (100, None, "a", true),
+                (101, Some(100), "a.txt", false),
+                (102, None, "b.tar.gz", false),
+                (103, Some(100), "c.d", true),
+                (104, Some(103), "noext", false),
+            ] {
+                index.insert_enum(&ParsedUsnRecord {
+                    major_version: 2,
+                    frn: frn(n),
+                    parent_frn: parent.map_or(NTFS_ROOT_FRN, frn),
+                    usn: 0,
+                    timestamp_ft: 0,
+                    reason: USN_REASON_FILE_CREATE,
+                    attributes: if dir { FILE_ATTRIBUTE_DIRECTORY } else { 0 },
+                    name: name.as_bytes().to_vec(),
+                    name_lossy: false,
+                });
+                index.set_stat(frn(n), n * 10, i64::try_from(n).unwrap_or(0) << 40);
+            }
+            index
+        }
+
         /// Query text built from the parser's own syntax and arbitrary
         /// characters, so that functions, ranges, wildcards, operators,
         /// groups, quotes and entities are reached.
@@ -2287,6 +2319,44 @@ mod tests {
                     "?case:",
                     "ww:",
                     "regex:",
+                    "nocase:",
+                    "nopath:",
+                    "prefix:",
+                    "whole:",
+                    "nopunc:",
+                    "nows:",
+                    "starall:",
+                    "nowildcards:",
+                    "metric:",
+                    "extension:",
+                    "len:",
+                    "namelen:",
+                    "extlen:",
+                    "parent:",
+                    "ancestor:",
+                    "name:",
+                    "stem:",
+                    "location:",
+                    "parent-name:",
+                    "audio:",
+                    "exe:",
+                    "no-file:",
+                    "?folder:",
+                    "::",
+                    "*:",
+                    "C:",
+                    "d:",
+                    "0x",
+                    "mtd",
+                    "prev",
+                    "next2",
+                    "coming",
+                    "T10:30",
+                    "/26",
+                    ".5",
+                    "2026-11-",
+                    "!",
+                    "!=",
                 ])
                 .prop_map(str::to_string),
                 "[0-9]{1,24}",
@@ -2308,7 +2378,22 @@ mod tests {
             ) {
                 let _ = parse_query_with_case(&input, match_case);
                 let clock = crate::query::dates::tests::FixedClock::utc(now);
-                let _ = parse_query_at(&input, match_case, &clock);
+                // What parses must also run, whatever odd values it holds,
+                // on volumes mounted the ways the daemon mounts them.
+                if let Ok(parsed) = parse_query_at(&input, match_case, &clock) {
+                    let index = tiny_index();
+                    for prefix in [r"C:\", r"C:\mnt\x\", r"\\?\Volume{0}\"] {
+                        let _ = crate::query::run_query(
+                            &index,
+                            prefix,
+                            &parsed,
+                            None,
+                            crate::types::SortSpec::default(),
+                            0,
+                            Some(10),
+                        );
+                    }
+                }
             }
         }
     }

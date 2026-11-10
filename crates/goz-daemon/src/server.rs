@@ -2209,6 +2209,41 @@ mod tests {
         assert!(result_paths(&vols, query("!")).is_empty());
     }
 
+    /// The terms of step S2 run on each volume and merge as any other: a
+    /// drive term keeps its own volume, `parent:` and `ancestor:` name a
+    /// folder of one volume, which the other answers nothing for, `ext:`
+    /// keeps files and a lone `\` folders, and a word modifier tests each
+    /// name.
+    #[test]
+    fn modifiers_and_functions_merge_across_volumes() {
+        let vols = set(&[
+            volume(r"C:\", merge_index(), VolumePhase::Live),
+            volume(r"D:\", merge_index(), VolumePhase::Live),
+        ]);
+        let sorted = |q: &str| {
+            let mut paths = result_paths(&vols, query(q));
+            paths.sort();
+            paths
+        };
+        assert_eq!(
+            sorted("d:"),
+            [r"D:\a", r"D:\a\z.log", r"D:\z", r"D:\z\a.log"]
+        );
+        assert_eq!(sorted(r"parent:D:\a"), [r"D:\a\z.log"]);
+        assert_eq!(
+            sorted(r"ancestor:c:\z|d: a"),
+            [r"C:\z\a.log", r"D:\a", r"D:\z\a.log"]
+        );
+        assert_eq!(
+            sorted("ext:log"),
+            [r"C:\a\z.log", r"C:\z\a.log", r"D:\a\z.log", r"D:\z\a.log"]
+        );
+        assert_eq!(sorted(r"\"), [r"C:\a", r"C:\z", r"D:\a", r"D:\z"]);
+        assert_eq!(sorted("whole:a|startwith:z.l c:"), [r"C:\a", r"C:\a\z.log"]);
+        let pages = results(&encode_query_binary(&vols, query("ww:z")));
+        assert_eq!(pages[0].total, 4, "z and z.log on each volume");
+    }
+
     /// A volume mounted under another volume's folder interleaves with it in a
     /// path sort: `C:\m\z.log` belongs between `C:\z.log` and
     /// `C:\z.log`. Each run is ordered within its volume; only the merge
