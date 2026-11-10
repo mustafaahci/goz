@@ -255,6 +255,9 @@ impl VolumeIndex {
             NIL,
         );
 
+        // Both are folders.
+        names.mark_folder(root_name);
+        names.mark_folder(lf_name);
         let mut this = Self {
             entries,
             names,
@@ -880,6 +883,9 @@ impl VolumeIndex {
         }
 
         let id = self.names.intern(name);
+        if is_dir {
+            self.names.mark_folder(id);
+        }
         let flags = EntryFlags::EMPTY
             .with(EntryFlags::DIR, is_dir)
             .with(EntryFlags::NON_UNICODE_NAME, name_lossy);
@@ -909,6 +915,9 @@ impl VolumeIndex {
         self.unlink_same_name(idx);
         self.names.release(self.entries.name_id(idx));
         let id = self.names.intern(name);
+        if is_dir {
+            self.names.mark_folder(id);
+        }
         self.entries.set_name_id(idx, id);
         self.link_same_name(idx, id);
         // A parent at or below the entry closes a cycle cut off from the root,
@@ -1010,6 +1019,7 @@ impl VolumeIndex {
             self.reclaim_stale_slot(record, idx);
         }
         let id = self.names.intern(PLACEHOLDER_NAME);
+        self.names.mark_folder(id);
         let idx = self.entries.alloc(
             parent_frn,
             self.lost_found,
@@ -1146,6 +1156,9 @@ impl VolumeIndex {
                 kept.push(current[pos]);
             } else {
                 let id = self.names.intern(&target.name.bytes);
+                if is_dir {
+                    self.names.mark_folder(id);
+                }
                 let flags = EntryFlags::EMPTY
                     .with(EntryFlags::DIR, is_dir)
                     .with(EntryFlags::NON_UNICODE_NAME, target.name.lossy);
@@ -1200,7 +1213,8 @@ impl VolumeIndex {
     /// always yields a live new id.
     ///
     /// This is the half that must hold the exclusive lock: column writes plus
-    /// one intern-table rebuild, no byte-buffer copying.
+    /// one intern-table rebuild, no byte-buffer copying. The same pass marks
+    /// the names folders bear, which the compacted store left clear.
     pub fn apply_compaction(&mut self, plan: CompactPlan) {
         let remap = self.names.install_compacted(plan.0);
         for idx in 0..self.entries.capacity() as EntryIdx {
@@ -1210,6 +1224,9 @@ impl VolumeIndex {
             let new_id = remap[self.entries.name_id(idx) as usize];
             debug_assert_ne!(new_id, NIL, "live entry referenced a dead name id");
             self.entries.set_name_id(idx, new_id);
+            if self.entries.flags(idx).contains(EntryFlags::DIR) {
+                self.names.mark_folder(new_id);
+            }
         }
     }
 
@@ -1281,6 +1298,13 @@ impl VolumeIndex {
     #[inline]
     pub(crate) fn name_raw(&self, id: NameId) -> &[u8] {
         self.names.raw_bytes(id)
+    }
+
+    /// Whether a folder may bear `id`: `false` means files alone do, so
+    /// [`Self::name_refcount`] counts files. See `NameStore::folder_bearer`.
+    #[inline]
+    pub(crate) fn name_may_bear_folder(&self, id: NameId) -> bool {
+        self.names.may_bear_folder(id)
     }
 
     /// Live entries bearing `id`: the chain's length without walking it.
@@ -1390,11 +1414,19 @@ impl VolumeIndex {
     }
 
     /// Every name's refcount equals its chain length: what lets a name-level
-    /// query count matches without touching an entry.
+    /// query count matches without touching an entry. And every name a
+    /// folder bears says so (see [`Self::name_may_bear_folder`]), which lets
+    /// a query that keeps files or folders count by refcount the names that
+    /// do not.
     #[cfg(test)]
     pub fn name_refcounts_match_chains(&self) -> bool {
-        (0..self.names.ids() as NameId)
-            .all(|id| self.names.refcount(id) as usize == self.name_chain(id).count())
+        (0..self.names.ids() as NameId).all(|id| {
+            self.names.refcount(id) as usize == self.name_chain(id).count()
+                && (self.names.may_bear_folder(id)
+                    || self
+                        .name_chain(id)
+                        .all(|e| !self.entries.flags(e).contains(EntryFlags::DIR)))
+        })
     }
 
     // -- folded-arena query support --------------------------------------

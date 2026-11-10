@@ -549,9 +549,14 @@ fn page_refs(
         if budget.spent() {
             return Err(Stopped);
         }
-        let total_size = sum_sizes.then(|| names_files_size(index, &matched));
+        // Folders add no size, and a name a folder bears may be a file's
+        // too, whose size a folders-only query must not add.
+        let total_size = sum_sizes.then(|| match compiled.kind {
+            Some(Kind::Folder) => 0,
+            _ => names_files_size(index, &matched),
+        });
         let (start, end) = page_bounds(total as usize, offset, limit);
-        let refs = name_level_refs(index, &matched, sort.dir, start, end);
+        let refs = name_level_refs(index, &matched, compiled.kind, sort.dir, start, end);
         return Ok(RefOutcome {
             total,
             refs,
@@ -598,11 +603,14 @@ fn files_size(index: &VolumeIndex, entries: impl Iterator<Item = EntryIdx>) -> u
 
 /// Whether every predicate of `parsed` is decided by the file name alone, so
 /// the query can run over the distinct names instead of the entries: no
-/// scope, no path term the mount prefix leaves open, no kind, size or date
-/// filter (an `ext:` filter keeps files), and no entry without a path (an
-/// orphan, or one in a parent cycle) whose presentability would need a
-/// per-entry walk. Extensions, wildcards and case sensitivity are properties
-/// of the name and pass, and so does an expression whose terms all are.
+/// scope, no path term the mount prefix leaves open, no size or date filter,
+/// and no entry without a path (an orphan, or one in a parent cycle) whose
+/// presentability would need a per-entry walk. Extensions, wildcards and
+/// case sensitivity are properties of the name and pass, and so does an
+/// expression whose terms all are. A kind filter passes too: a name no
+/// folder bears counts its files by refcount, and only the chain of one a
+/// folder may bear is walked (see [`entries_of_kind`]), so `ext:pdf`, which
+/// keeps files, runs over the names as it did when it kept folders too.
 fn is_name_level(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
@@ -612,7 +620,6 @@ fn is_name_level(
     scope.is_none()
         && compiled.volume_admits
         && !compiled.tests_paths()
-        && compiled.kind.is_none()
         && parsed.filters.size.is_none()
         && parsed.filters.date.is_none()
         && compiled.expr_entry.is_none()
@@ -935,6 +942,23 @@ fn word_ids(base: usize, words: &[u64]) -> impl Iterator<Item = NameId> + '_ {
     })
 }
 
+/// How many live entries of `kind`, synthetic ones aside, bear name `id`:
+/// for a name no folder bears, its files are all its entries, counted as
+/// [`entries_bearing`] counts them, and it has no folder; only the chain of a
+/// name a folder may bear is walked, testing each entry.
+fn entries_of_kind(index: &VolumeIndex, id: NameId, kind: Kind) -> u64 {
+    if !index.name_may_bear_folder(id) {
+        return match kind {
+            Kind::File => entries_bearing(index, id),
+            Kind::Folder => 0,
+        };
+    }
+    index
+        .name_chain(id)
+        .filter(|&e| !index.is_synthetic(e) && kind_matches(Some(kind), index.entry(e).is_dir()))
+        .count() as u64
+}
+
 /// How many live entries, synthetic ones aside, bear name `id`: its refcount,
 /// which is its chain length, so no entry is touched, except for the three
 /// names synthetic entries can bear, whose chains are walked.
@@ -965,7 +989,12 @@ fn match_names(
     // Stamped out for the query's shape, so that a query with one needle or
     // none and no name tests beyond the buckets' runs the loop it always has:
     // it tests every distinct name, and an instruction more per name showed.
-    match (compiled.needles(parsed).len() > 1, compiled.name_extra) {
+    // A kind filter counts each name's entries of that kind, beyond the
+    // buckets' tests too.
+    match (
+        compiled.needles(parsed).len() > 1,
+        compiled.name_extra || compiled.kind.is_some(),
+    ) {
         (false, false) => match_names_as::<false, false>(index, parsed, compiled),
         (false, true) => match_names_as::<false, true>(index, parsed, compiled),
         (true, false) => match_names_as::<true, false>(index, parsed, compiled),
@@ -974,7 +1003,9 @@ fn match_names(
 }
 
 /// [`match_names`] for a scan of several needles (`UNION`), whose repeats
-/// it skips, and for a query with name tests beyond the buckets' (`EXTRA`).
+/// it skips, and for a query with name tests beyond the buckets' or a kind
+/// filter (`EXTRA`). A name with no entry of the kind is left out of the set,
+/// so the page walk never visits its chain.
 fn match_names_as<const UNION: bool, const EXTRA: bool>(
     index: &VolumeIndex,
     parsed: &ParsedQuery,
@@ -1016,10 +1047,17 @@ fn match_names_as<const UNION: bool, const EXTRA: bool>(
                     {
                         return;
                     }
+                    let bearing = match compiled.kind {
+                        Some(kind) if EXTRA => entries_of_kind(index, id, kind),
+                        _ => entries_bearing(index, id),
+                    };
+                    if EXTRA && bearing == 0 && compiled.kind.is_some() {
+                        return;
+                    }
                     let at = id as usize - base;
                     words[at / 64] |= 1 << (at % 64);
                     len += 1;
-                    total += entries_bearing(index, id);
+                    total += bearing;
                 };
                 if needles.is_empty() {
                     ids.map(|id| id as NameId)
@@ -1109,12 +1147,14 @@ fn names_in_order<'a>(
 
 /// Rows `[start, end)` of a name-level query: walks the matched names in
 /// name order (reversed for a descending sort) and each name's same-name
-/// chain, and stops at `end`. Names with equal folded bytes form one group
-/// whose entries interleave by idx (descending when the sort is), exactly the
-/// `(folded name, idx)` order the candidate comparator produces.
+/// chain, its entries of `kind` when the query keeps one, and stops at `end`.
+/// Names with equal folded bytes form one group whose entries interleave by
+/// idx (descending when the sort is), exactly the `(folded name, idx)` order
+/// the candidate comparator produces.
 fn name_level_refs(
     index: &VolumeIndex,
     matched: &NameSet,
+    kind: Option<Kind>,
     dir: SortDir,
     start: usize,
     end: usize,
@@ -1126,14 +1166,18 @@ fn name_level_refs(
     let mut refs = Vec::with_capacity((end - start).min(1 << 16));
     let mut group: Vec<EntryIdx> = Vec::new();
     let mut seen = 0usize;
+    let listed = |e: EntryIdx| {
+        !index.is_synthetic(e)
+            && kind.is_none_or(|k| kind_matches(Some(k), index.entry(e).is_dir()))
+    };
     while seen < end
         && let Some(first) = names.next()
     {
         let folded = index.name_folded(first);
         group.clear();
-        group.extend(index.name_chain(first).filter(|&e| !index.is_synthetic(e)));
+        group.extend(index.name_chain(first).filter(|&e| listed(e)));
         while let Some(id) = names.next_if(|&id| index.name_folded(id) == folded) {
-            group.extend(index.name_chain(id).filter(|&e| !index.is_synthetic(e)));
+            group.extend(index.name_chain(id).filter(|&e| listed(e)));
         }
         // A chain is in link order, not idx order.
         group.sort_unstable();
@@ -3997,6 +4041,89 @@ mod tests {
         }
     }
 
+    /// `ext:`, which keeps files, and the kinds run over the distinct names,
+    /// as `ext:` did when it kept folders too: a name no folder bears counts
+    /// its files by refcount, and the chain of one a folder bears is walked,
+    /// so a folder and files of the same name are told apart. The bit stays
+    /// set after the folder goes, which costs a walk and nothing else, until
+    /// a compaction recomputes it.
+    #[test]
+    fn kinds_run_over_the_names() {
+        let root = NTFS_ROOT_FRN;
+        let delete = |f: Frn| {
+            let mut rec = enum_rec(f, root, "", false);
+            rec.reason = USN_REASON_FILE_DELETE;
+            rec
+        };
+        let mut idx = VolumeIndex::new(root, FrnMap::sparse());
+        let mut recs: Vec<_> = (0..400)
+            .map(|i| enum_rec(frn(1000 + i), root, &format!("{i:040}"), false))
+            .collect();
+        recs.extend([
+            enum_rec(frn(100), root, "x.txt", true),
+            enum_rec(frn(101), frn(100), "x.txt", false),
+            enum_rec(frn(102), root, "y.txt", false),
+            enum_rec(frn(103), root, "z.pdf", true),
+            // An empty folder named as a file is.
+            enum_rec(frn(104), frn(103), "y.txt", true),
+        ]);
+        idx.apply_batch(&recs);
+        idx.optimize_storage();
+        let id = |idx: &VolumeIndex, f: u64| idx.name_id(idx.head_of(frn(f)).unwrap());
+        assert!(idx.name_may_bear_folder(id(&idx, 101)));
+        assert!(idx.name_may_bear_folder(id(&idx, 102)));
+        assert!(!idx.name_may_bear_folder(id(&idx, 1000)), "files alone");
+        let check = |idx: &VolumeIndex, query: &str, want: &[&str]| {
+            let parsed = parse_query(query).unwrap();
+            let compiled = CompiledQuery::new(idx, &parsed, r"C:\", &UNLIMITED);
+            assert!(is_name_level(idx, &parsed, &compiled, None), "{query}");
+            let mut got = run(idx, query);
+            got.sort();
+            assert_eq!(got, want, "{query}");
+            for fast in [true, false] {
+                let out = unlimited_refs(
+                    idx,
+                    r"C:\",
+                    &parsed,
+                    None,
+                    SortSpec::default(),
+                    0,
+                    None,
+                    true,
+                    fast,
+                );
+                assert_eq!(out.total, want.len() as u64, "{query} fast {fast}");
+                assert_eq!(out.total_size, Some(0), "{query} fast {fast}");
+            }
+        };
+        check(&idx, "ext:txt", &[r"x.txt\x.txt", "y.txt"]);
+        check(&idx, "ext:pdf", &[]);
+        check(&idx, "file:x.t", &[r"x.txt\x.txt"]);
+        check(&idx, "folder:x.t", &["x.txt"]);
+        check(&idx, "folder:txt", &["x.txt", r"z.pdf\y.txt"]);
+        check(&idx, "file:y", &["y.txt"]);
+        check(&idx, "folder:y", &[r"z.pdf\y.txt"]);
+        check(&idx, r"\ .", &["x.txt", "z.pdf", r"z.pdf\y.txt"]);
+        check(&idx, "x.txt", &["x.txt", r"x.txt\x.txt"]);
+        // The empty folder goes: the bit of the name it shared with a file
+        // stays, and the counts hold.
+        idx.apply_batch(&[delete(frn(104))]);
+        assert!(idx.name_may_bear_folder(id(&idx, 102)));
+        check(&idx, "folder:y", &[]);
+        check(&idx, "file:y", &["y.txt"]);
+        check(&idx, "ext:txt", &[r"x.txt\x.txt", "y.txt"]);
+        // A compaction recomputes the bits from the folders still there.
+        idx.apply_batch(&(0..400).map(|i| delete(frn(1000 + i))).collect::<Vec<_>>());
+        let plan = idx.plan_compaction().expect("garbage");
+        idx.apply_compaction(plan);
+        assert!(idx.name_refcounts_match_chains());
+        assert!(!idx.name_may_bear_folder(id(&idx, 102)));
+        assert!(idx.name_may_bear_folder(id(&idx, 101)));
+        assert!(idx.name_may_bear_folder(id(&idx, 103)));
+        check(&idx, "folder:", &["x.txt", "z.pdf"]);
+        check(&idx, "ext:txt", &[r"x.txt\x.txt", "y.txt"]);
+    }
+
     /// A child of a removed folder has no full path. The name-level page
     /// trusts each name's refcount only while `may_have_unpresentable` is false, so the
     /// child used to be counted and shown under the folder's zero-filled
@@ -4276,7 +4403,8 @@ mod tests {
     /// volume, so `C:\ report` is decided by names alone, as `report` is, and
     /// runs per distinct name, and so is the drive term `c:`. Another
     /// drive's term still empties the volume, and under `case:` a lowercase
-    /// drive is not in `C:\`. A lone `\` keeps folders (Everything 1.5).
+    /// drive is not in `C:\`. A lone `\` keeps folders (Everything 1.5),
+    /// which the names decide too (see `entries_of_kind`).
     #[test]
     fn a_path_term_the_prefix_holds_leaves_the_query_to_names() {
         let mut idx = sample_index();
@@ -4293,7 +4421,7 @@ mod tests {
             );
         }
         let folders = parse_query(r"\ report").unwrap();
-        assert!(!is_name_level(
+        assert!(is_name_level(
             &idx,
             &folders,
             &CompiledQuery::new(&idx, &folders, r"C:\", &UNLIMITED),

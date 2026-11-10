@@ -95,6 +95,15 @@ pub(crate) struct NameStore {
     refcount: Vec<u32>,
     /// Head of the same-name entry chain (see `EntryTable::next_same`).
     head: Vec<EntryIdx>,
+    /// One bit per id, set when a folder takes the name: a name whose bit is
+    /// clear is borne by files alone, so a query that keeps files or folders
+    /// (`file:`, `folder:`, or the files an `ext:` keeps) can count its
+    /// entries by refcount, or skip it, on the pass over the distinct names,
+    /// and walk the chain only of a name a folder may bear. A bit stays set
+    /// after its folders go, which only costs such a walk, until compaction
+    /// recomputes them all (see `VolumeIndex::apply_compaction`). Folders are
+    /// a few percent of the names of a real volume.
+    folder_bearer: Vec<u64>,
     /// raw bytes → id. Stores only the id (4 bytes/name); key bytes live in
     /// the arenas and are compared through `raw_bytes`.
     by_bytes: hashbrown::HashTable<NameId>,
@@ -242,6 +251,12 @@ impl NameStore {
         self.head.push(NIL);
         self.rank_of.push(UNRANKED);
         self.unranked.push(id);
+        if id as usize / 64 == self.folder_bearer.len() {
+            if self.settled {
+                room_for(&mut self.folder_bearer, 1);
+            }
+            self.folder_bearer.push(0);
+        }
         let Self {
             by_bytes,
             pairs,
@@ -306,6 +321,18 @@ impl NameStore {
     #[inline]
     pub(crate) fn pairs(&self) -> &[NamePair] {
         &self.pairs
+    }
+
+    /// Notes that a folder bears `id`.
+    #[inline]
+    pub(crate) fn mark_folder(&mut self, id: NameId) {
+        self.folder_bearer[id as usize / 64] |= 1 << (id % 64);
+    }
+
+    /// Whether a folder may bear `id`: `false` means files alone do.
+    #[inline]
+    pub(crate) fn may_bear_folder(&self, id: NameId) -> bool {
+        self.folder_bearer[id as usize / 64] & (1 << (id % 64)) != 0
     }
 
     #[inline]
@@ -416,8 +443,11 @@ impl NameStore {
 
     /// Installs storage built by [`Self::plan_compact`], returning the id
     /// remap (`remap[old_id]` = new id or [`NIL`]). The caller must rewrite
-    /// every entry's name id through it. Buffer swaps plus one intern-table
-    /// rebuild; this is the half that runs under the exclusive lock.
+    /// every entry's name id through it, and mark the name of every folder
+    /// again ([`Self::mark_folder`]): the folder-bearer bits come back clear,
+    /// so that bits whose folders are gone stop costing queries a chain
+    /// walk. Buffer swaps plus one intern-table rebuild; this is the half
+    /// that runs under the exclusive lock.
     ///
     /// The plan is only valid if the index has not changed since it was
     /// built; the volume's single-writer discipline (one tail thread, which
@@ -442,6 +472,7 @@ impl NameStore {
         self.pairs = c.pairs;
         self.refcount = c.refcount;
         self.head = c.head;
+        self.folder_bearer = vec![0; self.pairs.len().div_ceil(64)];
         self.garbage = 0;
         let mut table = hashbrown::HashTable::with_capacity(self.pairs.len());
         let (pairs, raw, folded) = (&self.pairs, &self.raw, &self.folded);
@@ -669,6 +700,7 @@ impl NameStore {
             + ComponentBytes::of_vec(&self.order)
             + ComponentBytes::of_vec(&self.rank_of)
             + ComponentBytes::of_vec(&self.unranked)
+            + ComponentBytes::of_vec(&self.folder_bearer)
             + ComponentBytes {
                 used: self.by_bytes.len() as u64 * intern_per,
                 allocated: intern_buckets * intern_per,
@@ -693,6 +725,7 @@ impl NameStore {
         shrink_vec(&mut self.order);
         shrink_vec(&mut self.rank_of);
         shrink_vec(&mut self.unranked);
+        shrink_vec(&mut self.folder_bearer);
         let Self {
             by_bytes,
             pairs,
