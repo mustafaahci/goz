@@ -18,11 +18,11 @@ pub mod volume;
 
 pub use columns::{Column, Columns};
 pub(crate) use store::NameId;
-pub use store::{ComponentBytes, EntryFlags, FrnMap, NameRef};
+pub use store::{ColumnValues, ComponentBytes, EntryFlags, FrnMap, NameRef};
 pub use volume::{
-    Anomaly, ApplyOutcome, CompactPlan, EntryView, FolderSizePlan, IndexMemory, IndexStats,
-    LinkTarget, NTFS_ROOT_FRN, NameMergePlan, PathStatus, Room, RoomPlan, StatInfo, VolumeIndex,
-    WtfName,
+    Anomaly, ApplyOutcome, ColumnSwitch, CompactPlan, EntryView, FolderSizePlan, IndexMemory,
+    IndexStats, LinkTarget, NTFS_ROOT_FRN, NameMergePlan, PathStatus, Room, RoomPlan, StatInfo,
+    VolumeIndex, WtfName,
 };
 
 #[cfg(test)]

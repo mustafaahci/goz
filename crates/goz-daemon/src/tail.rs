@@ -173,7 +173,15 @@ pub(crate) fn spawn(state: Arc<VolumeState>, handle: VolumeHandle) -> std::io::R
             // `Retired` is a promise that joining is instant, and a close is
             // itself an IRP a sick device can pend.
             let _retired = pulse_thread.retire_on_drop();
-            tail_loop(&state, handle, &stop_thread, &pulse_thread)
+            tail_loop(&state, handle, &stop_thread, &pulse_thread);
+            // A volume left a Snapshot has no tail to follow the options
+            // any more: a switch made while it was built is applied now,
+            // and later ones by the options' change (see
+            // `switch_columns_without_tail`).
+            if !stop_thread.load(Ordering::Relaxed) && *state.phase.read() == VolumePhase::Snapshot
+            {
+                spawn_columns_without_tail(Arc::clone(&state));
+            }
         })?;
     let io_handle = io_rx
         .recv()
@@ -490,14 +498,19 @@ impl ColumnBuilder {
             (index.columns(), index.settled_columns())
         };
         if have != want {
-            let mut index = state.index.write();
-            for c in Column::ALL {
-                index.set_column(c, want.contains(c));
-            }
+            // A column switched on is allocated and filled under an
+            // upgradable read, so queries keep reading (and no other writer
+            // runs) while tens of MB are written; the write lock only swaps
+            // it in. One switched off is freed after the lock.
+            let guard = state.index.upgradable_read();
+            let plan = guard.plan_columns(want);
+            let mut index = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
+            let freed = index.switch_columns(plan);
             if want.contains(Column::RecentChange) {
                 index.settle_column(Column::RecentChange);
             }
             drop(index);
+            drop(freed);
             tracing::info!(volume = %state.mount_prefix(), columns = ?want, "optional columns switched");
             self.failed = Columns::NONE;
         }
@@ -581,6 +594,55 @@ impl ColumnBuilder {
         if *slot != progress {
             *slot = progress;
         }
+    }
+}
+
+/// Brings the optional columns of a volume no tail runs for (a Snapshot,
+/// whose tail stopped) in line with the options, as the tail's
+/// [`ColumnBuilder`] does for a live one: a column switched off is freed at
+/// once, and one switched on is built by a FILE_LAYOUT pass run to its end
+/// on this thread. No journal changes such a volume, so nothing else writes
+/// its columns. One runs at a time per volume; a switch made while one runs
+/// is taken up by it before it ends.
+pub(crate) fn columns_without_tail(state: &VolumeState, wanted: impl Fn() -> Columns) {
+    while state
+        .tailless_columns
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let mut builder = ColumnBuilder::default();
+        let mut want = wanted();
+        loop {
+            builder.step(state, want);
+            if !builder.building() {
+                break;
+            }
+            want = wanted();
+        }
+        state.tailless_columns.store(false, Ordering::Release);
+        if wanted() == want {
+            return;
+        }
+    }
+}
+
+/// [`columns_without_tail`] for every volume left a Snapshot, each on a
+/// thread of its own, once the options changed.
+pub(crate) fn switch_columns_without_tail(volumes: &crate::volume_state::VolumeSet) {
+    for volume in volumes.iter() {
+        if *volume.phase.read() == VolumePhase::Snapshot {
+            spawn_columns_without_tail(Arc::clone(volume));
+        }
+    }
+}
+
+fn spawn_columns_without_tail(state: Arc<VolumeState>) {
+    let name = format!("goz-columns-{}", state.mount_prefix());
+    let spawned = std::thread::Builder::new()
+        .name(name)
+        .spawn(move || columns_without_tail(&state, crate::config::wanted_columns));
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "cannot start the column switch of a volume without a tail");
     }
 }
 
@@ -1290,6 +1352,7 @@ mod tests {
             })),
             published_generation: std::sync::atomic::AtomicU64::new(0),
             column_build: parking_lot::Mutex::new(Default::default()),
+            tailless_columns: AtomicBool::new(false),
         }
     }
 
@@ -1570,6 +1633,53 @@ mod tests {
         assert_eq!(state.published(), before + 1);
         crate::folder_sizes::sync(&state);
         assert_eq!(state.published(), before + 1);
+    }
+
+    /// W9R-8: a volume left a Snapshot, whose tail stopped, still follows
+    /// the options. A column switched off is freed and one switched on is
+    /// on (built by a pass of its own, which needs the volume and does not
+    /// run here; the date recently changed needs none and settles at once).
+    /// One switch runs at a time, and one made while it runs is taken up.
+    #[test]
+    fn a_volume_without_a_tail_follows_the_columns() {
+        use goz_core::index::{Column, Columns};
+        let state = volume(VolumePhase::Snapshot);
+        {
+            let mut index = state.index.write();
+            index.set_column(Column::Attributes, true);
+            index.settle_column(Column::Attributes);
+        }
+        let rc = Columns::NONE.with(Column::RecentChange, true);
+        super::columns_without_tail(&state, || rc);
+        {
+            let index = state.index.read();
+            assert_eq!(index.columns(), rc);
+            assert_eq!(index.settled_columns(), rc);
+            assert_eq!(index.column_memory(Column::Attributes).allocated, 0);
+        }
+        assert!(!state.tailless_columns.load(Ordering::Acquire));
+
+        // Another switch is running: this one leaves it to that one.
+        state.tailless_columns.store(true, Ordering::Release);
+        super::columns_without_tail(&state, || Columns::NONE);
+        assert_eq!(state.index.read().columns(), rc);
+        state.tailless_columns.store(false, Ordering::Release);
+
+        // The options change while the switch runs: it switches again.
+        let calls = std::cell::Cell::new(0);
+        super::columns_without_tail(&state, || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 { rc } else { Columns::NONE }
+        });
+        assert_eq!(state.index.read().columns(), Columns::NONE);
+        assert_eq!(
+            state
+                .index
+                .read()
+                .column_memory(Column::RecentChange)
+                .allocated,
+            0
+        );
     }
 
     /// A rescan the volume refuses a new journal for leaves a Snapshot, as

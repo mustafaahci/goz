@@ -25,8 +25,8 @@
 
 use super::columns::{self, Column, Columns};
 use super::store::{
-    CompactedNames, ComponentBytes, EntryFlags, EntryRoom, EntryTable, FrnMap, FrnRoom,
-    MTIME_UNKNOWN, NameId, NameMerge, NamePair, NameRoom, NameStore, SIZE_UNKNOWN,
+    ColumnValues, CompactedNames, ComponentBytes, EntryFlags, EntryRoom, EntryTable, FrnMap,
+    FrnRoom, MTIME_UNKNOWN, NameId, NameMerge, NamePair, NameRoom, NameStore, SIZE_UNKNOWN,
 };
 use crate::layout::LayoutFile;
 use crate::types::{EntryIdx, Frn, NIL};
@@ -190,6 +190,26 @@ impl Room {
             room.records += 1;
         }
         room
+    }
+}
+
+/// The optional columns switched on, built off the write lock (see
+/// [`VolumeIndex::plan_columns`]).
+pub struct ColumnSwitch {
+    epoch: u64,
+    want: Columns,
+    built: Vec<(Column, ColumnValues)>,
+}
+
+impl ColumnSwitch {
+    /// Where the values built for column `c` are, to tell a swap from a
+    /// copy.
+    #[cfg(test)]
+    pub(crate) fn ptr(&self, c: Column) -> Option<usize> {
+        self.built
+            .iter()
+            .find(|(b, _)| *b == c)
+            .map(|(_, v)| v.ptr())
     }
 }
 
@@ -627,6 +647,66 @@ impl VolumeIndex {
             self.entries.set_column(c, on);
             self.settled_columns = self.settled_columns.with(c, false);
         }
+    }
+
+    /// What switching the optional columns to `want` needs built: each
+    /// column switched on, every value unknown. Made under a read lock (an
+    /// upgradable one, so no other writer runs) while queries keep reading;
+    /// [`Self::switch_columns`] then only swaps it in.
+    pub fn plan_columns(&self, want: Columns) -> ColumnSwitch {
+        let have = self.columns();
+        let built = Column::ALL
+            .into_iter()
+            .filter(|&c| want.contains(c) && !have.contains(c))
+            .map(|c| (c, self.entries.plan_column(c)))
+            .collect();
+        ColumnSwitch {
+            epoch: self.epoch,
+            want,
+            built,
+        }
+    }
+
+    /// Switches the optional columns to the plan's, as [`Self::set_column`]
+    /// does each: one switched on takes the values the plan built (built
+    /// here instead only if the index changed since the plan), and one
+    /// switched off is handed back, to be freed after the write lock.
+    pub fn switch_columns(&mut self, plan: ColumnSwitch) -> Vec<ColumnValues> {
+        let fresh = plan.epoch == self.epoch;
+        let mut built = plan.built;
+        let mut freed = Vec::new();
+        for c in Column::ALL {
+            let on = plan.want.contains(c);
+            if self.columns().contains(c) == on {
+                continue;
+            }
+            self.epoch += 1;
+            self.settled_columns = self.settled_columns.with(c, false);
+            if on {
+                let values = built
+                    .iter()
+                    .position(|(b, _)| *b == c)
+                    .map(|i| built.swap_remove(i).1);
+                let installed = match values {
+                    Some(v) if fresh => self.entries.install_column(c, v).map_err(Some),
+                    v => Err(v),
+                };
+                if let Err(unused) = installed {
+                    freed.extend(unused);
+                    self.entries.set_column(c, true);
+                }
+            } else {
+                freed.extend(self.entries.take_column(c));
+            }
+        }
+        freed.extend(built.into_iter().map(|(_, v)| v));
+        freed
+    }
+
+    /// Where column `c`'s values are, to tell a swap from a copy.
+    #[cfg(test)]
+    pub(crate) fn column_ptr(&self, c: Column) -> usize {
+        self.entries.column_ptr(c)
     }
 
     /// Marks column `c`, when it is on, as holding every entry's value.
@@ -1523,6 +1603,21 @@ impl VolumeIndex {
         let (size, mtime) = current.first().map_or((SIZE_UNKNOWN, MTIME_UNKNOWN), |&e| {
             (self.entries.size(e), self.entries.mtime(e))
         });
+        // So do the optional columns that are on: the tail applies the
+        // record's columns and the stat to the old chain before it reconciles,
+        // and a settled column is read from the index, not the disk.
+        let cols = self.columns();
+        let carried = current.first().filter(|_| !cols.is_empty()).map(|&e| {
+            (
+                [
+                    Column::DateCreated,
+                    Column::DateAccessed,
+                    Column::RecentChange,
+                ]
+                .map(|c| (c, self.entries.date(c, e))),
+                self.entries.packed_attrib(e),
+            )
+        });
 
         // Match each desired link to an existing entry, else allocate.
         let mut kept: SmallVec<[EntryIdx; 4]> = SmallVec::new();
@@ -1546,6 +1641,12 @@ impl VolumeIndex {
                     .with(EntryFlags::NON_UNICODE_NAME, target.name.lossy);
                 let size = if is_dir { self.new_folder_size() } else { size };
                 let idx = self.entries.alloc(frn, parent, id, flags, size, mtime, NIL);
+                if let Some((dates, packed)) = carried {
+                    for (c, date) in dates {
+                        self.entries.set_date(c, idx, date);
+                    }
+                    self.entries.set_packed_attrib(idx, packed);
+                }
                 self.link_same_name(idx, id);
                 self.link_child(idx);
                 self.dir_index_insert(idx);

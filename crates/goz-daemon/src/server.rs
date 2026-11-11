@@ -435,7 +435,10 @@ async fn handle_connection(
                     continue;
                 }
                 // Only an elevated administrator changes the options: the
-                // client's token decides, read through the pipe.
+                // token this connection carries decides (the request has
+                // been read, so the check may impersonate its sender, here
+                // on this thread with no await before it reverts), never the
+                // client process, whose ID can be freed and reused.
                 Ok(Request::SetConfig(change)) => {
                     use std::os::windows::io::{AsRawHandle, BorrowedHandle};
                     // SAFETY: `server` is a live pipe instance for the call.
@@ -1112,6 +1115,11 @@ fn set_config(
             if before.index_folder_size != now.index_folder_size {
                 crate::folder_sizes::set(volumes, now.index_folder_size);
             }
+            // A live volume's tail follows the columns on its next turn; a
+            // Snapshot has no tail, so its switch runs here.
+            if Columns::of_config(&before) != Columns::of_config(&now) {
+                crate::tail::switch_columns_without_tail(volumes);
+            }
             Response::Config(now)
         }
         Err(e) => Response::Error {
@@ -1701,6 +1709,7 @@ mod tests {
             scope_cache: Mutex::new(None),
             published_generation: std::sync::atomic::AtomicU64::new(0),
             column_build: Mutex::new(Default::default()),
+            tailless_columns: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

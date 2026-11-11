@@ -17,6 +17,11 @@ use crate::reply::{PipeIo, Replies, ReplyError};
 /// authenticate the server: see [`Client::connect`], which verifies the pipe's
 /// owner is the elevated daemon before any request is sent.
 const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+/// The impersonation level `--config set` offers instead
+/// (`SECURITY_IDENTIFICATION`): gozd judges a change by the token the
+/// connection carries, which an anonymous connection does not show it. At
+/// this level a server learns who the client is but cannot act as it.
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
 #[derive(Debug)]
 pub(crate) enum ClientError {
@@ -38,12 +43,14 @@ pub(crate) struct Client {
 
 impl Client {
     /// Connects to the running daemon and, unless `insecure`, verifies the pipe
-    /// server's identity before returning.
+    /// server's identity before returning. The connection shows the daemon
+    /// this client's token only when `identify` (see
+    /// [`SECURITY_IDENTIFICATION`]); otherwise it is anonymous.
     ///
     /// Returns [`ClientError::Unreachable`] if no pipe exists (daemon absent),
     /// [`ClientError::Untrusted`] if a server is present but not owned by the
     /// elevated daemon, or [`ClientError::Protocol`] for other open errors.
-    pub(crate) fn connect(insecure: bool) -> Result<Self, ClientError> {
+    pub(crate) fn connect(insecure: bool, identify: bool) -> Result<Self, ClientError> {
         use std::os::windows::fs::OpenOptionsExt;
 
         // Win32 error codes (goz-cli intentionally has no windows-sys dep).
@@ -61,7 +68,11 @@ impl Client {
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .custom_flags(SECURITY_SQOS_PRESENT)
+                .custom_flags(if identify {
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+                } else {
+                    SECURITY_SQOS_PRESENT
+                })
                 .open(PIPE_NAME)
             {
                 Ok(pipe) => break pipe,

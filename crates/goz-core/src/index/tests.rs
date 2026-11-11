@@ -614,6 +614,97 @@ fn a_new_hard_link_gets_the_size_and_date_of_its_file() {
     );
 }
 
+/// Every link of `f`, sorted by name, with the optional columns it carries.
+type LinkColumns = (String, Option<i64>, Option<i64>, Option<i64>, Option<u32>);
+fn link_columns(idx: &VolumeIndex, f: Frn) -> Vec<LinkColumns> {
+    let mut out = Vec::new();
+    let mut cur = idx.head_of(f).unwrap();
+    while cur != crate::types::NIL {
+        let e = idx.entry(cur);
+        out.push((
+            String::from_utf8_lossy(e.name()).into_owned(),
+            e.ctime(),
+            e.atime(),
+            e.rtime(),
+            e.attrib(),
+        ));
+        cur = e.next_link();
+    }
+    out.sort();
+    out
+}
+
+/// W9R-3: a name added or renamed while the volume is live takes the
+/// optional columns its file's chain carries, as it takes the size and
+/// date: the tail applies the record's columns and the stat to the old
+/// chain before it reconciles, and nothing fills the new entry afterwards,
+/// while a settled column is read from the index.
+#[test]
+fn a_new_hard_link_gets_the_optional_columns_of_its_file() {
+    use crate::index::Column;
+    let mut idx = index_from_enum(&[
+        create(frn(10), root_frn(), "dirA", true),
+        create(frn(11), root_frn(), "dirB", true),
+        create(frn(100), frn(10), "orig.txt", false),
+    ]);
+    for c in [
+        Column::DateCreated,
+        Column::DateAccessed,
+        Column::RecentChange,
+        Column::Attributes,
+    ] {
+        idx.set_column(c, true);
+    }
+    let a = idx.head_of(frn(10)).unwrap();
+    let b = idx.head_of(frn(11)).unwrap();
+    // READONLY | ARCHIVE.
+    let attributes = 0x1 | 0x20;
+    let stat = StatInfo {
+        size: 17,
+        mtime: 1234,
+        ctime: 1000,
+        atime: 3000,
+        attributes,
+    };
+    // A write (the date recently changed), the stat, then a second name,
+    // applied as the tail applies them: the batch, the stat, the reconcile.
+    let mut write = record(frn(100), frn(10), "orig.txt", false, 0x2); // DATA_EXTEND
+    write.timestamp_ft = 2000;
+    write.attributes = attributes;
+    idx.apply_batch(&[write]);
+    idx.set_stat_info(frn(100), &stat);
+    let outcome = idx.apply_batch(&[record(
+        frn(100),
+        frn(11),
+        "link.txt",
+        false,
+        USN_REASON_HARD_LINK_CHANGE,
+    )]);
+    assert_eq!(outcome.needs_link_reconcile, [frn(100)]);
+    idx.set_stat_info(frn(100), &stat);
+    idx.reconcile_links(frn(100), &[link(a, "orig.txt"), link(b, "link.txt")]);
+    let file = idx.entry(idx.head_of(frn(100)).unwrap()).attrib();
+    assert_eq!(file.map(|v| v & attributes), Some(attributes));
+    let carried = |name: &str, rc: i64| (name.to_string(), Some(1000), Some(3000), Some(rc), file);
+    assert_eq!(
+        link_columns(&idx, frn(100)),
+        [carried("link.txt", 2000), carried("orig.txt", 2000)]
+    );
+
+    // Renaming one name re-allocates it; it keeps the columns too, with the
+    // rename's date recently changed.
+    let mut moved = rename(frn(100), frn(11), "moved.txt", false);
+    moved.timestamp_ft = 4000;
+    moved.attributes = attributes;
+    let outcome = idx.apply_batch(&[moved]);
+    assert_eq!(outcome.needs_link_reconcile, [frn(100)]);
+    idx.reconcile_links(frn(100), &[link(a, "orig.txt"), link(b, "moved.txt")]);
+    assert_eq!(
+        link_columns(&idx, frn(100)),
+        [carried("moved.txt", 4000), carried("orig.txt", 4000)]
+    );
+}
+
 /// Renaming one name of a hard-linked file goes through reconciliation, which
 /// drops the old entry and allocates one for the new name.
 #[test]
@@ -1983,6 +2074,73 @@ fn optional_columns_take_room_only_while_on() {
         "nothing grew under the lock"
     );
     assert_eq!(idx.column_memory(Column::DateAccessed).allocated, 0);
+    assert_whole(&idx);
+}
+
+/// W9R-7: switching columns on builds them off the write lock (the plan
+/// takes `&self`) and the switch only swaps them in: the column installed
+/// is the very buffer the plan filled, with the entry columns' room. One
+/// switched off is handed back to free after the lock; a plan made before
+/// the index changed still switches correctly, building under the lock.
+#[test]
+fn columns_switched_on_are_built_off_the_write_lock() {
+    use crate::index::{Column, Columns};
+    let mut idx = new_index();
+    idx.reserve_for_records(64);
+    let recs: Vec<_> = (0..40u64)
+        .map(|i| create(frn(1_000 + i), root_frn(), &format!("f{i}"), false))
+        .collect();
+    idx.apply_batch(&recs);
+    let n = idx.len();
+    let entries = idx.memory().entries.allocated;
+
+    let want = Columns::NONE
+        .with(Column::DateCreated, true)
+        .with(Column::Attributes, true);
+    let plan = idx.plan_columns(want);
+    assert_eq!(idx.columns(), Columns::NONE, "planning changes nothing");
+    let ctime = plan.ptr(Column::DateCreated).expect("built");
+    let attrib = plan.ptr(Column::Attributes).expect("built");
+    assert_eq!(plan.ptr(Column::DateAccessed), None);
+    let freed = idx.switch_columns(plan);
+    assert!(freed.is_empty());
+    assert_eq!(idx.columns(), want);
+    assert_eq!(idx.settled_columns(), Columns::NONE);
+    assert_eq!(idx.column_ptr(Column::DateCreated), ctime, "swapped in");
+    assert_eq!(idx.column_ptr(Column::Attributes), attrib, "swapped in");
+    let head = idx.head_of(frn(1_000)).unwrap();
+    assert_eq!(idx.entry(head).ctime(), None);
+    assert_eq!(idx.entry(head).attrib(), None);
+    assert!(idx.column_memory(Column::DateCreated).allocated >= n as u64 * 8);
+    assert_eq!(
+        idx.memory().entries.allocated,
+        entries
+            + idx.column_memory(Column::DateCreated).allocated
+            + idx.column_memory(Column::Attributes).allocated,
+        "the entry columns themselves untouched"
+    );
+    // New entries grow the columns that are on.
+    idx.apply_batch(&[create(frn(5_000), root_frn(), "new", false)]);
+    let new = idx.head_of(frn(5_000)).unwrap();
+    assert_eq!(idx.entry(new).ctime(), None);
+
+    // Off: handed back, nothing left in the index.
+    let freed = idx.switch_columns(idx.plan_columns(Columns::NONE.with(Column::DateCreated, true)));
+    assert_eq!(freed.len(), 1);
+    assert_eq!(idx.column_memory(Column::Attributes).allocated, 0);
+    assert_eq!(idx.columns(), Columns::NONE.with(Column::DateCreated, true));
+
+    // A plan the index moved past is not swapped in; the switch still holds.
+    let all = Column::ALL
+        .into_iter()
+        .fold(Columns::NONE, |a, c| a.with(c, true));
+    let stale = idx.plan_columns(all);
+    idx.apply_batch(&[create(frn(5_001), root_frn(), "later", false)]);
+    let freed = idx.switch_columns(stale);
+    assert_eq!(freed.len(), 3, "the stale values, freed after the lock");
+    assert_eq!(idx.columns(), all);
+    let later = idx.head_of(frn(5_001)).unwrap();
+    assert_eq!(idx.entry(later).rtime(), None);
     assert_whole(&idx);
 }
 

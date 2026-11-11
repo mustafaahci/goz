@@ -69,6 +69,9 @@ pub(crate) struct VolumeState {
     /// How the background build of optional columns switched on while the
     /// volume is live stands, for `--status`.
     pub column_build: Mutex<ColumnBuild>,
+    /// Whether a switch of the optional columns runs for this volume while
+    /// no tail does (see `tail::columns_without_tail`).
+    pub tailless_columns: AtomicBool,
 }
 
 /// A background build of optional columns (see `tail::ColumnBuilder`).
@@ -96,6 +99,7 @@ impl VolumeState {
             scope_cache: Mutex::new(None),
             published_generation: AtomicU64::new(0),
             column_build: Mutex::new(ColumnBuild::default()),
+            tailless_columns: AtomicBool::new(false),
         }
     }
 

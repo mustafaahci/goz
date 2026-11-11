@@ -1347,6 +1347,66 @@ impl EntryTable {
         }
     }
 
+    /// Column `c` as switching it on makes it, every slot unknown, built
+    /// without changing the table so it can be made off the write lock (see
+    /// [`Self::install_column`]). It gets the room the entry columns have,
+    /// so it grows with them.
+    pub(crate) fn plan_column(&self, c: Column) -> ColumnValues {
+        let (n, room) = (self.frn.len(), self.frn.capacity());
+        match c {
+            Column::Attributes => ColumnValues::Attrib(filled(n, room, ATTRIB_UNKNOWN)),
+            _ => ColumnValues::Date(filled(n, room, DATE_UNKNOWN)),
+        }
+    }
+
+    /// Switches column `c` on with the values [`Self::plan_column`] built,
+    /// when it is still off and they still cover every slot; otherwise
+    /// hands them back. Swaps only.
+    pub(crate) fn install_column(
+        &mut self,
+        c: Column,
+        values: ColumnValues,
+    ) -> Result<(), ColumnValues> {
+        if self.columns.contains(c) || values.len() != self.frn.len() {
+            return Err(values);
+        }
+        match (c, values) {
+            (Column::DateCreated, ColumnValues::Date(v)) => self.ctime = v,
+            (Column::DateAccessed, ColumnValues::Date(v)) => self.atime = v,
+            (Column::RecentChange, ColumnValues::Date(v)) => self.rtime = v,
+            (Column::Attributes, ColumnValues::Attrib(v)) => self.attrib = v,
+            (_, values) => return Err(values),
+        }
+        self.columns = self.columns.with(c, true);
+        Ok(())
+    }
+
+    /// Switches column `c` off, handing back its values so the caller can
+    /// free them after the write lock (`None` while it is off).
+    pub(crate) fn take_column(&mut self, c: Column) -> Option<ColumnValues> {
+        if !self.columns.contains(c) {
+            return None;
+        }
+        self.columns = self.columns.with(c, false);
+        Some(match c {
+            Column::DateCreated => ColumnValues::Date(core::mem::take(&mut self.ctime)),
+            Column::DateAccessed => ColumnValues::Date(core::mem::take(&mut self.atime)),
+            Column::RecentChange => ColumnValues::Date(core::mem::take(&mut self.rtime)),
+            Column::Attributes => ColumnValues::Attrib(core::mem::take(&mut self.attrib)),
+        })
+    }
+
+    /// Where column `c`'s values are, to tell a swap from a copy.
+    #[cfg(test)]
+    pub(crate) fn column_ptr(&self, c: Column) -> usize {
+        match c {
+            Column::DateCreated => self.ctime.as_ptr() as usize,
+            Column::DateAccessed => self.atime.as_ptr() as usize,
+            Column::RecentChange => self.rtime.as_ptr() as usize,
+            Column::Attributes => self.attrib.as_ptr() as usize,
+        }
+    }
+
     /// A date column's value at `idx` (a FILETIME, or unknown); unknown
     /// while the column is off.
     #[inline]
@@ -1613,6 +1673,43 @@ pub(crate) enum FrnRoom {
 /// A column of `n` copies of `fill`, or an empty one holding no memory.
 fn sized<T: Clone>(n: usize, fill: T) -> Vec<T> {
     if n == 0 { Vec::new() } else { vec![fill; n] }
+}
+
+/// `n` copies of `fill` with room for `room` (at least `n`).
+fn filled<T: Clone>(n: usize, room: usize, fill: T) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut v = Vec::with_capacity(room.max(n));
+    v.resize(n, fill);
+    v
+}
+
+/// One optional column's values, built or freed off the write lock (see
+/// [`VolumeIndex::plan_columns`](super::VolumeIndex::plan_columns) and
+/// [`VolumeIndex::switch_columns`](super::VolumeIndex::switch_columns)).
+#[derive(Debug)]
+pub enum ColumnValues {
+    Date(Vec<i64>),
+    Attrib(Vec<u16>),
+}
+
+impl ColumnValues {
+    fn len(&self) -> usize {
+        match self {
+            Self::Date(v) => v.len(),
+            Self::Attrib(v) => v.len(),
+        }
+    }
+
+    /// Where the values are, to tell a swap from a copy.
+    #[cfg(test)]
+    pub(crate) fn ptr(&self) -> usize {
+        match self {
+            Self::Date(v) => v.as_ptr() as usize,
+            Self::Attrib(v) => v.as_ptr() as usize,
+        }
+    }
 }
 
 /// Appends `v` to an optional column, which grows by a sixteenth once the

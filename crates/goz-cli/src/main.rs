@@ -166,7 +166,10 @@ mod win {
             None => None,
         };
 
-        let mut connection = match Client::connect(plan.insecure_no_server_check) {
+        // gozd judges a change of its options by the token the connection
+        // carries, so that one connection shows it.
+        let identify = matches!(plan.config, Some(ConfigCommand::Set(_)));
+        let mut connection = match Client::connect(plan.insecure_no_server_check, identify) {
             Ok(c) => c,
             Err(ClientError::Unreachable) => {
                 // es's line, then the goz service's state and its fix.
