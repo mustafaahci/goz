@@ -643,6 +643,13 @@ impl Lexer {
         let mut literal_bang = self.literal_bang;
         // The term's own `regex:` or `no-regex:`, the outermost winning.
         let mut regex: Option<bool> = None;
+        // The term's function, whose value a regular expression is only
+        // when it is text (`Func::matches_text`).
+        let mut func: Option<Func> = None;
+        // A group of values of a function whose value is no text
+        // (`size:<1kb|2kb>`, `ext:<jpg|png>`) is open from this depth: its
+        // values keep their own reading under `regex:` too.
+        let mut values_from: Option<usize> = None;
         while let Some(c) = self.peek() {
             if c.is_whitespace() {
                 return Ok(());
@@ -651,10 +658,16 @@ impl Lexer {
             if self.after_close && !matches!(c, '|' | '>') {
                 return Err(QueryError::GroupExpansion { column });
             }
+            // In a group of a function's values, which keep their reading.
+            let in_values = values_from.is_some();
             // After a prefix of a term that is a regular expression, its
             // value starts: there `|` and `<` are the expression's own, and
-            // a `>` closes a group only when one is open.
-            let in_regex = !first && regex.or(self.global.regex) == Some(true);
+            // a `>` closes a group only when one is open. A function whose
+            // value is no text keeps its own reading.
+            let in_regex = !first
+                && !in_values
+                && regex.or(self.global.regex) == Some(true)
+                && func.is_none_or(Func::matches_text);
             match c {
                 '|' if !in_regex => {
                     self.at += 1;
@@ -662,18 +675,29 @@ impl Lexer {
                     first = true;
                     literal_bang = self.literal_bang;
                     regex = None;
+                    func = None;
                     continue;
                 }
                 '>' if !in_regex || self.depth > 0 => {
                     self.at += 1;
                     self.emit(Tok::Close, column);
+                    if values_from.is_some_and(|d| self.depth < d) {
+                        values_from = None;
+                    }
                     continue;
                 }
                 '<' if !in_regex => {
+                    // Right after a function whose value is no text: its
+                    // group of values.
+                    let values = !first && func.is_some_and(|f| !f.matches_text());
                     self.at += 1;
                     self.emit(Tok::Open, column);
+                    if values && values_from.is_none() {
+                        values_from = Some(self.depth);
+                    }
                     first = true;
                     regex = None;
+                    func = None;
                     continue;
                 }
                 '!' if !literal_bang => {
@@ -695,6 +719,7 @@ impl Lexer {
                         first = true;
                         literal_bang = self.literal_bang;
                         regex = None;
+                        func = None;
                     }
                     Head::Precedence(and_first) => {
                         self.at = after;
@@ -730,15 +755,19 @@ impl Lexer {
                             self.emit(Tok::Text(text), column);
                             return Ok(());
                         }
-                        if let Prefix::Func(func) = prefix {
-                            let regex = regex.or(self.global.regex) == Some(true);
-                            self.value(func, literal_bang, regex)?;
+                        if let Prefix::Func(f) = prefix {
+                            func = Some(f);
+                            let regex = !in_values && regex.or(self.global.regex) == Some(true);
+                            self.value(f, literal_bang, regex)?;
                         }
                     }
                 }
                 continue;
             }
-            let text = if regex.or(self.global.regex) == Some(true) {
+            let text = if !in_values
+                && regex.or(self.global.regex) == Some(true)
+                && func.is_none_or(Func::matches_text)
+            {
                 self.regex_text()
             } else {
                 self.text(false)?
@@ -1526,8 +1555,22 @@ mod tests {
         assert_eq!(shape("regex:a&vert:b"), "P(regex:)T(a|b)");
         assert_eq!(shape("regex*:^a b|c$"), "P(regex:)T(^a b|c$)");
         assert_eq!(shape("regex:stem:^a|b"), "P(regex:)P(stem:)T(^a|b)");
-        // A function whose value is no text keeps its own reading.
+        // A function whose value is no text keeps its own reading, its
+        // group of values included, under the term's or the search's
+        // `regex:`.
         assert_eq!(shape("regex:ext:a;b"), "P(regex:)P(ext:)T(a;b)");
+        assert_eq!(
+            shape("regex:ext:<jpg|png>"),
+            "P(regex:)P(ext:)<T(jpg)|T(png)>"
+        );
+        assert_eq!(shape("?regex: ext:<jpg|png>"), " P(ext:)<T(jpg)|T(png)>");
+        assert_eq!(shape("?regex: size:<1kb|2kb>"), " P(size:)<T(1kb)|T(2kb)>");
+        assert_eq!(
+            shape("?regex: dm:<2021|2024> a|b"),
+            " P(dm:)<T(2021)|T(2024)> T(a|b)"
+        );
+        assert_eq!(shape("?regex: size:<1kb x|y"), " P(size:)T(<1kb) T(x|y)");
+        assert_eq!(shape("?regex: name:<a|b>"), " P(name:)T(<a|b>)");
         // `?regex:` makes every later term's text a regular expression; a
         // term starts as ever, and `noregex:` turns it off for one term.
         assert_eq!(shape("?regex: a|b <c|d>"), " T(a|b) <T(c|d)>");

@@ -6540,4 +6540,79 @@ mod tests {
         assert!(resolve_scope(&idx, "cafè".as_bytes(), false).is_some());
         assert_eq!(resolve_scope(&idx, "café".as_bytes(), true), accented);
     }
+
+    /// `diacritics:` reaches `parent:` and `ancestor:` (and so `goz -a
+    /// -parent`): a sibling folder spelled with other accents is not named,
+    /// as in Everything with Match Diacritics on.
+    #[test]
+    fn diacritics_reach_the_folder_functions() {
+        let idx = accent_index();
+        let sorted = |q: &str| {
+            let mut v = run(&idx, q);
+            v.sort();
+            v
+        };
+        let accented = sorted(r"parent:C:\café");
+        assert!(accented.contains(&r"cafe\café.txt".to_string()));
+        assert!(accented.contains(&r"café\cafe.txt".to_string()));
+        for q in [
+            r"diacritics:parent:C:\café",
+            r"?diacritics: parent:C:\CAFÉ",
+            "diacritics:ancestor:C:\\cafe\u{301}",
+            // `goz -a -parent C:\café`, as the CLI sends it.
+            "?diacritics: parent:\"C:\\café\"",
+        ] {
+            let got = sorted(q);
+            assert!(!got.is_empty(), "{q}");
+            assert!(got.iter().all(|p| p.starts_with("café\\")), "{q}: {got:?}");
+        }
+        assert_eq!(sorted(r"diacritics:parent:C:\cafe"), vec![r"cafe\café.txt"]);
+        assert!(sorted(r"diacritics:parent:C:\cafè").is_empty());
+    }
+
+    /// Characters whose compatibility form is path or name syntax keep
+    /// their own (DESIGN.md §10): `＼` is no separator for `parent:` or a
+    /// path term, `․` and `．` no extension dot, and compatibility jamo are
+    /// not joined into a syllable.
+    #[test]
+    fn folding_makes_no_separators_dots_or_syllables() {
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let root = NTFS_ROOT_FRN;
+        idx.insert_enum(&enum_rec(frn(100), root, "a\u{FF3C}b", true));
+        idx.insert_enum(&enum_rec(frn(200), frn(100), "z.txt", false));
+        for (i, name) in ["report\u{2024}pdf", "a\u{FF0E}txt", "\u{3131}\u{314F}.txt"]
+            .iter()
+            .enumerate()
+        {
+            idx.insert_enum(&enum_rec(frn(300 + i as u64), root, name, false));
+        }
+        let sorted = |q: &str| {
+            let mut v = run(&idx, q);
+            v.sort();
+            v
+        };
+        let z = vec!["a\u{FF3C}b\\z.txt".to_string()];
+        assert_eq!(sorted("parent:C:\\a\u{FF3C}b"), z);
+        assert_eq!(sorted("ancestor:C:\\a\u{FF3C}b"), z);
+        assert_eq!(sorted("infolder:C:\\A\u{FF3C}B\\"), z);
+        // No folder `a` holds a `b`: no path term finds the one folder.
+        assert!(sorted(r"a\b").is_empty());
+        assert!(sorted(r"\a\b\").is_empty());
+        // No extension, for every term that reads one: the stem is the
+        // whole name.
+        for q in ["ext:pdf", "*.pdf", "extension:pdf", "diacritics:*.pdf"] {
+            assert!(sorted(q).is_empty(), "{q}");
+        }
+        assert_eq!(sorted("stem:pdf"), vec!["report\u{2024}pdf"]);
+        assert_eq!(
+            sorted("*.txt"),
+            vec!["a\u{FF3C}b\\z.txt", "\u{3131}\u{314F}.txt"]
+        );
+        assert_eq!(sorted("report\u{2024}"), vec!["report\u{2024}pdf"]);
+        assert_eq!(sorted("a\u{FF0E}t"), vec!["a\u{FF0E}txt"]);
+        // The jamo as they are.
+        assert_eq!(sorted("\u{3131}"), vec!["\u{3131}\u{314F}.txt"]);
+        assert_eq!(sorted("??.txt"), vec!["\u{3131}\u{314F}.txt"]);
+        assert!(sorted("\u{AC00}").is_empty());
+    }
 }

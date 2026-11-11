@@ -34,7 +34,7 @@ pub use engine::{
     CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, mtime_key, resolve_scope, run_query,
     run_query_refs, size_key,
 };
-pub use expr::{Anchors, Expr, Leaf, LenOf, Skip, Target};
+pub use expr::{Anchors, Expr, FolderPath, Leaf, LenOf, Skip, Target};
 pub use parse::{
     Filters, Kind, ParsedQuery, QueryError, SizeRange, Wildcard, parse_query, parse_query_at,
     parse_query_with_case,

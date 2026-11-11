@@ -11,15 +11,34 @@
 //! would pass [`SIZE_LIMIT`] is refused too, which bounds the work of one
 //! match on one name; the engine checks the query's budget as the text it
 //! has matched grows (see `cexpr`).
+//!
+//! Memory: a compiled pattern is shared, but every thread that runs it at
+//! the same moment keeps caches of its own: the lazy DFA's, one for each
+//! direction and each at most [`DFA_LIMIT`], and, where the lazy DFA cannot
+//! decide (a Unicode `\b` on a non-ASCII name, say), the PikeVM's or the
+//! backtracker's, which grow with the compiled size. The pass over the
+//! names runs on a thread per CPU, so a query costs about its regex terms
+//! (at most `MAX_REGEX_TERMS`, 8) times the threads times those caches,
+//! plus the compiled patterns: 8 of the largest hostile patterns the limits
+//! let through, on 16 threads over a mix of ASCII and accented names, peaked
+//! at 18 MiB (4 MiB of it compiled), where 32 terms with 1 MiB caches had
+//! reached 596 MiB.
 
 use super::parse::QueryError;
 use regex::bytes::{Regex, RegexBuilder};
 use std::sync::Arc;
 
-/// The most memory one compiled pattern may take, and its lazy DFA's cache
-/// per thread: a megabyte, which is far more than any pattern a person
-/// types and bounds what one hostile pattern costs.
-const SIZE_LIMIT: usize = 1 << 20;
+/// The most memory one compiled pattern may take: 512 KiB. A big Unicode
+/// class repeated is what reaches it: `\w{10}` (ten word characters) is
+/// about the largest such repetition that fits, while `(?-u:\w)` and
+/// `[a-z0-9_]` are small.
+const SIZE_LIMIT: usize = 512 << 10;
+
+/// The most memory each of a pattern's two lazy DFAs (forward and reverse)
+/// may keep in its cache, per thread that runs it: 128 KiB. A pattern whose
+/// DFA outgrows it is matched by the PikeVM instead, which is slower but
+/// linear, and the query's budget bounds the time.
+const DFA_LIMIT: usize = 128 << 10;
 
 /// A `regex:` term's pattern, compiled. Two terms are equal when their
 /// patterns and case are.
@@ -43,7 +62,7 @@ impl RegexTerm {
             .case_insensitive(!case)
             .unicode(true)
             .size_limit(SIZE_LIMIT)
-            .dfa_size_limit(SIZE_LIMIT)
+            .dfa_size_limit(DFA_LIMIT)
             .build()
             .map_err(|e| bad(reason(&e)))?;
         Ok(RegexTerm {
@@ -139,6 +158,13 @@ mod tests {
             "{}",
             bad(r"\w{1000}{1000}")
         );
+        // The compiled size is held to 512 KiB (each thread that runs a
+        // pattern keeps caches that grow with it): a big Unicode class
+        // repeated a few times fits, twenty times does not; small classes
+        // fit far longer repetitions.
+        assert!(RegexTerm::new(br"\w{8}", false).is_ok());
+        assert!(bad(r"\w{20}").contains("size limit"));
+        assert!(RegexTerm::new(br"(?-u:\w){200}[a-z0-9_]{200}", false).is_ok());
         let mut lone = Vec::new();
         crate::wtf8::from_utf16(&[0xD800], &mut lone);
         assert!(matches!(

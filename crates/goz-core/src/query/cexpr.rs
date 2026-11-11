@@ -21,7 +21,7 @@
 use super::budget::Budget;
 use super::dates::DateFilter;
 use super::engine::{CACHED_PATH_MAX, anchored_lead, size_matches, term_admits};
-use super::expr::{Expr, Leaf, LenOf, Target};
+use super::expr::{Expr, FolderPath, Leaf, LenOf, Target};
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, SizeRange, Wildcard};
 use super::pattern::RegexTerm;
@@ -168,14 +168,16 @@ impl Volume<'_> {
     /// with the entries of those on it, or `Err(())` when one of them holds
     /// the whole volume (`ancestor:C:`, or a folder above a mount folder). A
     /// path names every folder it matches case-insensitively, siblings that
-    /// differ by case alone included, as Everything compares paths.
-    fn folders(&self, paths: &[Vec<u8>], ancestor: bool) -> Result<Vec<EntryIdx>, ()> {
+    /// differ by case alone included, as Everything compares paths, and
+    /// ignoring accents unless the path says they count (`diacritics:`).
+    fn folders(&self, paths: &[FolderPath], ancestor: bool) -> Result<Vec<EntryIdx>, ()> {
         let top = self
             .folded_prefix
             .strip_suffix(b"\\")
             .unwrap_or(self.folded_prefix);
         let mut found = Vec::new();
-        for path in paths {
+        for folder in paths {
+            let path = &folder.path;
             if path.as_slice() == top {
                 if ancestor {
                     return Err(());
@@ -186,7 +188,7 @@ impl Volume<'_> {
                 .and_then(|rest| rest.strip_prefix(b"\\"))
                 .filter(|_| !top.is_empty())
             {
-                found.extend(self.below_root(rest));
+                found.extend(self.below_root(rest, folder.accented.as_deref()));
             } else if ancestor
                 && top
                     .strip_prefix(path.as_slice())
@@ -201,13 +203,29 @@ impl Volume<'_> {
         Ok(found)
     }
 
-    /// The folders at `rest` (folded, `\`-separated) below the root.
-    fn below_root(&self, rest: &[u8]) -> Vec<EntryIdx> {
+    /// The folders at `rest` (folded, `\`-separated) below the root; with
+    /// `accented` (the whole path as [`FolderPath::accented`] has it), only
+    /// those whose names have its accents.
+    fn below_root(&self, rest: &[u8], accented: Option<&[u8]>) -> Vec<EntryIdx> {
+        fn split(p: &[u8]) -> Vec<&[u8]> {
+            p.split(|&b| b == b'\\').filter(|p| !p.is_empty()).collect()
+        }
+        let parts = split(rest);
+        // The accented spelling's last parts are the same folders: no
+        // folding makes or takes a separator.
+        let exact: Option<Vec<&[u8]>> = accented.map(split).and_then(|all| {
+            let skip = all.len().checked_sub(parts.len())?;
+            Some(all[skip..].to_vec())
+        });
         let mut level = vec![self.index.root()];
-        for part in rest.split(|&b| b == b'\\').filter(|p| !p.is_empty()) {
+        for (i, part) in parts.iter().enumerate() {
+            let want = exact.as_ref().map(|e| e[i]);
             level = level
                 .iter()
                 .flat_map(|&dir| self.index.child_dirs(dir, part))
+                .filter(|&d| {
+                    want.is_none_or(|w| crate::fold::fold_exact(self.index.entry(d).name()) == w)
+                })
                 .collect();
             if level.is_empty() {
                 break;

@@ -230,6 +230,15 @@ pub(super) fn ext_value(item: &[u8]) -> &[u8] {
 /// `/` written as `\`, with no separator at its end. A relative path names
 /// no folder, so it is refused.
 pub(super) fn folder_path(item: &[u8], what: &'static str) -> Result<Vec<u8>, QueryError> {
+    folder_path_as(item, what, fold)
+}
+
+/// [`folder_path`], folded with `fold_with`.
+pub(super) fn folder_path_as(
+    item: &[u8],
+    what: &'static str,
+    fold_with: fn(&[u8]) -> Vec<u8>,
+) -> Result<Vec<u8>, QueryError> {
     let mut path: Vec<u8> = item
         .iter()
         .map(|&b| if b == b'/' { b'\\' } else { b })
@@ -253,7 +262,7 @@ pub(super) fn folder_path(item: &[u8], what: &'static str) -> Result<Vec<u8>, Qu
             ),
         });
     }
-    Ok(fold(&path))
+    Ok(fold_with(&path))
 }
 
 #[cfg(test)]

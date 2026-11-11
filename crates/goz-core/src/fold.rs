@@ -27,7 +27,16 @@
 //!   `ae`, `œ` → `oe`, `ø` → `o`, `ł` `ŀ` → `l`, `đ` `ð` → `d`, `þ` → `th`,
 //!   `ħ` → `h`, `ŧ` → `t`, `ŋ` → `n`, `ı` → `i`, `ς` → `σ`. Then canonical
 //!   recomposition, which puts Hangul syllables and voiced kana back together
-//!   so `?` keeps counting each as one character. Marks other scripts write
+//!   so `?` keeps counting each as one character. Two kinds of character keep
+//!   their own form (canonical decomposition only) because their
+//!   compatibility one would change what the text says: one whose
+//!   decomposition holds path or name syntax, `\` `/` `:` `.` (full-width
+//!   `＼` `／` `：` `．`, small `﹨` `﹒`, the dot leaders `․` `‥` `…`, ...),
+//!   which a folded name or path would read as a separator, a drive or an
+//!   extension; and one that decomposes to conjoining Hangul jamo though it
+//!   is no syllable (the compatibility and half-width jamo `ㄱ` `ㅏ`, the
+//!   circled and parenthesized ones), which recomposition would join into
+//!   syllables the name never held (`ㄱㅏ` into `가`). Marks other scripts write
 //!   their vowels or points with (Devanagari, Thai, Hebrew, Arabic, ...) are
 //!   kept: what Everything does with them is unverified, and dropping a vowel
 //!   sign would merge different words.
@@ -145,20 +154,38 @@ fn base_letters(c: char, run: &mut SmallVec<[char; 256]>, based: &mut bool) {
         *based = true;
         return;
     }
-    decompose_compatible(lower, |d| {
+    let mut parts: SmallVec<[char; 4]> = SmallVec::new();
+    decompose_compatible(lower, |d| parts.push(d));
+    if !c.is_ascii() && parts.iter().any(|&d| changes_meaning(d)) {
+        // Its own form: see the module's documentation.
+        parts.clear();
+        decompose_canonical(lower, |d| parts.push(d));
+    }
+    for d in parts {
         let d = lower_char(d);
         if is_diacritic_mark(d) {
             if !*based {
                 run.push(d);
             }
-            return;
+            continue;
         }
         match letter_table(d) {
             Some(letters) => run.extend(letters.chars()),
             None => run.push(d),
         }
         *based = !matches!(d, '\\' | ':');
-    });
+    }
+}
+
+/// Whether `d`, in the compatibility decomposition of a non-ASCII
+/// character, would change what the folded text says: path or name syntax,
+/// or a conjoining Hangul jamo (only a syllable's canonical decomposition,
+/// which is its compatibility one too, may give those).
+fn changes_meaning(d: char) -> bool {
+    matches!(
+        d,
+        '\\' | '/' | ':' | '.' | '\u{1100}'..='\u{11FF}' | '\u{A960}'..='\u{A97F}' | '\u{D7B0}'..='\u{D7FF}'
+    )
 }
 
 /// The letters Everything folds to others though no decomposition does:
@@ -399,6 +426,48 @@ mod tests {
         }
         // Scripts whose marks are vowels keep them.
         assert_ne!(fold("कु".as_bytes()), fold("क".as_bytes()));
+    }
+
+    /// No folding makes path or name syntax (a separator, a drive's `:`, an
+    /// extension's dot) of a character that is none, nor joins compatibility
+    /// jamo into a syllable: the character keeps its own form. Other
+    /// full-width letters still fold.
+    #[test]
+    fn folding_makes_no_syntax_and_no_syllables() {
+        for kept in [
+            "\u{FF3C}", // ＼ fullwidth reverse solidus
+            "\u{FE68}", // ﹨ small reverse solidus
+            "\u{FF0F}", // ／
+            "\u{FF1A}", // ：
+            "\u{FE55}", // ﹕ small colon
+            "\u{FF0E}", // ．
+            "\u{FE52}", // ﹒ small full stop
+            "\u{2024}", // ․ one dot leader
+            "\u{2025}", // ‥
+            "\u{2026}", // …
+            "\u{2488}", // ⒈ digit one full stop
+            "\u{2100}", // ℀ account of
+            "\u{3131}", // ㄱ compatibility jamo
+            "\u{314F}", // ㅏ
+            "\u{FFA1}", // ﾡ half-width jamo
+            "\u{3260}", // ㉠ circled jamo
+            "\u{326E}", // ㉮ circled syllable
+        ] {
+            for f in [fold, fold_exact] {
+                assert_eq!(f(kept.as_bytes()), kept.as_bytes(), "{kept:?}");
+            }
+        }
+        assert_eq!(fold(r"C:\a＼b".as_bytes()), r"c:\a＼b".as_bytes());
+        assert_eq!(fold("report․PDF".as_bytes()), "report․pdf".as_bytes());
+        // The jamo stay apart: a name of four keeps four for `????`.
+        assert_eq!(fold("ㄱㅏ".as_bytes()), "ㄱㅏ".as_bytes());
+        assert_eq!(fold("ㅎㅏㅎㅏ".as_bytes()), "ㅎㅏㅎㅏ".as_bytes());
+        // Syllables, decomposed or not, and the rest of the full-width forms
+        // fold as before.
+        assert_eq!(fold("\u{1100}\u{1161}".as_bytes()), "가".as_bytes());
+        assert_eq!(fold("가".as_bytes()), "가".as_bytes());
+        assert_eq!(fold("ｆｕｌｌ".as_bytes()), b"full");
+        assert_eq!(fold("Ａ＿１".as_bytes()), b"a_1");
     }
 
     /// A precomposed character folds to ONE code point, so `?` (which matches

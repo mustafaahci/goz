@@ -147,13 +147,34 @@ pub enum Leaf {
     Date(DateFilter),
     /// A length, in UTF-16 units, is in range.
     Len { of: LenOf, range: SizeRange },
-    /// The entry's folder is one of these, given by absolute full path,
-    /// folded, `\` for every separator and none at the end.
-    Parent(Vec<Vec<u8>>),
+    /// The entry's folder is one of these.
+    Parent(Vec<FolderPath>),
     /// One of the entry's folders, up to the root, is one of these.
-    Ancestor(Vec<Vec<u8>>),
+    Ancestor(Vec<FolderPath>),
     /// The entry is on this drive (an ASCII letter, lower-cased): `d:`.
     Drive(u8),
+}
+
+/// A folder `parent:` or `ancestor:` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderPath {
+    /// Its absolute full path, folded, `\` for every separator and none at
+    /// the end.
+    pub path: Vec<u8>,
+    /// Under `diacritics:`, the same path with case folded but accents
+    /// kept ([`crate::fold::fold_exact`]): each folder on the way must have
+    /// its accents, so a sibling spelled with others is not named.
+    pub accented: Option<Vec<u8>>,
+}
+
+impl FolderPath {
+    /// A folder named ignoring accents.
+    pub fn folded(path: Vec<u8>) -> FolderPath {
+        FolderPath {
+            path,
+            accented: None,
+        }
+    }
 }
 
 impl Leaf {

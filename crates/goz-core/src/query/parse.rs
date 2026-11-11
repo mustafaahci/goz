@@ -53,7 +53,7 @@
 //! query is parsed with.
 
 use super::dates::{DateFilter, LocalClock, date_filter};
-use super::expr::{self, Anchors, Expr, Leaf, LenOf, Skip, Target};
+use super::expr::{self, Anchors, Expr, FolderPath, Leaf, LenOf, Skip, Target};
 use super::lex::{self, Func, Macro, ModSet, Prefix, Text, Tok, Token};
 use super::pattern::RegexTerm;
 use super::value::{self, Number};
@@ -187,8 +187,10 @@ fn unbalanced(what: &char, column: &usize) -> String {
 const MAX_QUERY_TERMS: usize = 256;
 
 /// The most `regex:` terms one query may hold. Each is a regular expression
-/// matched against every name it tests, the costliest test a term makes.
-const MAX_REGEX_TERMS: usize = 32;
+/// matched against every name it tests, the costliest test a term makes,
+/// and each keeps caches on every thread of the pass over the names (see
+/// the `pattern` module): 8 keep a hostile query's memory to tens of MiB.
+const MAX_REGEX_TERMS: usize = 8;
 
 /// How deep groups and prefixes may nest. Each level is a frame of the
 /// parser and of every walk of the expression, and the text arrives from the
@@ -738,7 +740,15 @@ impl<'t> Parser<'t, '_> {
             Func::ParentName => Target::ParentName,
             Func::Extension => Target::Extension,
             Func::Parent | Func::Ancestor => {
-                let path = value::folder_path(item, what)?;
+                // Under `diacritics:` the folders' accents count too.
+                let path = FolderPath {
+                    path: value::folder_path(item, what)?,
+                    accented: if set.diacritics == Some(true) {
+                        Some(value::folder_path_as(item, what, fold_exact)?)
+                    } else {
+                        None
+                    },
+                };
                 return Ok(Expr::Leaf(if func == Func::Parent {
                     Leaf::Parent(vec![path])
                 } else {
@@ -2094,7 +2104,11 @@ mod tests {
     /// L7:497-509); a relative one is refused.
     #[test]
     fn folder_functions() {
-        let parent = |p: &str| Expr::Leaf(Leaf::Parent(vec![p.as_bytes().to_vec()]));
+        let parent = |p: &str| {
+            Expr::Leaf(Leaf::Parent(vec![FolderPath::folded(
+                p.as_bytes().to_vec(),
+            )]))
+        };
         assert_eq!(ex(r"parent:C:\W\Windows\"), parent(r"c:\w\windows"));
         assert_eq!(ex(r"infolder:C:\W"), parent(r"c:\w"));
         assert_eq!(ex(r"nosubfolders:C:/W"), parent(r"c:\w"));
@@ -2106,7 +2120,7 @@ mod tests {
         assert_eq!(ex(r"parent:<C:\a|C:\b>"), ex(r"parent:C:\a;C:\b"));
         assert_eq!(
             ex(r"ancestor:C:\W"),
-            Expr::Leaf(Leaf::Ancestor(vec![br"c:\w".to_vec()]))
+            Expr::Leaf(Leaf::Ancestor(vec![FolderPath::folded(br"c:\w".to_vec())]))
         );
         for relative in [
             r"parent:w\windows",
@@ -2540,6 +2554,11 @@ mod tests {
             (p.filters.kind, p.expr),
             (Some(Kind::File), Some(regex(Target::Name, "x", false)))
         );
+        // A function whose value is no text reads its group of values as
+        // ever under `regex:`.
+        assert_eq!(q("?regex: size:<1kb|2kb>"), q("size:<1kb|2kb>"));
+        assert_eq!(q("?regex: ext:<jpg|png>"), q("ext:<jpg|png>"));
+        assert_eq!(q("regex:ext:<jpg|png>"), q("ext:<jpg|png>"));
         // No wildcard: `*` and `?` are the pattern's.
         assert_eq!(ex("regex:a*"), regex(Target::Name, "a*", false));
         // An empty pattern matches everything.

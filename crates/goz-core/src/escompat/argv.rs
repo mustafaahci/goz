@@ -132,6 +132,11 @@ pub struct EsPlan {
     /// The CLI absolutizes it and puts it before the search text as a
     /// `parent:` term (see [`EsPlan::query_with_parent`]).
     pub parent: Option<String>,
+    /// Where the search text starts in `query`, after the switches' terms
+    /// (`folder:`, `matchpath:`, `?diacritics:`, ...): a `parent:` term
+    /// goes there, so the modifiers the switches set for the whole search
+    /// reach it too.
+    pub text_at: usize,
     /// `-n` / `-max-results` value: return only the top N results after
     /// sorting. `None` means unlimited.
     pub limit: Option<u32>,
@@ -197,6 +202,7 @@ impl Default for EsPlan {
             scope: None,
             scope_is_parent_of: false,
             parent: None,
+            text_at: 0,
             limit: None,
             offset: 0,
             columns: Vec::new(),
@@ -236,14 +242,22 @@ impl EsPlan {
     }
 
     /// The search text with `-parent`'s folder, made absolute (`absolute`),
-    /// as a `parent:` term before it. Quoted, as a folder's path may hold
-    /// spaces or `;`; no Windows path holds a quote.
+    /// as a `parent:` term before it, after the switches' own terms (so
+    /// `-a -parent DIR` names the folder with its accents). Quoted, as a
+    /// folder's path may hold spaces or `;`; no Windows path holds a quote.
     pub fn query_with_parent(&self, absolute: &str) -> String {
-        if self.query.is_empty() {
-            format!("parent:\"{absolute}\"")
+        let at = if self.query.is_char_boundary(self.text_at) {
+            self.text_at
         } else {
-            format!("parent:\"{absolute}\" {}", self.query)
-        }
+            0
+        };
+        let (lead, text) = self.query.split_at(at);
+        let term = format!("parent:\"{absolute}\"");
+        [lead.trim_end(), term.as_str(), text]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -1265,10 +1279,12 @@ fn parse_tokens(mut tokens: impl Tokens) -> Result<Command, EsFatal> {
             query.push(format!("?{name}:"));
         }
     }
+    let text_len = text.len();
     if !text.is_empty() {
         query.push(text);
     }
     plan.query = query.join(" ");
+    plan.text_at = plan.query.len() - text_len;
     let key = pending.sort_key.unwrap_or(plan.sort.key);
     plan.sort = SortSpec {
         key,
@@ -2321,6 +2337,20 @@ mod tests {
             r#"parent:"C:\""#
         );
         crate::query::parse_query(&p.query_with_parent(r"C:\a;b c")).unwrap();
+        // After the switches' terms, which reach it: `-a -parent` names the
+        // folder with its accents.
+        assert_eq!(
+            plan(&["-a", "-ad", "-parent", r"C:\café", "x y"]).query_with_parent(r"C:\café"),
+            r#"folder: ?diacritics: parent:"C:\café" x y"#
+        );
+        assert_eq!(
+            plan(&["-a", "-parent", r"C:\café"]).query_with_parent(r"C:\café"),
+            r#"?diacritics: parent:"C:\café""#
+        );
+        assert_eq!(
+            plan(&["-r", "^a b", "-parent", r"C:\d"]).query_with_parent(r"C:\d"),
+            r#"parent:"C:\d" regex*:^a b"#
+        );
         let p = plan(&["-parent-path", r"sub\a.txt"]);
         assert_eq!(
             (p.scope.as_deref(), p.scope_is_parent_of),
