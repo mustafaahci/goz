@@ -14,6 +14,7 @@ use super::cexpr::{self, CNode, ExtMatcher, Form, Scratch, Source, Subject, Volu
 use super::folder_rank::FolderRanks;
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, ParsedQuery, SizeRange, Wildcard};
+use crate::index::store::NamePair;
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
 use crate::types::{EntryIdx, Frn, NIL, SortDir, SortKey, SortSpec};
@@ -797,13 +798,10 @@ fn wildcards_match(
 /// Calls `f` once per distinct name whose folded bytes contain `needle`: one
 /// `memmem` pass over the folded arena, which holds each name once, mapping
 /// the ascending hit offsets to ids with a forward cursor over `name_pairs`
-/// (amortized O(1) per hit; a per-hit binary search cache-thrashes at scale).
-/// The first hit seeds the cursor with one binary search so a rare term whose
-/// matches start deep in the arena does not pay a full forward walk. A name
-/// is a contiguous NUL-separated region, so after a hit the search resumes at
-/// the end of that name: a short needle like `e` occurs about three times in
-/// each name it is in, and finding the rest only to drop them was most of the
-/// pass.
+/// (see [`name_holding`]). A name is a contiguous NUL-separated region, so
+/// after a hit the search resumes at the end of that name: a short needle
+/// like `e` occurs about three times in each name it is in, and finding the
+/// rest only to drop them was most of the pass.
 fn for_each_prefilter_hit(index: &VolumeIndex, needle: &[u8], f: impl FnMut(NameId)) {
     for_each_prefilter_hit_in(index, needle, 0..index.name_count(), f);
 }
@@ -823,33 +821,64 @@ fn for_each_prefilter_hit_in(
         return;
     }
     let driver = memmem::Finder::new(needle);
-    let pairs = index.name_pairs();
+    let all = index.name_pairs();
     let hay = index.folded_bytes();
-    let hay = &hay[..pairs
+    let hay = &hay[..all
         .get(ids.end)
         .map_or(hay.len(), |p| p.folded.off as usize)];
+    let pairs = &all[..ids.end];
     let mut cursor = ids.start;
-    let mut seeded = false;
     let mut at = pairs[ids.start].folded.off as usize;
     while let Some(rel) = hay.get(at..).and_then(|rest| driver.find(rest)) {
         let pos = at + rel;
-        if !seeded {
-            cursor = ids.start
-                + pairs[ids.clone()]
-                    .partition_point(|p| p.folded.off as usize <= pos)
-                    .saturating_sub(1);
-            seeded = true;
-        } else {
-            while cursor + 1 < ids.end && pairs[cursor + 1].folded.off as usize <= pos {
-                cursor += 1;
-            }
-        }
+        cursor = name_holding(pairs, cursor, pos);
         f(cursor as NameId);
         // On to the next name. An empty needle, which no caller passes, also
         // matches at the end of the arena: `max` and `get` still end the loop.
         let name = pairs[cursor].folded;
         at = (name.off as usize + name.len as usize + 1).max(pos + 1);
     }
+}
+
+/// The id of the name holding byte `pos` of the folded arena: the last of
+/// `pairs` (ascending `folded.off`) from `from` on whose bytes start at or
+/// before `pos`, where `pairs[from]`'s do.
+///
+/// A needle most names hold finds the next name or the one after, which the
+/// two steps in line settle with the loads a walk name by name makes. A
+/// rarer one gallops out of line from there, so the names between two hits
+/// cost a logarithm of their count. A walk over them read every pair up to
+/// the last hit, 16 bytes a name: for a rare needle on 2.1 M names, 2.1 M
+/// turns of a loop and 34 MB beside the arena's 67, about as long as the
+/// `memmem` pass itself, and most likely that loop's address alone (whether
+/// it crossed a 64-byte fetch window) moved a rare path term's time by a
+/// fifth (see `docs/DESIGN.md`).
+#[inline(always)]
+fn name_holding(pairs: &[NamePair], from: usize, pos: usize) -> usize {
+    let starts_by = |i: usize| pairs.get(i).is_some_and(|p| p.folded.off as usize <= pos);
+    if !starts_by(from + 1) {
+        from
+    } else if !starts_by(from + 2) {
+        from + 1
+    } else {
+        gallop_to(pairs, from + 2, pos)
+    }
+}
+
+/// [`name_holding`] past its two steps: doubling strides from `from`, then
+/// a binary search of the last stride.
+#[inline(never)]
+fn gallop_to(pairs: &[NamePair], from: usize, pos: usize) -> usize {
+    let (mut lo, mut stride) = (from, 1);
+    while pairs
+        .get(lo + stride)
+        .is_some_and(|p| p.folded.off as usize <= pos)
+    {
+        lo += stride;
+        stride *= 2;
+    }
+    let end = (lo + stride).min(pairs.len());
+    lo + pairs[lo + 1..end].partition_point(|p| p.folded.off as usize <= pos)
 }
 
 /// The names a scan for several needles has handed on already, so that a
@@ -3032,6 +3061,89 @@ mod tests {
                 .filter(|&id| memmem::find(idx.name_folded(id), needle).is_some())
                 .collect();
             assert_eq!(hits, every, "needle {:?}", String::from_utf8_lossy(needle));
+        }
+    }
+
+    /// A hit maps to its name wherever it lies after the last one: in the
+    /// next name, the one after, or thousands of names on (the gallop of
+    /// `name_holding`), in the whole arena and in any range of ids of it,
+    /// as the passes across cores split it, a dead name among them.
+    #[test]
+    fn the_prefilter_maps_hits_far_apart_in_any_range() {
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let keyed = [
+            0usize, 1, 2, 4, 7, 8, 9, 40, 41, 300, 301, 302, 1500, 2998, 2999,
+        ];
+        let name = |i: usize| {
+            if keyed.contains(&i) {
+                format!("n{i:04}KEY")
+            } else {
+                format!("n{i:04}")
+            }
+        };
+        for i in 0..3000 {
+            idx.insert_enum(&enum_rec(
+                frn(100 + i as u64),
+                NTFS_ROOT_FRN,
+                &name(i),
+                false,
+            ));
+        }
+        let mut gone = enum_rec(frn(400), NTFS_ROOT_FRN, &name(300), false);
+        gone.reason = USN_REASON_FILE_DELETE;
+        idx.apply_batch(&[gone]);
+        let names = idx.name_count();
+        let every = |ids: Range<usize>| -> Vec<NameId> {
+            ids.map(|id| id as NameId)
+                .filter(|&id| idx.name_refcount(id) > 0)
+                .filter(|&id| memmem::find(idx.name_folded(id), b"key").is_some())
+                .collect()
+        };
+        assert_eq!(every(0..names).len(), keyed.len() - 1);
+        for ids in [
+            0..names,
+            0..1,
+            1..names,
+            5..9,
+            9..41,
+            40..1501,
+            302..303,
+            1501..names,
+            names - 1..names,
+        ] {
+            let mut got = Vec::new();
+            for_each_prefilter_hit_in(&idx, b"key", ids.clone(), |id| got.push(id));
+            assert_eq!(got, every(ids.clone()), "ids {ids:?}");
+        }
+    }
+
+    proptest! {
+        /// `name_holding` lands where a walk over every name from `from`
+        /// does, whatever the names' lengths (empty ones too) and however
+        /// far on the byte lies.
+        #[test]
+        fn name_holding_agrees_with_a_walk(
+            lens in prop::collection::vec(0u16..6, 1..400),
+            from in any::<prop::sample::Index>(),
+            at in any::<prop::sample::Index>(),
+        ) {
+            let mut pairs = Vec::with_capacity(lens.len());
+            let mut off = 0u32;
+            for &len in &lens {
+                pairs.push(NamePair {
+                    folded: crate::index::NameRef { off, len },
+                    ..NamePair::default()
+                });
+                off += u32::from(len) + 1;
+            }
+            let from = from.index(pairs.len());
+            let start = pairs[from].folded.off as usize;
+            let pos = start + at.index(off as usize - start);
+            let mut want = from;
+            while want + 1 < pairs.len() && pairs[want + 1].folded.off as usize <= pos {
+                want += 1;
+            }
+            prop_assert_eq!(name_holding(&pairs, from, pos), want);
         }
     }
 
