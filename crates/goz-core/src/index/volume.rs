@@ -491,10 +491,10 @@ impl VolumeIndex {
 
     /// The hook for folder-size changes made apart from a journal batch, a
     /// stat or a link reconcile (which move the generation themselves):
-    /// folder sizes summed or cleared on a live index (the daemon calls it),
-    /// and the totals a compaction corrects (called here).
-    /// The generation moves as it does for any other change, so a watcher of
-    /// the volume is told.
+    /// folder sizes summed or cleared on a live index (the daemon calls it)
+    /// and the totals a compaction corrects (called here). The generation
+    /// moves as it does for any other change, so a watcher of the volume is
+    /// told.
     pub fn note_folder_sizes_changed(&mut self) {
         self.note_changed();
     }
