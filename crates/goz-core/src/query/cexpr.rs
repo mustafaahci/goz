@@ -24,12 +24,46 @@ use super::engine::{CACHED_PATH_MAX, anchored_lead, size_matches, term_admits};
 use super::expr::{Expr, Leaf, LenOf, Target};
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, SizeRange, Wildcard};
+use super::pattern::RegexTerm;
 use super::text::{TextMatcher, utf16_len};
+use crate::fold::{fold_exact_into, fold_into};
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
 use crate::types::{EntryIdx, NIL};
 use memchr::memmem;
 use rustc_hash::FxHashSet;
+use std::borrow::Cow;
+
+/// How a leaf compares text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Form {
+    /// Folded with [`crate::fold::fold`], case and accents ignored: the
+    /// default, and how the index keeps every name for its scan.
+    Folded,
+    /// Folded with [`crate::fold::fold_exact`], case ignored and accents
+    /// kept: `diacritics:`.
+    Accented,
+    /// As stored: `case:`.
+    Raw,
+}
+
+impl Form {
+    /// The form of a leaf that matches case or not, and accents or not.
+    pub(super) fn of(case: bool, diacritics: bool) -> Form {
+        if case {
+            Form::Raw
+        } else if diacritics {
+            Form::Accented
+        } else {
+            Form::Folded
+        }
+    }
+}
+
+/// How many bytes of text the `regex:` terms of a search may match between
+/// two checks of its budget. A match is linear in its text, but a large
+/// pattern's can cost microseconds a byte; a check costs a clock read.
+const REGEX_BYTES_PER_CHECK: usize = 16 * 1024;
 
 /// A compiled expression.
 pub(super) enum CNode<'a> {
@@ -38,22 +72,22 @@ pub(super) enum CNode<'a> {
     And(Vec<CNode<'a>>),
     Or(Vec<CNode<'a>>),
     Not(Box<CNode<'a>>),
-    /// The name holds the needle (folded unless `case`).
+    /// The name, in `form`, holds the needle.
     Name {
         finder: memmem::Finder<'a>,
-        case: bool,
+        form: Form,
     },
     /// A text term with anchors or skips, or on a target that is neither
     /// the name nor the full path.
     Text {
         target: Target,
         matcher: Box<TextMatcher<'a>>,
-        case: bool,
+        form: Form,
     },
     /// The name matches a name wildcard.
     NameGlob {
         glob: &'a Wildcard,
-        case: bool,
+        form: Form,
     },
     /// The last part of the name matches a path wildcard of one part and no
     /// `**` (`path:*.md`), which below a prefix ending with a separator is
@@ -61,14 +95,14 @@ pub(super) enum CNode<'a> {
     NamePart {
         part: &'a Glob,
         lit: Option<Vec<u8>>,
-        case: bool,
+        form: Form,
     },
     /// The whole of a target other than the name and the full path matches
     /// a wildcard (`stem:doc*`).
     TargetGlob {
         target: Target,
         glob: &'a Wildcard,
-        case: bool,
+        form: Form,
     },
     /// A file whose extension is one of these.
     Ext(Box<ExtMatcher>),
@@ -87,7 +121,7 @@ pub(super) enum CNode<'a> {
     /// The full path holds the needle.
     Path {
         finder: memmem::Finder<'a>,
-        case: bool,
+        form: Form,
     },
     /// The full path matches a sub-path wildcard, whose ends are checked
     /// first: the literal it ends with, and the one it starts with when that
@@ -100,7 +134,12 @@ pub(super) enum CNode<'a> {
         /// [`Wildcard::name_literal`]), when the prefix ends with a
         /// separator, so that the last part of a full path is the name.
         name_lit: Option<Vec<u8>>,
-        case: bool,
+        form: Form,
+    },
+    /// The target, as stored, holds a match of a regular expression.
+    Regex {
+        target: Target,
+        regex: &'a RegexTerm,
     },
 }
 
@@ -116,12 +155,12 @@ pub(super) struct Volume<'i> {
 }
 
 impl Volume<'_> {
-    /// The prefix as a term matching case (`case`) or not compares it.
-    fn prefix(&self, case: bool) -> &[u8] {
-        if case {
-            self.raw_prefix
-        } else {
-            self.folded_prefix
+    /// The prefix as a term of `form` compares it.
+    fn prefix(&self, form: Form) -> Cow<'_, [u8]> {
+        match form {
+            Form::Raw => Cow::Borrowed(self.raw_prefix),
+            Form::Folded => Cow::Borrowed(self.folded_prefix),
+            Form::Accented => Cow::Owned(crate::fold::fold_exact(self.raw_prefix)),
         }
     }
 
@@ -198,50 +237,56 @@ fn compile_leaf<'a>(leaf: &'a Leaf, volume: &Volume) -> CNode<'a> {
             target,
             needle,
             case,
+            diacritics,
             anchors,
             skip,
         } => {
-            let case = *case;
+            let form = Form::of(*case, *diacritics);
             let plain = anchors.is_free() && skip.is_none();
             match target {
                 Target::Name if plain => CNode::Name {
                     finder: memmem::Finder::new(needle),
-                    case,
+                    form,
                 },
                 Target::FullPath if plain => {
-                    let prefix = volume.prefix(case);
-                    if memmem::find(prefix, needle).is_some() {
+                    let prefix = volume.prefix(form);
+                    if memmem::find(&prefix, needle).is_some() {
                         // In every full path on the volume.
                         CNode::True
-                    } else if !term_admits(needle, prefix) {
+                    } else if !term_admits(needle, &prefix) {
                         // Its drive is another volume's.
                         CNode::False
                     } else {
                         CNode::Path {
                             finder: memmem::Finder::new(needle),
-                            case,
+                            form,
                         }
                     }
                 }
                 _ => CNode::Text {
                     target: *target,
                     matcher: Box::new(TextMatcher::new(needle, *anchors, *skip)),
-                    case,
+                    form,
                 },
             }
         }
-        Leaf::Glob { target, glob, case } => {
-            let case = *case;
+        Leaf::Glob {
+            target,
+            glob,
+            case,
+            diacritics,
+        } => {
+            let form = Form::of(*case, *diacritics);
             match target {
-                Target::Name | Target::FullPath if glob.is_name() => CNode::NameGlob { glob, case },
+                Target::Name | Target::FullPath if glob.is_name() => CNode::NameGlob { glob, form },
                 Target::Name | Target::FullPath => match glob.single_part() {
                     Some(part) if volume.parts_are_names => CNode::NamePart {
                         part,
                         lit: glob.longest_literal(),
-                        case,
+                        form,
                     },
                     _ => {
-                        let prefix = volume.prefix(case);
+                        let prefix = volume.prefix(form);
                         let lead = anchored_lead(glob);
                         if lead.as_deref().is_some_and(|lead| {
                             let n = lead.len().min(prefix.len());
@@ -254,7 +299,7 @@ fn compile_leaf<'a>(leaf: &'a Leaf, volume: &Volume) -> CNode<'a> {
                                 lead,
                                 trail: glob.trailing_literal(),
                                 name_lit: glob.name_literal().filter(|_| volume.parts_are_names),
-                                case,
+                                form,
                             }
                         }
                     }
@@ -262,12 +307,23 @@ fn compile_leaf<'a>(leaf: &'a Leaf, volume: &Volume) -> CNode<'a> {
                 target => CNode::TargetGlob {
                     target: *target,
                     glob,
-                    case,
+                    form,
                 },
             }
         }
+        Leaf::Regex { target, regex } => CNode::Regex {
+            target: *target,
+            regex,
+        },
         Leaf::Kind(kind) => CNode::Kind(*kind),
-        Leaf::Ext { values, case } => CNode::Ext(Box::new(ExtMatcher::new(values, *case))),
+        Leaf::Ext {
+            values,
+            case,
+            diacritics,
+        } => CNode::Ext(Box::new(ExtMatcher::new(
+            values,
+            Form::of(*case, *diacritics),
+        ))),
         Leaf::Size(range) => CNode::Size(*range),
         Leaf::SizeUnknown => CNode::SizeUnknown,
         Leaf::Date(date) => CNode::Date(*date),
@@ -477,11 +533,13 @@ impl<'a> CNode<'a> {
                 4
             }
             CNode::Ext(_) | CNode::Ancestor(_) => 5,
+            CNode::Regex { target, .. } if target.by_name() => 6,
             CNode::Path { .. }
             | CNode::Text { .. }
             | CNode::TargetGlob { .. }
             | CNode::Len { .. } => 6,
             CNode::PathGlob { .. } => 7,
+            CNode::Regex { .. } => 8,
         };
         (class, 1)
     }
@@ -513,7 +571,7 @@ impl<'a> CNode<'a> {
             | CNode::Len {
                 of: LenOf::Name, ..
             } => true,
-            CNode::Text { target, .. } => target.by_name(),
+            CNode::Text { target, .. } | CNode::Regex { target, .. } => target.by_name(),
             CNode::Not(inner) => inner.decided_by_name(),
             CNode::And(items) | CNode::Or(items) => items.iter().all(CNode::decided_by_name),
             _ => false,
@@ -523,34 +581,40 @@ impl<'a> CNode<'a> {
     /// The needles of [`plan`] for this node: a name search's own needle, a
     /// name wildcard's longest literal, `.ext` for each of a few extensions;
     /// the best of an AND's children; all of an OR's, when each has some.
-    /// What a NOT, a kind, size or date term, a path term or a term that
-    /// matches case matches holds no needle its folded name must hold.
+    /// What a NOT, a kind, size or date term, a path term, a regular
+    /// expression or a term that matches case or accents matches holds no
+    /// needle its folded name must hold.
     fn needles(&self) -> Option<Vec<Vec<u8>>> {
         match self {
             CNode::Name {
                 finder,
-                case: false,
+                form: Form::Folded,
             } => Some(vec![finder.needle().to_vec()]),
             // The stem and the extension are parts of the name.
             CNode::Text {
                 target: Target::Name | Target::Stem | Target::Extension,
                 matcher,
-                case: false,
+                form: Form::Folded,
             } if !matcher.skips() && !matcher.needle().is_empty() => {
                 Some(vec![matcher.needle().to_vec()])
             }
-            CNode::NameGlob { glob, case: false }
+            CNode::NameGlob {
+                glob,
+                form: Form::Folded,
+            }
             | CNode::TargetGlob {
                 target: Target::Stem | Target::Extension,
                 glob,
-                case: false,
+                form: Form::Folded,
             } => glob.longest_literal().map(|lit| vec![lit]),
             CNode::NamePart {
-                lit, case: false, ..
+                lit,
+                form: Form::Folded,
+                ..
             }
             | CNode::PathGlob {
                 name_lit: lit,
-                case: false,
+                form: Form::Folded,
                 ..
             } => lit.clone().map(|lit| vec![lit]),
             CNode::Ext(ext) => ext.needles(),
@@ -572,9 +636,9 @@ impl<'a> CNode<'a> {
     pub(super) fn tests_paths(&self) -> bool {
         match self {
             CNode::Path { .. } | CNode::PathGlob { .. } => true,
-            CNode::Text { target, .. } | CNode::TargetGlob { target, .. } => {
-                target_needs_path(*target)
-            }
+            CNode::Text { target, .. }
+            | CNode::TargetGlob { target, .. }
+            | CNode::Regex { target, .. } => target_needs_path(*target),
             CNode::Len { of, .. } => matches!(of, LenOf::FullPath | LenOf::Location),
             CNode::Not(inner) => inner.tests_paths(),
             CNode::And(items) | CNode::Or(items) => items.iter().any(CNode::tests_paths),
@@ -591,43 +655,53 @@ impl<'a> CNode<'a> {
             CNode::And(items) => items.iter().all(|c| c.eval(s)),
             CNode::Or(items) => items.iter().any(|c| c.eval(s)),
             CNode::Not(inner) => !inner.eval(s),
-            CNode::Name { finder, case } => finder.find(s.name(*case)).is_some(),
+            CNode::Name { finder, form } => finder.find(s.name(*form)).is_some(),
             CNode::Text {
                 target,
                 matcher,
-                case,
+                form,
             } => {
                 let budget = s.budget;
-                s.hay(*target, *case).is_some_and(|(hay, cps)| {
+                s.hay(*target, *form).is_some_and(|(hay, cps)| {
                     !long_and_spent(hay, budget) && matcher.matches(hay, cps, budget)
                 })
             }
-            CNode::NameGlob { glob, case } => {
+            CNode::NameGlob { glob, form } => {
                 let budget = s.budget;
-                glob.matches_decoded(s.name_code_points(*case), budget)
+                glob.matches_decoded(s.name_code_points(*form), budget)
             }
-            CNode::NamePart { part, case, .. } => {
+            CNode::NamePart { part, form, .. } => {
                 let budget = s.budget;
-                let name = s.name_code_points(*case);
+                let name = s.name_code_points(*form);
                 let last = name
                     .iter()
                     .rposition(|&c| c == u32::from(b'\\'))
                     .map_or(name, |sep| &name[sep + 1..]);
                 part.matches_decoded(last, budget)
             }
-            CNode::TargetGlob { target, glob, case } => {
+            CNode::TargetGlob { target, glob, form } => {
                 let budget = s.budget;
-                s.hay(*target, *case).is_some_and(|(hay, cps)| {
+                s.hay(*target, *form).is_some_and(|(hay, cps)| {
                     !long_and_spent(hay, budget) && {
                         decode_into(hay, cps);
                         glob.matches_decoded(cps, budget)
                     }
                 })
             }
+            CNode::Regex { target, regex } => {
+                // Read the text once to count it, as a spent budget stops
+                // the match before it runs; reading it again costs nothing.
+                let Some(len) = s.hay(*target, Form::Raw).map(|(hay, _)| hay.len()) else {
+                    return false;
+                };
+                !s.regex_spent(len)
+                    && s.hay(*target, Form::Raw)
+                        .is_some_and(|(hay, _)| regex.is_match(hay))
+            }
             CNode::Ext(ext) => {
                 !s.is_dir() && {
                     let budget = s.budget;
-                    let raw = s.name(true);
+                    let raw = s.stored_name(Form::Raw);
                     let scratch = &mut *s.scratch;
                     ext.matches(raw, &mut scratch.ext, &mut scratch.text_cps, budget)
                 }
@@ -644,16 +718,20 @@ impl<'a> CNode<'a> {
             CNode::Date(date) => date.matches(s.mtime()),
             CNode::Len { of, range } => {
                 let len = match of {
-                    LenOf::Name => Some(utf16_len(s.name(true))),
+                    LenOf::Name => Some(utf16_len(s.stored_name(Form::Raw))),
                     // A folder has no extension, and so no length of one
                     // (`extlen:0` keeps files with no dot, L7:432).
                     LenOf::Extension if s.is_dir() => None,
                     LenOf::Extension => Some(
-                        s.hay(Target::Extension, true)
+                        s.hay(Target::Extension, Form::Raw)
                             .map_or(0, |(ext, _)| utf16_len(ext)),
                     ),
-                    LenOf::FullPath => s.hay(Target::FullPath, true).map(|(p, _)| utf16_len(p)),
-                    LenOf::Location => s.hay(Target::Location, true).map(|(p, _)| utf16_len(p)),
+                    LenOf::FullPath => s
+                        .hay(Target::FullPath, Form::Raw)
+                        .map(|(p, _)| utf16_len(p)),
+                    LenOf::Location => s
+                        .hay(Target::Location, Form::Raw)
+                        .map(|(p, _)| utf16_len(p)),
                 };
                 len.is_some_and(|len| range.contains(len))
             }
@@ -673,26 +751,26 @@ impl<'a> CNode<'a> {
                 }
                 false
             }),
-            CNode::Path { finder, case } => {
+            CNode::Path { finder, form } => {
                 let budget = s.budget;
-                s.hay(Target::FullPath, *case)
+                s.hay(Target::FullPath, *form)
                     .is_some_and(|(p, _)| !long_and_spent(p, budget) && finder.find(p).is_some())
             }
             CNode::PathGlob {
                 glob,
                 lead,
                 trail,
-                case,
+                form,
                 ..
             } => {
                 let budget = s.budget;
-                let fits = s.hay(Target::FullPath, *case).is_some_and(|(p, _)| {
+                let fits = s.hay(Target::FullPath, *form).is_some_and(|(p, _)| {
                     lead.as_deref().is_none_or(|lead| p.starts_with(lead))
                         && p.ends_with(trail)
                         && !long_and_spent(p, budget)
                 });
                 fits && s
-                    .path_code_points(*case)
+                    .path_code_points(*form)
                     .is_some_and(|cps| glob.matches_decoded(cps, budget))
             }
         }
@@ -722,8 +800,8 @@ fn long_and_spent(path: &[u8], budget: &Budget) -> bool {
 /// name, `*` every file, L7:528-530); an empty value names a name with no
 /// dot.
 pub(super) struct ExtMatcher {
-    case: bool,
-    /// The plain values, folded unless `case`.
+    form: Form,
+    /// The plain values, in `form`.
     plain: Plain,
     /// How many dot-separated parts the plain values have, fewest first.
     parts: Vec<usize>,
@@ -750,7 +828,7 @@ enum Plain {
 const FEW_MAX: usize = 8;
 
 impl ExtMatcher {
-    pub(super) fn new(values: &[Vec<u8>], case: bool) -> Self {
+    pub(super) fn new(values: &[Vec<u8>], form: Form) -> Self {
         let mut plain: Vec<Vec<u8>> = Vec::new();
         let mut parts = Vec::new();
         let mut globs = Vec::new();
@@ -775,7 +853,7 @@ impl ExtMatcher {
             _ => Plain::Set(plain.into_iter().collect()),
         };
         ExtMatcher {
-            case,
+            form,
             plain,
             last_part_only: globs.is_empty() && parts.iter().all(|&k| k == 1),
             parts,
@@ -864,24 +942,31 @@ impl ExtMatcher {
             .any(|glob| glob.matches_decoded(cps, budget))
     }
 
-    /// `tail`, a part of a name, folded into `fold_buf` unless the values
-    /// match case.
+    /// `tail`, a part of a name, in the values' form: as stored, or folded
+    /// into `fold_buf`.
     #[inline(always)]
     fn folded<'b>(&self, tail: &'b [u8], fold_buf: &'b mut Vec<u8>) -> &'b [u8] {
-        if self.case {
-            tail
-        } else {
-            fold_buf.clear();
-            crate::fold::fold_into(tail, fold_buf);
-            fold_buf.as_slice()
+        match self.form {
+            Form::Raw => tail,
+            Form::Folded => {
+                fold_buf.clear();
+                fold_into(tail, fold_buf);
+                fold_buf.as_slice()
+            }
+            Form::Accented => {
+                fold_buf.clear();
+                fold_exact_into(tail, fold_buf);
+                fold_buf.as_slice()
+            }
         }
     }
 
     /// `.ext` for each of a few plain values, one of which the folded name
     /// of every match holds: none for a wildcard or an empty value, or for
-    /// values matching case, which the folded names cannot be scanned for.
+    /// values matching case or accents, which the folded names cannot be
+    /// scanned for.
     fn needles(&self) -> Option<Vec<Vec<u8>>> {
-        if self.case || self.none || !self.globs.is_empty() {
+        if self.form != Form::Folded || self.none || !self.globs.is_empty() {
             return None;
         }
         let dotted = |v: &Vec<u8>| [&b"."[..], v].concat();
@@ -914,6 +999,14 @@ pub(super) struct Scratch {
     pub(super) other_cps: CodePointBuf,
     /// A target decoded, for a match that skips or a wildcard.
     pub(super) text_cps: CodePointBuf,
+    /// A name folded keeping accents, for `diacritics:`.
+    pub(super) accented_name: Vec<u8>,
+    /// A full path folded keeping accents.
+    pub(super) accented_path: Vec<u8>,
+    /// That path decoded.
+    pub(super) accented_cps: CodePointBuf,
+    /// The bytes `regex:` terms matched since the budget's last check.
+    pub(super) regex_bytes: usize,
 }
 
 /// Fills its buffer with an entry's full path (as the query compares it)
@@ -935,10 +1028,17 @@ pub(super) struct Subject<'s, 'x> {
     budget: &'s Budget<'s>,
     scratch: &'x mut Scratch,
     full_path: Option<PathSource<'x>>,
-    /// Which way `scratch.cps` holds the name decoded, if it does.
-    name_decoded: Option<bool>,
+    /// Which form of the name `scratch.cps` holds decoded, if any.
+    name_decoded: Option<Form>,
+    /// `scratch.accented_name` holds this name.
+    name_accented: bool,
+    /// The full path folded as the query folds paths: as stored when it
+    /// matches case, else folded.
     path: Fetched,
+    /// The full path in the other of those two forms.
     other: Fetched,
+    /// The full path folded keeping accents.
+    accented: Fetched,
 }
 
 /// How far one of the subject's full paths has been read.
@@ -952,10 +1052,15 @@ enum Fetched {
 }
 
 /// Where a target's text lies.
+#[derive(Clone, Copy)]
 enum Src<'s> {
+    /// A name the index holds.
     Name(&'s [u8]),
+    /// `scratch.accented_name`.
+    AccentedName,
     Path,
     Other,
+    AccentedPath,
 }
 
 impl<'s, 'x> Subject<'s, 'x> {
@@ -977,8 +1082,10 @@ impl<'s, 'x> Subject<'s, 'x> {
             scratch,
             full_path: None,
             name_decoded: None,
+            name_accented: false,
             path: Fetched::Unread,
             other: Fetched::Unread,
+            accented: Fetched::Unread,
         }
     }
 
@@ -1000,19 +1107,50 @@ impl<'s, 'x> Subject<'s, 'x> {
         s
     }
 
-    /// The name, as stored (`case`) or folded.
-    fn name(&self, case: bool) -> &'s [u8] {
-        if case {
+    /// The name in `form` as the index holds it: as stored, or folded. An
+    /// ASCII name folded keeping accents is its folded name.
+    fn stored_name(&self, form: Form) -> &'s [u8] {
+        if form == Form::Raw {
             self.index.name_raw(self.id)
         } else {
             self.index.name_folded(self.id)
         }
     }
 
-    fn name_code_points(&mut self, case: bool) -> &[u32] {
-        if self.name_decoded != Some(case) {
-            decode_into(self.name(case), &mut self.scratch.cps);
-            self.name_decoded = Some(case);
+    /// Folds the name keeping accents into `scratch.accented_name`, when
+    /// that is not its folded name, and says whether it did: an ASCII name
+    /// has no accents to keep.
+    fn accent_name(&mut self) -> bool {
+        let raw = self.index.name_raw(self.id);
+        if raw.is_ascii() {
+            return false;
+        }
+        if !self.name_accented {
+            self.scratch.accented_name.clear();
+            fold_exact_into(raw, &mut self.scratch.accented_name);
+            self.name_accented = true;
+        }
+        true
+    }
+
+    /// The name in `form`.
+    fn name(&mut self, form: Form) -> &[u8] {
+        if form == Form::Accented && self.accent_name() {
+            &self.scratch.accented_name
+        } else {
+            self.stored_name(form)
+        }
+    }
+
+    fn name_code_points(&mut self, form: Form) -> &[u32] {
+        if self.name_decoded != Some(form) {
+            if form == Form::Accented && self.accent_name() {
+                let scratch = &mut *self.scratch;
+                decode_into(&scratch.accented_name, &mut scratch.cps);
+            } else {
+                decode_into(self.stored_name(form), &mut self.scratch.cps);
+            }
+            self.name_decoded = Some(form);
         }
         &self.scratch.cps
     }
@@ -1029,9 +1167,17 @@ impl<'s, 'x> Subject<'s, 'x> {
         self.entry.and_then(|e| self.index.entry(e).mtime())
     }
 
-    /// Reads the full path, folded as the query folds paths (`case` is the
-    /// query's) or the other way, and says whether the entry has one.
-    fn fetch_path(&mut self, case: bool) -> bool {
+    /// The form the query folds its paths in, which `full_path` gives.
+    fn query_form(&self) -> Form {
+        if self.query_case {
+            Form::Raw
+        } else {
+            Form::Folded
+        }
+    }
+
+    /// Reads the full path in `form`, and says whether the entry has one.
+    fn fetch_path(&mut self, form: Form) -> bool {
         if self.path == Fetched::Unread {
             let found = match self.full_path.as_mut() {
                 Some(fill) => {
@@ -1049,15 +1195,45 @@ impl<'s, 'x> Subject<'s, 'x> {
         if self.path == Fetched::Missing {
             return false;
         }
-        if case == self.query_case {
+        if form == self.query_form() {
             return true;
         }
+        if form != Form::Accented {
+            return self.fetch_other();
+        }
+        if self.accented == Fetched::Unread {
+            // Fold the path as stored: the query's, or the other one.
+            let query_case = self.query_case;
+            let found = query_case || self.fetch_other();
+            if found {
+                let Scratch {
+                    path,
+                    other_path,
+                    accented_path,
+                    ..
+                } = &mut *self.scratch;
+                let raw = if query_case { path } else { other_path };
+                accented_path.clear();
+                fold_exact_into(raw, accented_path);
+            }
+            self.accented = if found {
+                Fetched::Read
+            } else {
+                Fetched::Missing
+            };
+        }
+        self.accented != Fetched::Missing
+    }
+
+    /// Reads the full path in the form the query does not fold its paths
+    /// in, and says whether the entry has one.
+    fn fetch_other(&mut self) -> bool {
         if self.other == Fetched::Unread {
             let other = &mut self.scratch.other_path;
             other.clear();
             let found = if self.query_case {
                 // The query's paths are as stored: fold this one.
-                crate::fold::fold_into(&self.scratch.path, other);
+                fold_into(&self.scratch.path, other);
                 true
             } else {
                 // The query's paths are folded: build this one as stored.
@@ -1083,32 +1259,54 @@ impl<'s, 'x> Subject<'s, 'x> {
         self.other != Fetched::Missing
     }
 
-    /// The text of `target`, folded unless `case`, and a buffer to decode it
-    /// into: `None` when the entry has no such text (a folder's extension,
-    /// or no full path).
-    fn hay(&mut self, target: Target, case: bool) -> Option<(&[u8], &mut CodePointBuf)> {
+    /// Where the full path in `form` lies, once fetched.
+    fn path_src(&self, form: Form) -> Src<'s> {
+        if form == self.query_form() {
+            Src::Path
+        } else if form == Form::Accented {
+            Src::AccentedPath
+        } else {
+            Src::Other
+        }
+    }
+
+    /// The text of `target` in `form`, and a buffer to decode it into:
+    /// `None` when the entry has no such text (a folder's extension, or no
+    /// full path).
+    fn hay(&mut self, target: Target, form: Form) -> Option<(&[u8], &mut CodePointBuf)> {
         let (src, range) = match target {
             Target::Name | Target::Stem | Target::Extension => {
-                let name = self.name(case);
+                let dir = self.is_dir();
+                let at_name_level = self.entry.is_none();
+                let src = if form == Form::Accented && self.accent_name() {
+                    Src::AccentedName
+                } else {
+                    Src::Name(self.stored_name(form))
+                };
+                let name: &[u8] = match src {
+                    Src::Name(name) => name,
+                    _ => &self.scratch.accented_name,
+                };
                 let dot = memchr::memrchr(b'.', name);
                 let range = match target {
                     Target::Name => 0..name.len(),
                     // A folder's stem is its name, and it has no extension.
-                    Target::Stem if self.is_dir() => 0..name.len(),
+                    Target::Stem if dir => 0..name.len(),
                     Target::Stem => 0..dot.unwrap_or(name.len()),
-                    _ if self.is_dir() || self.entry.is_none() => return None,
+                    _ if dir || at_name_level => return None,
                     _ => (dot? + 1)..name.len(),
                 };
-                (Src::Name(name), range)
+                (src, range)
             }
             Target::FullPath | Target::Location | Target::ParentName => {
-                if !self.fetch_path(case) {
+                if !self.fetch_path(form) {
                     return None;
                 }
-                let path = if case == self.query_case {
-                    &self.scratch.path
-                } else {
-                    &self.scratch.other_path
+                let src = self.path_src(form);
+                let path: &[u8] = match src {
+                    Src::Path => &self.scratch.path,
+                    Src::Other => &self.scratch.other_path,
+                    _ => &self.scratch.accented_path,
                 };
                 let range = match target {
                     Target::FullPath => 0..path.len(),
@@ -1124,38 +1322,53 @@ impl<'s, 'x> Subject<'s, 'x> {
                         }
                     }
                 };
-                let src = if case == self.query_case {
-                    Src::Path
-                } else {
-                    Src::Other
-                };
                 (src, range)
             }
         };
         let scratch = &mut *self.scratch;
         let bytes: &[u8] = match src {
             Src::Name(name) => &name[range],
+            Src::AccentedName => &scratch.accented_name[range],
             Src::Path => &scratch.path[range],
             Src::Other => &scratch.other_path[range],
+            Src::AccentedPath => &scratch.accented_path[range],
         };
         Some((bytes, &mut scratch.text_cps))
     }
 
-    fn path_code_points(&mut self, case: bool) -> Option<&[u32]> {
-        if !self.fetch_path(case) {
+    fn path_code_points(&mut self, form: Form) -> Option<&[u32]> {
+        if !self.fetch_path(form) {
             return None;
         }
+        let src = self.path_src(form);
         let scratch = &mut *self.scratch;
-        let (state, path, cps) = if case == self.query_case {
-            (&mut self.path, &scratch.path, &mut scratch.path_cps)
-        } else {
-            (&mut self.other, &scratch.other_path, &mut scratch.other_cps)
+        let (state, path, cps) = match src {
+            Src::Path => (&mut self.path, &scratch.path, &mut scratch.path_cps),
+            Src::Other => (&mut self.other, &scratch.other_path, &mut scratch.other_cps),
+            _ => (
+                &mut self.accented,
+                &scratch.accented_path,
+                &mut scratch.accented_cps,
+            ),
         };
         if *state == Fetched::Read {
             decode_into(path, cps);
             *state = Fetched::Decoded;
         }
         Some(cps)
+    }
+
+    /// Counts `len` more bytes of text a `regex:` term is about to match,
+    /// and once enough have been since the last check, checks the budget:
+    /// `true` when it is spent, and the match must not run.
+    fn regex_spent(&mut self, len: usize) -> bool {
+        let matched = &mut self.scratch.regex_bytes;
+        *matched += len;
+        if *matched < REGEX_BYTES_PER_CHECK {
+            return false;
+        }
+        *matched = 0;
+        self.budget.check()
     }
 }
 
@@ -1335,7 +1548,8 @@ mod tests {
                 }
             })
             .collect();
-        ExtMatcher::new(&values, case).matches(
+        let form = if case { Form::Raw } else { Form::Folded };
+        ExtMatcher::new(&values, form).matches(
             name.as_bytes(),
             &mut Vec::new(),
             &mut CodePointBuf::new(),
@@ -1393,4 +1607,26 @@ mod tests {
 
     /// Extensions no test name has, to make a list long.
     const FILLER: [&str; 8] = ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"];
+
+    /// `regex:` terms check the budget once they have matched
+    /// [`REGEX_BYTES_PER_CHECK`] bytes since the last check, however few
+    /// entries those took: a long path's match cannot run on past a spent
+    /// budget for long.
+    #[test]
+    fn regex_text_counts_toward_a_check_of_the_budget() {
+        use std::time::{Duration, Instant};
+        let index = VolumeIndex::new(crate::index::NTFS_ROOT_FRN, crate::index::FrnMap::sparse());
+        let id = index.name_id(index.root());
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let spent = Budget::until(Instant::now() + Duration::from_secs(3600), &cancel);
+        let mut scratch = Scratch::default();
+        let mut s = Subject::name_level(&index, id, false, &spent, &mut scratch);
+        assert!(!s.regex_spent(REGEX_BYTES_PER_CHECK - 1), "not checked yet");
+        assert!(s.regex_spent(1), "checked, and spent");
+        assert!(!s.regex_spent(10), "counting again");
+        let unlimited = Budget::unlimited();
+        let mut scratch = Scratch::default();
+        let mut s = Subject::name_level(&index, id, false, &unlimited, &mut scratch);
+        assert!(!s.regex_spent(10 * REGEX_BYTES_PER_CHECK));
+    }
 }

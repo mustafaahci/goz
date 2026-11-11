@@ -30,6 +30,10 @@
 //! (`size:<1kb`), unless a `>` closes it within the same white-space-free
 //! run, as in Everything, around values a `|` separates (`size:<1kb|2kb>`).
 //!
+//! A `regex:` term's value is read as Everything's parser eats it: up to
+//! unquoted white space, `|`, `;` and `<` included, and `>` too unless it
+//! closes an open group; `?regex:` reads every later term's text so.
+//!
 //! Three directives are read here and leave no token: `case:` and
 //! `matchpath:` with no text, or with `0` or `1`, whole-query switches as
 //! goz has always had them (`case:Foo` is the per-term modifier), and
@@ -106,6 +110,11 @@ pub(super) enum Mod {
     Wildcards,
     /// `metric:`: size units of 1000.
     Metric,
+    /// `diacritics:` (`diac:`): match accents; by default they are
+    /// ignored.
+    Diacritics,
+    /// `regex:`: the text is a regular expression.
+    Regex,
 }
 
 /// The modifiers a term may have, each switched on or off, or left to the
@@ -126,6 +135,8 @@ pub(super) struct ModSet {
     pub(super) star_all: Option<bool>,
     pub(super) wildcards: Option<bool>,
     pub(super) metric: Option<bool>,
+    pub(super) diacritics: Option<bool>,
+    pub(super) regex: Option<bool>,
     /// `?file:` or `?folder:`: the kind of every term after it.
     pub(super) kind: Option<Kind>,
 }
@@ -146,6 +157,8 @@ impl ModSet {
             Mod::StarAll => &mut self.star_all,
             Mod::Wildcards => &mut self.wildcards,
             Mod::Metric => &mut self.metric,
+            Mod::Diacritics => &mut self.diacritics,
+            Mod::Regex => &mut self.regex,
         }
     }
 
@@ -176,6 +189,8 @@ impl ModSet {
             star_all: self.star_all.or(inner.star_all),
             wildcards: self.wildcards.or(inner.wildcards),
             metric: self.metric.or(inner.metric),
+            diacritics: self.diacritics.or(inner.diacritics),
+            regex: self.regex.or(inner.regex),
             kind: self.kind.or(inner.kind),
         }
     }
@@ -231,6 +246,20 @@ impl Func {
                 | Func::PathLen
                 | Func::LocationLen
                 | Func::ExtLen
+        )
+    }
+
+    /// Whether the value is text a term matches against a part of the
+    /// path, which `regex:` makes a regular expression (`regex:stem:^a`).
+    pub(super) fn matches_text(self) -> bool {
+        matches!(
+            self,
+            Func::Extension
+                | Func::Name
+                | Func::Stem
+                | Func::FullPath
+                | Func::Location
+                | Func::ParentName
         )
     }
 
@@ -384,6 +413,8 @@ impl Prefix {
             "starall" => on(M::StarAll),
             "filenamewildcards" | "filenamewildcard" => on(M::Wildcards),
             "metric" => on(M::Metric),
+            "diacritics" | "diac" => on(M::Diacritics),
+            "regex" => on(M::Regex),
             "wildcards" | "wildcard" => Named::Refused(
                 "Everything's extended wildcards (wildcards:) are not supported; \
                  * and ? work without it",
@@ -447,6 +478,10 @@ impl Prefix {
                 (Mod::Wildcards, false) => "nowildcards:",
                 (Mod::Metric, true) => "metric:",
                 (Mod::Metric, false) => "nometric:",
+                (Mod::Diacritics, true) => "diacritics:",
+                (Mod::Diacritics, false) => "nodiacritics:",
+                (Mod::Regex, true) => "regex:",
+                (Mod::Regex, false) => "noregex:",
             },
             Prefix::File => "file:",
             Prefix::Folder => "folder:",
@@ -511,6 +546,7 @@ pub(super) fn lex(input: &str) -> Result<Lexed, QueryError> {
         literal_bang: false,
         after_close: false,
         global: ModSet::default(),
+        depth: 0,
     };
     lexer.run()?;
     Ok(lexer.out)
@@ -531,6 +567,9 @@ struct Lexer {
     after_close: bool,
     /// The modifiers `?mod:` set for the rest of the search.
     global: ModSet,
+    /// The groups open here, so that a `>` in a regular expression closes
+    /// one only when one is open.
+    depth: usize,
 }
 
 /// What a `NAME:` at a term start is.
@@ -567,6 +606,11 @@ impl Lexer {
 
     fn emit(&mut self, kind: Tok, column: usize) {
         self.after_close = kind == Tok::Close;
+        match kind {
+            Tok::Open => self.depth += 1,
+            Tok::Close => self.depth = self.depth.saturating_sub(1),
+            _ => {}
+        }
         self.out.tokens.push(Token {
             kind,
             column,
@@ -597,6 +641,8 @@ impl Lexer {
         // keyword, a directive, or a function goz does not know.
         let mut first = true;
         let mut literal_bang = self.literal_bang;
+        // The term's own `regex:` or `no-regex:`, the outermost winning.
+        let mut regex: Option<bool> = None;
         while let Some(c) = self.peek() {
             if c.is_whitespace() {
                 return Ok(());
@@ -605,23 +651,29 @@ impl Lexer {
             if self.after_close && !matches!(c, '|' | '>') {
                 return Err(QueryError::GroupExpansion { column });
             }
+            // After a prefix of a term that is a regular expression, its
+            // value starts: there `|` and `<` are the expression's own, and
+            // a `>` closes a group only when one is open.
+            let in_regex = !first && regex.or(self.global.regex) == Some(true);
             match c {
-                '|' => {
+                '|' if !in_regex => {
                     self.at += 1;
                     self.emit(Tok::Or, column);
                     first = true;
                     literal_bang = self.literal_bang;
+                    regex = None;
                     continue;
                 }
-                '>' => {
+                '>' if !in_regex || self.depth > 0 => {
                     self.at += 1;
                     self.emit(Tok::Close, column);
                     continue;
                 }
-                '<' => {
+                '<' if !in_regex => {
                     self.at += 1;
                     self.emit(Tok::Open, column);
                     first = true;
+                    regex = None;
                     continue;
                 }
                 '!' if !literal_bang => {
@@ -642,6 +694,7 @@ impl Lexer {
                         self.emit(kind, column);
                         first = true;
                         literal_bang = self.literal_bang;
+                        regex = None;
                     }
                     Head::Precedence(and_first) => {
                         self.at = after;
@@ -664,6 +717,9 @@ impl Lexer {
                         self.at = after;
                         self.emit(Tok::Prefix(prefix), column);
                         first = false;
+                        if let Prefix::Mod(Mod::Regex, on) = prefix {
+                            regex.get_or_insert(on);
+                        }
                         if rest {
                             // `name*:`: the rest of the query, verbatim.
                             let column = self.at + 1;
@@ -675,16 +731,52 @@ impl Lexer {
                             return Ok(());
                         }
                         if let Prefix::Func(func) = prefix {
-                            self.value(func, literal_bang)?;
+                            let regex = regex.or(self.global.regex) == Some(true);
+                            self.value(func, literal_bang, regex)?;
                         }
                     }
                 }
                 continue;
             }
-            let text = self.text(false)?;
+            let text = if regex.or(self.global.regex) == Some(true) {
+                self.regex_text()
+            } else {
+                self.text(false)?
+            };
             self.emit(Tok::Text(text), column);
         }
         Ok(())
+    }
+
+    /// Reads a regular expression's text, as Everything's parser eats it:
+    /// up to unquoted white space, `|`, `;`, `<` and `>` included, but for a
+    /// `>` that closes an open group. Quotes are removed (`regex:"a b"`) and
+    /// entities replaced, as everywhere.
+    fn regex_text(&mut self) -> Text {
+        let mut out = Text::default();
+        let mut quoted = false;
+        while let Some(c) = self.peek() {
+            if c == '"' {
+                quoted = !quoted;
+                self.at += 1;
+                continue;
+            }
+            if !quoted && (c.is_whitespace() || (c == '>' && self.depth > 0)) {
+                break;
+            }
+            if c == '&'
+                && let Some((cp, len, _)) = self.entity()
+            {
+                encode_code_point(cp, &mut out.text);
+                self.at += len;
+                continue;
+            }
+            let mut buf = [0u8; 4];
+            out.text
+                .extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            self.at += 1;
+        }
+        out
     }
 
     /// `?name:`: the modifier holds for every term after it that does not
@@ -859,12 +951,19 @@ impl Lexer {
     /// follows, which the word's loop reads as a group. A number or a date
     /// may start with its comparison (`size:>1mb`), whose `<` or `>` is part
     /// of the value; a `<` is a value group there only when it is one (see
-    /// [`Lexer::value_group_follows`]).
-    fn value(&mut self, func: Func, literal_bang: bool) -> Result<(), QueryError> {
+    /// [`Lexer::value_group_follows`]). Under `regex:` (`regex`), a text
+    /// function's value is a regular expression, read as one is.
+    fn value(&mut self, func: Func, literal_bang: bool, regex: bool) -> Result<(), QueryError> {
         while !literal_bang && func.compares() && self.peek() == Some('!') {
             let column = self.at + 1;
             self.at += 1;
             self.emit(Tok::Not, column);
+        }
+        if regex && func.matches_text() {
+            let column = self.at + 1;
+            let text = self.regex_text();
+            self.emit(Tok::Text(text), column);
+            return Ok(());
         }
         if self.peek() == Some('<') && (!func.compares() || self.value_group_follows()) {
             return Ok(());
@@ -1408,5 +1507,42 @@ mod tests {
         assert_eq!(shape("len:!7"), "P(len:)!T(7)");
         assert_eq!(shape("name:!x"), "P(name:)T(!x)");
         assert_eq!(shape(r"parent:!C:\x"), r"P(parent:)T(!C:\x)");
+    }
+
+    /// A regular expression's value runs to white space, `|`, `;`, `<` and
+    /// `>` included, as Everything's parser eats them (L1:413-417), but for
+    /// a `>` that closes an open group; the prefixes before it are read as
+    /// ever, and a `!` before the value negates the term.
+    #[test]
+    fn a_regex_value_runs_to_white_space() {
+        assert_eq!(shape("regex:^foo|^ever"), "P(regex:)T(^foo|^ever)");
+        assert_eq!(shape("regex:^foo |ever"), "P(regex:)T(^foo) |T(ever)");
+        assert_eq!(shape(r#"regex:"^foo bar""#), "P(regex:)T(^foo bar)");
+        assert_eq!(shape("regex:a;b<c>d"), "P(regex:)T(a;b<c>d)");
+        assert_eq!(shape("regex:<a|b>"), "P(regex:)T(<a|b>)");
+        assert_eq!(shape("<regex:a|b> c"), "<P(regex:)T(a|b)> T(c)");
+        assert_eq!(shape("case:regex:^Foo"), "P(case:)P(regex:)T(^Foo)");
+        assert_eq!(shape("regex:!x|y"), "P(regex:)!T(x|y)");
+        assert_eq!(shape("regex:a&vert:b"), "P(regex:)T(a|b)");
+        assert_eq!(shape("regex*:^a b|c$"), "P(regex:)T(^a b|c$)");
+        assert_eq!(shape("regex:stem:^a|b"), "P(regex:)P(stem:)T(^a|b)");
+        // A function whose value is no text keeps its own reading.
+        assert_eq!(shape("regex:ext:a;b"), "P(regex:)P(ext:)T(a;b)");
+        // `?regex:` makes every later term's text a regular expression; a
+        // term starts as ever, and `noregex:` turns it off for one term.
+        assert_eq!(shape("?regex: a|b <c|d>"), " T(a|b) <T(c|d)>");
+        assert_eq!(shape("?regex: a noregex:b|c"), " T(a) P(noregex:)T(b)|T(c)");
+    }
+
+    #[test]
+    fn diacritics_is_a_modifier() {
+        assert_eq!(shape("diac:café"), "P(diacritics:)T(café)");
+        assert_eq!(shape("diacritics:<a b>"), "P(diacritics:)<T(a) T(b)>");
+        assert_eq!(shape("no-diacritics:x"), "P(nodiacritics:)T(x)");
+        assert_eq!(shape("?diacritics: x"), " T(x)");
+        assert_eq!(
+            lex("?diacritics: x").unwrap().tokens[0].global.diacritics,
+            Some(true)
+        );
     }
 }

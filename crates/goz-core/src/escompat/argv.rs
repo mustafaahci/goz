@@ -1965,11 +1965,13 @@ mod tests {
         assert!(msg.contains("unbalanced '>' at column 4"), "{msg}");
         let msg = refused(&["gr<a|e>y"]);
         assert!(msg.contains("group expansion"), "{msg}");
-        let msg = refused(&["regex:foo"]);
+        let msg = refused(&["content:foo"]);
         assert!(
-            msg.contains("unknown search function or modifier 'regex:'"),
+            msg.contains("unknown search function or modifier 'content:'"),
             "{msg}"
         );
+        let msg = refused(&["regex:(?<=a)b"]);
+        assert!(msg.contains("look-around"), "{msg}");
         let msg = refused(&["size:huge2"]);
         assert!(msg.contains("size:"), "{msg}");
         assert_eq!(

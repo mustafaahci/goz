@@ -435,6 +435,7 @@ const GOLDEN: &[(&str, &str, &[&str])] = &[
     (r#"L7"#, r#"ww:spider-man"#, &[r#"words\spider-man.txt"#]),
     (r#"L7"#, r#"ww:"spider man""#, &[r#"words\spider man.txt"#]),
     (r#"L7"#, r#"ww:ab12cd"#, &[r#"words\ab12cd.txt"#]),
+    (r#"L7"#, r#"ww:ab"#, &[r#"p\áb.txt"#]),
     (r#"L7"#, r#"ww:12"#, &[]),
     (r#"L7"#, r#"ww:txt"#, &[r#"case1\Foo.txt"#, r#"case2\FOO.TXT"#, r#"case3\foo.txt"#, r#"d2\dec2025.txt"#, r#"d2\fut10d.txt"#, r#"d2\fut3d.txt"#, r#"d2\jan2026.txt"#, r#"d2\may2025.txt"#, r#"d2\mon1109.txt"#, r#"d2\oct2026b.txt"#, r#"d2\rel29d.txt"#, r#"d2\rel2h.txt"#, r#"d2\rel32d.txt"#, r#"d2\rel6d12h.txt"#, r#"d2\rel7d1h.txt"#, r#"d2\sat1107.txt"#, r#"d2\sep2026.txt"#, r#"d2\sun1108.txt"#, r#"d2\t1015.txt"#, r#"d2\thu1105.txt"#, r#"d2\wed1104.txt"#, r#"d2\y1930.txt"#, r#"d2\y1950.txt"#, r#"d2\y2029.txt"#, r#"d2\y2049.txt"#, r#"dates\d1999.txt"#, r#"dates\d2020a.txt"#, r#"dates\d2020b.txt"#, r#"dates\d2021.txt"#, r#"dates\d2024may.txt"#, r#"dates\d2024wed.txt"#, r#"dates\d2026nov.txt"#, r#"dates\d2026oct.txt"#, r#"desktop\First Level First\f.txt"#, r#"desktop\First Level First\inner\g.txt"#, r#"desktop\other\h.txt"#, r#"dia3\dzx.txt"#, r#"dia3\eb.txt"#, r#"dia3\hal.txt"#, r#"dia3\ijs.txt"#, r#"dia3\la.txt"#, r#"dia3\na.txt"#, r#"dia3\sun.txt"#, r#"dia3\tarx.txt"#, r#"dia3\ħal.txt"#, r#"dia3\ĳs.txt"#, r#"dia3\ŀa.txt"#, r#"dia3\ŋa.txt"#, r#"dia3\ŧar.txt"#, r#"dia3\ſun.txt"#, r#"dia3\ǆx.txt"#, r#"dia3\əb.txt"#, r#"dia3\ας.txt"#, r#"dia3\ασ.txt"#, r#"dia3\еж.txt"#, r#"dia3\иод.txt"#, r#"dia3\йод.txt"#, r#"dia3\ёж.txt"#, r#"dia\CAFÉ2.txt"#, r#"dia\Straße.txt"#, r#"dia\aeble.txt"#, r#"dia\ano.txt"#, r#"dia\año.txt"#, r#"dia\cafe.txt"#, r#"dia\cafénfd.txt"#, r#"dia\café.txt"#, r#"dia\cag.txt"#, r#"dia\dak.txt"#, r#"dia\file.txt"#, r#"dia\full.txt"#, r#"dia\istanbul.txt"#, r#"dia\kirmizi.txt"#, r#"dia\kırmızı.txt"#, r#"dia\lodz.txt"#, r#"dia\naive.txt"#, r#"dia\naïve.txt"#, r#"dia\oeuvre.txt"#, r#"dia\pho.txt"#, r#"dia\phở.txt"#, r#"dia\q.txt"#, r#"dia\q́.txt"#, r#"dia\soren.txt"#, r#"dia\strasse.txt"#, r#"dia\søren.txt"#, r#"dia\thdr.txt"#, r#"dia\x2y.txt"#, r#"dia\x²y.txt"#, r#"dia\Æble2.txt"#, r#"dia\æble.txt"#, r#"dia\çağ.txt"#, r#"dia\þðr.txt"#, r#"dia\đak.txt"#, r#"dia\İstanbul.txt"#, r#"dia\łodź.txt"#, r#"dia\œuvre.txt"#, r#"dia\άλφα.txt"#, r#"dia\αλφα.txt"#, r#"dia\ẞ3.txt"#, r#"dia\ﬁle.txt"#, r#"dia\ｆｕｌｌ.txt"#, r#"ext\a.txt"#, r#"ext\b.TXT"#, r#"ext\dir.txt"#, r#"ext\q.Txt"#, r#"len\lllllllllllllllllllllllll.txt"#, r#"len\😀.txt"#, r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a(b).txt"#, r#"p\a,b.txt"#, r#"p\a1b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\aéb.txt"#, r#"p\áb.txt"#, r#"p\aאb.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#, r#"p\a　b.txt"#, r#"words\!bang.txt"#, r#"words\123ever.txt"#, r#"words\a+b.txt"#, r#"words\ab12cd.txt"#, r#"words\camelCaseEver.txt"#, r#"words\ever's.txt"#, r#"words\ever-and-ever.txt"#, r#"words\ever.txt"#, r#"words\ever123.txt"#, r#"words\everest.txt"#, r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#, r#"words\foot.txt"#, r#"words\forever.txt"#, r#"words\gray.txt"#, r#"words\grey.txt"#, r#"words\hosts.txt"#, r#"words\never.txt"#, r#"words\spider man.txt"#, r#"words\spider-man.txt"#, r#"words\spider.man.txt"#, r#"words\spider_man.txt"#, r#"words\spiderman.txt"#, r#"words\wow!.txt"#, r#"words\x(1).txt"#]),
     (r#"L7"#, r#"ww:*ever"#, &[]),
@@ -443,6 +444,7 @@ const GOLDEN: &[(&str, &str, &[&str])] = &[
     (r#"L7"#, r#"prefix:man"#, &[r#"words\spider man.txt"#, r#"words\spider-man.txt"#, r#"words\spider.man.txt"#, r#"words\spider_man.txt"#]),
     (r#"L7"#, r#"prefix:foo"#, &[r#"case1\Foo.txt"#, r#"case2\FOO.TXT"#, r#"case3\foo.txt"#, r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#, r#"words\foot.txt"#]),
     (r#"L7"#, r#"prefix:bar"#, &[r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#]),
+    (r#"L7"#, r#"prefix:ab"#, &[r#"len\l10.abcdef"#, r#"len\l7.abcd"#, r#"p\áb.txt"#, r#"words\ab12cd.txt"#]),
     (r#"L7"#, r#"prefix:12"#, &[r#"words\123ever.txt"#]),
     (r#"L7"#, r#"prefix:case"#, &[r#"case1"#, r#"case2"#, r#"case3"#]),
     (r#"L7"#, r#"suffix:ever"#, &[r#"words\123ever.txt"#, r#"words\camelCaseEver.txt"#, r#"words\ever's.txt"#, r#"words\ever-and-ever.txt"#, r#"words\ever.txt"#, r#"words\forever.txt"#, r#"words\never.txt"#]),
@@ -459,6 +461,7 @@ const GOLDEN: &[(&str, &str, &[&str])] = &[
     (r#"L7"#, r#"nopunc:nows:spiderman"#, &[r#"words\spider man.txt"#, r#"words\spider-man.txt"#, r#"words\spider.man.txt"#, r#"words\spider_man.txt"#, r#"words\spiderman.txt"#]),
     (r#"L7"#, r#"nopunc:foobar"#, &[r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#]),
     (r#"L7"#, r#"nows:foobar"#, &[r#"words\foo bar.txt"#, r#"words\foobar.txt"#]),
+    (r#"L7"#, r#"nopunc:ab"#, &[r#"len\l10.abcdef"#, r#"len\l7.abcd"#, r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a(b).txt"#, r#"p\a,b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\áb.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#, r#"words\a+b.txt"#, r#"words\ab12cd.txt"#]),
     (r#"L7"#, r#"len:7 \len\"#, &[r#"len\l7.abcd"#]),
     (r#"L7"#, r#"len:10 \len\"#, &[r#"len\l10.abcdef"#]),
     (r#"L7"#, r#"len:>20 \len\"#, &[r#"len\lllllllllllllllllllllllll.txt"#]),
@@ -711,10 +714,14 @@ const GOLDEN: &[(&str, &str, &[&str])] = &[
     (r#"L7"#, r#"dm:202611 \d2\"#, &[r#"d2\fut10d.txt"#, r#"d2\fut3d.txt"#, r#"d2\mon1109.txt"#, r#"d2\rel2h.txt"#, r#"d2\rel6d12h.txt"#, r#"d2\rel7d1h.txt"#, r#"d2\sat1107.txt"#, r#"d2\sun1108.txt"#, r#"d2\thu1105.txt"#, r#"d2\wed1104.txt"#]),
     (r#"L7"#, r#"dm:261104 \d2\"#, &[r#"d2\wed1104.txt"#]),
     (r#"L7"#, r#"dm:20261104 \d2\"#, &[r#"d2\wed1104.txt"#]),
+    (r#"L7"#, r#"nopunc:ab \p\"#, &[r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a(b).txt"#, r#"p\a,b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\áb.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#]),
+    (r#"L7"#, r#"nows:ab \p\"#, &[r#"p\a b.txt"#, r#"p\áb.txt"#, r#"p\a　b.txt"#]),
+    (r#"L7"#, r#"nopunc:nows:ab \p\"#, &[r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a(b).txt"#, r#"p\a,b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\áb.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#, r#"p\a　b.txt"#]),
     (r#"L7"#, r#"ww:a \p\"#, &[r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a(b).txt"#, r#"p\a,b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#, r#"p\a　b.txt"#]),
     (r#"L7"#, r#"ww:b \p\"#, &[r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a(b).txt"#, r#"p\a,b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#, r#"p\a　b.txt"#]),
     (r#"L7"#, r#"prefix:b \p\"#, &[r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a(b).txt"#, r#"p\a,b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#, r#"p\a　b.txt"#]),
     (r#"L7"#, r#"suffix:a \p\"#, &[r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a(b).txt"#, r#"p\a,b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#, r#"p\a　b.txt"#]),
+    (r#"L7"#, r#"ww:ab \p\"#, &[r#"p\áb.txt"#]),
     (r#"L7"#, r#"len:7 \p\"#, &[r#"p\a#b.txt"#, r#"p\a$b.txt"#, r#"p\a%b.txt"#, r#"p\a&b.txt"#, r#"p\a'b.txt"#, r#"p\a,b.txt"#, r#"p\a1b.txt"#, r#"p\a;b.txt"#, r#"p\a=b.txt"#, r#"p\a@b.txt"#, r#"p\a[b.txt"#, r#"p\a^b.txt"#, r#"p\a`b.txt"#, r#"p\a{b.txt"#, r#"p\a~b.txt"#, r#"p\a b.txt"#, r#"p\a©b.txt"#, r#"p\a·b.txt"#, r#"p\aéb.txt"#, r#"p\áb.txt"#, r#"p\aאb.txt"#, r#"p\a—b.txt"#, r#"p\a€b.txt"#, r#"p\a　b.txt"#]),
     (r#"L7"#, r#"len:8 \p\"#, &[r#"p\a(b).txt"#]),
     (r#"L7"#, r#"size:<1kb dm:>2020 \size\"#, &[r#"size\s0.bin"#, r#"size\s1.bin"#, r#"size\s1023.bin"#]),
@@ -772,6 +779,7 @@ const GOLDEN: &[(&str, &str, &[&str])] = &[
     (r#"L7"#, r#"dm:tuesday \d2\"#, &[r#"d2\rel2h.txt"#]),
     (r#"L7"#, r#"ext:exe \ext\"#, &[r#"ext\e.exe"#]),
     (r#"L7"#, r#"nopunc:a.b \p\"#, &[]),
+    (r#"L7"#, r#"nopunc:"a b" \p\"#, &[r#"p\a b.txt"#, r#"p\a　b.txt"#]),
     (r#"L7"#, r#"nopunc:a_b \p\"#, &[]),
     (r#"L7"#, r#"size:1.6kb \size\"#, &[]),
     (r#"L7"#, r#"size:1.56kb \size\"#, &[r#"size\s1600.bin"#]),
@@ -1118,18 +1126,187 @@ const REFUSED: &[(&str, usize)] = &[
 const DIFFERENT: &[(&str, &str)] = &[
     (r#"case: Foo"#, r#"bare case: and case:1 are goz's whole-query switch (DESIGN.md §3.1); Everything reads bare case: as nothing and case:1 as text"#),
     (r#"case:1 Foo"#, r#"bare case: and case:1 are goz's whole-query switch (DESIGN.md §3.1); Everything reads bare case: as nothing and case:1 as text"#),
-    (r#"ww:ab"#, r#"the answer holds a name with an accent the query lacks, which Everything folds and goz leaves to step S3 (DESIGN.md §10)"#),
-    (r#"prefix:ab"#, r#"the answer holds a name with an accent the query lacks, which Everything folds and goz leaves to step S3 (DESIGN.md §10)"#),
-    (r#"nopunc:ab"#, r#"the answer holds a name with an accent the query lacks, which Everything folds and goz leaves to step S3 (DESIGN.md §10)"#),
     (r#"dm:mon \d2\"#, r#"dm:mon: a live Everything reads mon as one month; goz as Monday, as the docs list it (DESIGN.md §3.7)"#),
-    (r#"nopunc:ab \p\"#, r#"the answer holds a name with an accent the query lacks, which Everything folds and goz leaves to step S3 (DESIGN.md §10)"#),
-    (r#"nows:ab \p\"#, r#"the answer holds a name with an accent the query lacks, which Everything folds and goz leaves to step S3 (DESIGN.md §10)"#),
-    (r#"nopunc:nows:ab \p\"#, r#"the answer holds a name with an accent the query lacks, which Everything folds and goz leaves to step S3 (DESIGN.md §10)"#),
     (r#"nopunc:a-b \p\"#, r#"Everything matches an em dash with a hyphen under nopunc:; goz compares them as the characters they are"#),
-    (r#"ww:ab \p\"#, r#"the answer holds a name with an accent the query lacks, which Everything folds and goz leaves to step S3 (DESIGN.md §10)"#),
-    (r#"nopunc:"a b" \p\"#, r#"Everything folds a no-break and an ideographic space to a space (NFKD), which goz leaves to step S3 (DESIGN.md §10)"#),
     (r#"size:<10 \ext\"#, r#"Everything sums folder sizes, goz does not: a folder matches no size: term (DESIGN.md §2.4 #51)"#),
     (r#"len:7;10 \len\"#, r#"len:7;10: a live Everything reads only the first value of a length list; goz reads every value, as for size:"#),
     (r#"dm:mon..wed \d2\"#, r#"dm:mon: a live Everything reads mon as one month; goz as Monday, as the docs list it (DESIGN.md §3.7)"#),
     (r#"dm:>=mon \d2\"#, r#"dm:mon: a live Everything reads mon as one month; goz as Monday, as the docs list it (DESIGN.md §3.7)"#),
+];
+
+/// Everything's answers to `regex:` and to accents (batteries 1-3, DESIGN.md
+/// §9 and §10), each compared within `folders`, whose entries were all there
+/// when its battery ran (a battery 3 answer, within every folder).
+#[test]
+fn regex_and_accents_as_everything_matches_them() {
+    let idx = volume();
+    let mut failures = Vec::new();
+    for &(at, folders, query, want) in ACCENTS_AND_REGEX {
+        let within = |path: &str| {
+            folders.is_empty()
+                || folders
+                    .iter()
+                    .any(|f| path == *f || path.starts_with(&format!("{f}\\")))
+        };
+        let want: BTreeSet<String> = want
+            .iter()
+            .map(|p| p.to_string())
+            .filter(|p| within(p))
+            .collect();
+        let parsed = match parse_query_at(query, false, &L7) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                failures.push(format!("{at} {query}: {e}"));
+                continue;
+            }
+        };
+        let out = run_query(&idx, PREFIX, &parsed, None, SortSpec::default(), 0, None);
+        let got: BTreeSet<String> = out
+            .hits
+            .iter()
+            .map(|h| below_fx(&String::from_utf8_lossy(&h.path)))
+            .filter(|p| within(p))
+            .collect();
+        if got != want {
+            let missing: Vec<&String> = want.difference(&got).collect();
+            let extra: Vec<&String> = got.difference(&want).collect();
+            failures.push(format!(
+                "{at} {query}: missing {missing:?}, extra {extra:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} differ:\n{}",
+        failures.len(),
+        ACCENTS_AND_REGEX.len(),
+        failures.join("\n")
+    );
+}
+
+/// The folders whose entries batteries 1 and 2 saw.
+const OLD: &[&str] = &[
+    "case1", "case2", "case3", "dates", "desktop", "dia", "len", "w", "words", "ext",
+];
+
+/// Where Everything answered, the folders to compare within (none: all),
+/// the query, and the entries it found, below `fx`.
+#[rustfmt::skip]
+const ACCENTS_AND_REGEX: &[(&str, &[&str], &str, &[&str])] = &[
+    (r#"L1:169"#, OLD, r#"cafe"#, &[r#"dia\CAFÉ2.txt"#, r#"dia\cafe.txt"#, r#"dia\cafénfd.txt"#, r#"dia\café.txt"#]),
+    (r#"L1:170"#, OLD, r#"café"#, &[r#"dia\CAFÉ2.txt"#, r#"dia\cafe.txt"#, r#"dia\cafénfd.txt"#, r#"dia\café.txt"#]),
+    (r#"L1:171"#, OLD, r#"CAFÉ"#, &[r#"dia\CAFÉ2.txt"#, r#"dia\cafe.txt"#, r#"dia\cafénfd.txt"#, r#"dia\café.txt"#]),
+    (r#"L1:175"#, OLD, r#"nodiacritics:café"#, &[r#"dia\CAFÉ2.txt"#, r#"dia\cafe.txt"#, r#"dia\cafénfd.txt"#, r#"dia\café.txt"#]),
+    (r#"L1:176"#, OLD, r#"strasse"#, &[r#"dia\Straße.txt"#, r#"dia\strasse.txt"#]),
+    (r#"L1:177"#, OLD, r#"straße"#, &[r#"dia\Straße.txt"#, r#"dia\strasse.txt"#]),
+    (r#"L1:178"#, OLD, r#"ss \dia\"#, &[r#"dia\Straße.txt"#, r#"dia\strasse.txt"#, r#"dia\ẞ3.txt"#]),
+    (r#"L1:179"#, OLD, r#"ß"#, &[r#"dia\Straße.txt"#, r#"dia\strasse.txt"#, r#"dia\ẞ3.txt"#]),
+    (r#"L1:180"#, OLD, r#"ẞ"#, &[r#"dia\Straße.txt"#, r#"dia\strasse.txt"#, r#"dia\ẞ3.txt"#]),
+    (r#"L1:181"#, OLD, r#"diacritics:straße"#, &[r#"dia\Straße.txt"#]),
+    (r#"L1:182"#, OLD, r#"diacritics:strasse"#, &[r#"dia\strasse.txt"#]),
+    (r#"L1:183"#, OLD, r#"ae \dia\"#, &[r#"dia\aeble.txt"#, r#"dia\Æble2.txt"#, r#"dia\æble.txt"#]),
+    (r#"L1:184"#, OLD, r#"æ"#, &[r#"dia\aeble.txt"#, r#"dia\Æble2.txt"#, r#"dia\æble.txt"#]),
+    (r#"L1:185"#, OLD, r#"aeble"#, &[r#"dia\aeble.txt"#, r#"dia\Æble2.txt"#, r#"dia\æble.txt"#]),
+    (r#"L1:186"#, OLD, r#"æble"#, &[r#"dia\aeble.txt"#, r#"dia\Æble2.txt"#, r#"dia\æble.txt"#]),
+    (r#"L1:187"#, OLD, r#"oe \dia\"#, &[r#"dia\oeuvre.txt"#, r#"dia\œuvre.txt"#]),
+    (r#"L1:188"#, OLD, r#"œ"#, &[r#"dia\oeuvre.txt"#, r#"dia\œuvre.txt"#, r#"ext\noext"#]),
+    (r#"L1:189"#, OLD, r#"soren"#, &[r#"dia\soren.txt"#, r#"dia\søren.txt"#]),
+    (r#"L1:190"#, OLD, r#"søren"#, &[r#"dia\soren.txt"#, r#"dia\søren.txt"#]),
+    (r#"L1:191"#, OLD, r#"lodz"#, &[r#"dia\lodz.txt"#, r#"dia\łodź.txt"#]),
+    (r#"L1:192"#, OLD, r#"łódź"#, &[r#"dia\lodz.txt"#, r#"dia\łodź.txt"#]),
+    (r#"L1:193"#, OLD, r#"dak"#, &[r#"dia\dak.txt"#, r#"dia\đak.txt"#]),
+    (r#"L1:194"#, OLD, r#"đak"#, &[r#"dia\dak.txt"#, r#"dia\đak.txt"#]),
+    (r#"L1:195"#, OLD, r#"kirmizi"#, &[r#"dia\kirmizi.txt"#, r#"dia\kırmızı.txt"#]),
+    (r#"L1:196"#, OLD, r#"kırmızı"#, &[r#"dia\kirmizi.txt"#, r#"dia\kırmızı.txt"#]),
+    (r#"L1:197"#, OLD, r#"istanbul"#, &[r#"dia\istanbul.txt"#, r#"dia\İstanbul.txt"#]),
+    (r#"L1:198"#, OLD, r#"İstanbul"#, &[r#"dia\istanbul.txt"#, r#"dia\İstanbul.txt"#]),
+    (r#"L1:199"#, OLD, r#"cag"#, &[r#"dia\cag.txt"#, r#"dia\çağ.txt"#]),
+    (r#"L1:200"#, OLD, r#"çağ"#, &[r#"dia\cag.txt"#, r#"dia\çağ.txt"#]),
+    (r#"L1:201"#, OLD, r#"file \dia\"#, &[r#"dia\file.txt"#, r#"dia\ﬁle.txt"#]),
+    (r#"L1:202"#, OLD, r#"ﬁle"#, &[r#"dia\file.txt"#, r#"dia\ﬁle.txt"#]),
+    (r#"L1:203"#, OLD, r#"full"#, &[r#"dia\full.txt"#, r#"dia\ｆｕｌｌ.txt"#]),
+    (r#"L1:204"#, OLD, r#"ｆｕｌｌ"#, &[r#"dia\full.txt"#, r#"dia\ｆｕｌｌ.txt"#]),
+    (r#"L1:205"#, OLD, r#"x2y"#, &[r#"dia\x2y.txt"#, r#"dia\x²y.txt"#]),
+    (r#"L1:206"#, OLD, r#"x²y"#, &[r#"dia\x2y.txt"#, r#"dia\x²y.txt"#]),
+    (r#"L1:207"#, OLD, r#"ano"#, &[r#"dia\ano.txt"#, r#"dia\año.txt"#]),
+    (r#"L1:208"#, OLD, r#"año"#, &[r#"dia\ano.txt"#, r#"dia\año.txt"#]),
+    (r#"L1:209"#, OLD, r#"αλφα"#, &[r#"dia\άλφα.txt"#, r#"dia\αλφα.txt"#]),
+    (r#"L1:210"#, OLD, r#"άλφα"#, &[r#"dia\άλφα.txt"#, r#"dia\αλφα.txt"#]),
+    (r#"L1:211"#, OLD, r#"pho"#, &[r#"dia\pho.txt"#, r#"dia\phở.txt"#]),
+    (r#"L1:212"#, OLD, r#"phở"#, &[r#"dia\pho.txt"#, r#"dia\phở.txt"#]),
+    (r#"L1:213"#, OLD, r#"naive"#, &[r#"dia\naive.txt"#, r#"dia\naïve.txt"#]),
+    (r#"L1:214"#, OLD, r#"naïve"#, &[r#"dia\naive.txt"#, r#"dia\naïve.txt"#]),
+    (r#"L1:215"#, OLD, r#"q \dia\"#, &[r#"dia\q.txt"#, r#"dia\q́.txt"#]),
+    (r#"L1:216"#, OLD, r#"thdr"#, &[r#"dia\thdr.txt"#, r#"dia\þðr.txt"#]),
+    (r#"L1:217"#, OLD, r#"þðr"#, &[r#"dia\thdr.txt"#, r#"dia\þðr.txt"#]),
+    (r#"L1:218"#, OLD, r#"th \dia\"#, &[r#"dia\thdr.txt"#, r#"dia\þðr.txt"#]),
+    (r#"L1:220"#, OLD, r#"case:Café"#, &[]),
+    (r#"L1:224"#, OLD, r#"caf?.txt"#, &[r#"dia\cafe.txt"#, r#"dia\café.txt"#]),
+    (r#"L1:225"#, OLD, r#"caf?nfd.txt"#, &[r#"dia\cafénfd.txt"#]),
+    (r#"L1:226"#, OLD, r#"café* \dia\"#, &[r#"dia\CAFÉ2.txt"#, r#"dia\cafe.txt"#, r#"dia\cafénfd.txt"#, r#"dia\café.txt"#]),
+    (r#"L1:413"#, OLD, r#"regex:^foo"#, &[r#"case1\Foo.txt"#, r#"case2\FOO.TXT"#, r#"case3\foo.txt"#, r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#, r#"words\foot.txt"#]),
+    (r#"L1:414"#, OLD, r#"regex:^foo|^ever"#, &[r#"case1\Foo.txt"#, r#"case2\FOO.TXT"#, r#"case3\foo.txt"#, r#"words\ever's.txt"#, r#"words\ever-and-ever.txt"#, r#"words\ever.txt"#, r#"words\ever123.txt"#, r#"words\everest.txt"#, r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#, r#"words\foot.txt"#]),
+    (r#"L1:415"#, OLD, r#"regex:^foo |ever"#, &[r#"case1\Foo.txt"#, r#"case2\FOO.TXT"#, r#"case3\foo.txt"#, r#"words\123ever.txt"#, r#"words\camelCaseEver.txt"#, r#"words\ever's.txt"#, r#"words\ever-and-ever.txt"#, r#"words\ever.txt"#, r#"words\ever123.txt"#, r#"words\everest.txt"#, r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#, r#"words\foot.txt"#, r#"words\forever.txt"#, r#"words\never.txt"#]),
+    (r#"L1:416"#, OLD, r#"regex:^foo | ever"#, &[r#"case1\Foo.txt"#, r#"case2\FOO.TXT"#, r#"case3\foo.txt"#, r#"words\123ever.txt"#, r#"words\camelCaseEver.txt"#, r#"words\ever's.txt"#, r#"words\ever-and-ever.txt"#, r#"words\ever.txt"#, r#"words\ever123.txt"#, r#"words\everest.txt"#, r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#, r#"words\foot.txt"#, r#"words\forever.txt"#, r#"words\never.txt"#]),
+    (r#"L1:417"#, OLD, r#"regex:"^foo bar""#, &[r#"words\foo bar.txt"#]),
+    (r#"L1:418"#, OLD, r#"regex:^Foo"#, &[r#"case1\Foo.txt"#, r#"case2\FOO.TXT"#, r#"case3\foo.txt"#, r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#, r#"words\foot.txt"#]),
+    (r#"L1:419"#, OLD, r#"case:regex:^Foo"#, &[r#"case1\Foo.txt"#]),
+    (r#"L1:420"#, OLD, r#"regex:spider.man"#, &[r#"words\spider man.txt"#, r#"words\spider-man.txt"#, r#"words\spider.man.txt"#, r#"words\spider_man.txt"#]),
+    (r#"L1:421"#, OLD, r#"regex:\.TXT$ \ext\"#, &[r#"ext\a.txt"#, r#"ext\b.TXT"#, r#"ext\dir.txt"#, r#"ext\q.Txt"#]),
+    (r#"L1:422"#, OLD, r#"regex:windows\\cmd"#, &[r#"w\windows\cmd.exe"#]),
+    (r#"L1:423"#, OLD, r#"path:regex:windows\\cmd"#, &[r#"w\windows\cmd.exe"#]),
+    (r#"L1:424"#, OLD, r#"regex:^c.*\.exe$"#, &[r#"w\mywindows\c.exe"#, r#"w\windows\cmd.exe"#, r#"w\windows\system32\cmd.exe"#]),
+    (r#"L1:425"#, OLD, r#"regex:caf."#, &[r#"dia\CAFÉ2.txt"#, r#"dia\cafe.txt"#, r#"dia\cafénfd.txt"#, r#"dia\café.txt"#]),
+    (r#"L1:426"#, OLD, r#"regex:^ca.e"#, &[r#"case1"#, r#"case2"#, r#"case3"#, r#"dia\cafe.txt"#, r#"dia\cafénfd.txt"#, r#"words\camelCaseEver.txt"#]),
+    (r#"L1:429"#, OLD, r#"regex*:^foo bar$"#, &[]),
+    (r#"L1:430"#, OLD, r#"regex:^foo bar"#, &[r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#]),
+    (r#"L1:431"#, OLD, r#"regex:[^\x00-\x7f]"#, &[r#"dia\CAFÉ2.txt"#, r#"dia\Straße.txt"#, r#"dia\año.txt"#, r#"dia\cafénfd.txt"#, r#"dia\café.txt"#, r#"dia\kırmızı.txt"#, r#"dia\naïve.txt"#, r#"dia\phở.txt"#, r#"dia\q́.txt"#, r#"dia\søren.txt"#, r#"dia\x²y.txt"#, r#"dia\Æble2.txt"#, r#"dia\æble.txt"#, r#"dia\çağ.txt"#, r#"dia\þðr.txt"#, r#"dia\đak.txt"#, r#"dia\İstanbul.txt"#, r#"dia\łodź.txt"#, r#"dia\œuvre.txt"#, r#"dia\άλφα.txt"#, r#"dia\αλφα.txt"#, r#"dia\ẞ3.txt"#, r#"dia\ﬁle.txt"#, r#"dia\ｆｕｌｌ.txt"#, r#"len\😀.txt"#]),
+    (r#"L1:432"#, OLD, r#"regex:é"#, &[r#"dia\CAFÉ2.txt"#, r#"dia\café.txt"#]),
+    (r#"L1:434"#, OLD, r#"diacritics:regex:caf.\."#, &[r#"dia\cafe.txt"#, r#"dia\café.txt"#]),
+    (r#"L2:163"#, OLD, r#"regex:^a\. \ext\"#, &[r#"ext\a.txt"#]),
+    (r#"L2:164"#, OLD, r#"regex:^(?i)A \ext\"#, &[r#"ext\a.txt"#]),
+    (r#"L2:165"#, OLD, r#"regex:(?-i)^A \ext\"#, &[]),
+    (r#"L2:166"#, OLD, r#"nocase:regex:^A \ext\"#, &[r#"ext\a.txt"#]),
+    (r#"L2:167"#, OLD, r#"case:regex:^a \ext\"#, &[r#"ext\a.txt"#]),
+    (r#"L2:168"#, OLD, r#"regex:\\words\\e \words\"#, &[r#"words\ever's.txt"#, r#"words\ever-and-ever.txt"#, r#"words\ever.txt"#, r#"words\ever123.txt"#, r#"words\everest.txt"#]),
+    (r#"L2:169"#, OLD, r#"path:regex:fx\\words\\ever"#, &[r#"words\ever's.txt"#, r#"words\ever-and-ever.txt"#, r#"words\ever.txt"#, r#"words\ever123.txt"#, r#"words\everest.txt"#]),
+    (r#"L2:170"#, OLD, r#"regex:^.{5}$ \words\"#, &[r#"words\hosts"#]),
+    (r#"L3:1"#, &[], r#"hal \dia3\"#, &[r#"dia3\hal.txt"#, r#"dia3\ħal.txt"#]),
+    (r#"L3:2"#, &[], r#"ħal"#, &[r#"dia3\hal.txt"#, r#"dia3\ħal.txt"#]),
+    (r#"L3:3"#, &[], r#"tar \dia3\"#, &[r#"dia3\tarx.txt"#, r#"dia3\ŧar.txt"#]),
+    (r#"L3:4"#, &[], r#"ŧar"#, &[r#"dia3\tarx.txt"#, r#"dia3\ŧar.txt"#, r#"ext\c.tar.gz"#]),
+    (r#"L3:5"#, &[], r#"na \dia3\"#, &[r#"dia3\na.txt"#, r#"dia3\ŋa.txt"#]),
+    (r#"L3:6"#, &[], r#"ŋa"#, &[r#"dia3\na.txt"#, r#"dia3\ŋa.txt"#, r#"dia\naive.txt"#, r#"dia\naïve.txt"#]),
+    (r#"L3:7"#, &[], r#"ijs"#, &[r#"dia3\ijs.txt"#, r#"dia3\ĳs.txt"#]),
+    (r#"L3:8"#, &[], r#"ĳs"#, &[r#"dia3\ijs.txt"#, r#"dia3\ĳs.txt"#]),
+    (r#"L3:9"#, &[], r#"sun \dia3\"#, &[r#"dia3\sun.txt"#, r#"dia3\ſun.txt"#]),
+    (r#"L3:10"#, &[], r#"ſun"#, &[r#"d2\sun1108.txt"#, r#"dia3\sun.txt"#, r#"dia3\ſun.txt"#]),
+    (r#"L3:11"#, &[], r#"eb \dia3\"#, &[r#"dia3\eb.txt"#]),
+    (r#"L3:12"#, &[], r#"əb"#, &[r#"dia3\əb.txt"#]),
+    (r#"L3:13"#, &[], r#"иод"#, &[r#"dia3\иод.txt"#, r#"dia3\йод.txt"#]),
+    (r#"L3:14"#, &[], r#"йод"#, &[r#"dia3\иод.txt"#, r#"dia3\йод.txt"#]),
+    (r#"L3:15"#, &[], r#"diacritics:йод"#, &[r#"dia3\йод.txt"#]),
+    (r#"L3:16"#, &[], r#"еж"#, &[r#"dia3\еж.txt"#, r#"dia3\ёж.txt"#]),
+    (r#"L3:17"#, &[], r#"ёж"#, &[r#"dia3\еж.txt"#, r#"dia3\ёж.txt"#]),
+    (r#"L3:18"#, &[], r#"ασ"#, &[r#"dia3\ας.txt"#, r#"dia3\ασ.txt"#]),
+    (r#"L3:19"#, &[], r#"ας"#, &[r#"dia3\ας.txt"#, r#"dia3\ασ.txt"#]),
+    (r#"L3:20"#, &[], r#"la \dia3\"#, &[r#"dia3\la.txt"#, r#"dia3\ŀa.txt"#]),
+    (r#"L3:22"#, &[], r#"dzx"#, &[r#"dia3\dzx.txt"#, r#"dia3\ǆx.txt"#]),
+    (r#"L3:23"#, &[], r#"ǆx"#, &[r#"dia3\dzx.txt"#, r#"dia3\ǆx.txt"#]),
+    (r#"L3:34"#, &[], r#"regex:"foo|bar" \words\"#, &[r#"words\foo bar.txt"#, r#"words\foo-bar.txt"#, r#"words\foo_bar.txt"#, r#"words\foobar.txt"#, r#"words\foot.txt"#]),
+];
+
+/// Queries of the same batteries whose answer differs, and why.
+#[rustfmt::skip]
+#[allow(dead_code)]
+const ACCENTS_AND_REGEX_DIFFERENT: &[(&str, &str, &str)] = &[
+    (r#"L1:172"#, r#"diacritics:cafe"#, r#"Everything compares raw code points under diacritics:, so the decomposed name holds cafe; goz folds NFC and NFD alike (DESIGN.md §3.4)"#),
+    (r#"L1:173"#, r#"diacritics:café"#, r#"Everything compares raw code points under diacritics:, so the decomposed name lacks é; goz folds NFC and NFD alike (DESIGN.md §3.4)"#),
+    (r#"L1:174"#, r#"diac:café"#, r#"Everything compares raw code points under diacritics:, so the decomposed name lacks é; goz folds NFC and NFD alike (DESIGN.md §3.4)"#),
+    (r#"L1:219"#, r#"case:café"#, r#"case: in goz compares the name as stored, accents included; Everything's case: still ignores accents (DESIGN.md §3.5)"#),
+    (r#"L1:221"#, r#"case:cafe"#, r#"case: in goz compares the name as stored, accents included; Everything's case: still ignores accents (DESIGN.md §3.5)"#),
+    (r#"L1:222"#, r#"case:CAFE"#, r#"case: in goz compares the name as stored, accents included; Everything's case: still ignores accents (DESIGN.md §3.5)"#),
+    (r#"L1:427"#, r#"regex:(a|b) \ext\"#, r#"the fixture's ext folder gained xexe.dat after battery 1 ran"#),
+    (r#"L1:428"#, r#"regex:\d{3}"#, r#"Everything lists its folder index's root by its full path, which holds digits; goz's root is the volume's"#),
+    (r#"L3:21"#, r#"ŀa"#, r#"Everything lists its folder index's root by its full path, which holds la; goz's root is the volume's"#),
 ];

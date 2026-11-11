@@ -19,6 +19,7 @@ mod lex;
 pub mod parse;
 #[cfg(test)]
 mod parse_v060;
+mod pattern;
 mod text;
 mod value;
 
@@ -38,3 +39,4 @@ pub use parse::{
     Filters, Kind, ParsedQuery, QueryError, SizeRange, Wildcard, parse_query, parse_query_at,
     parse_query_with_case,
 };
+pub use pattern::RegexTerm;

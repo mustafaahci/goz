@@ -160,8 +160,8 @@ fn malformed_search_text_exits_4() {
         (&["-argv", "<a|b"][..], "goz: unbalanced '<' at column 1"),
         (&["gr<a|e>y"][..], "group expansion such as gr<a|e>y"),
         (
-            &["!regex:x"][..],
-            "unknown search function or modifier 'regex:'",
+            &["!content:x"][..],
+            "unknown search function or modifier 'content:'",
         ),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_goz"))

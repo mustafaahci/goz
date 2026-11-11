@@ -22,7 +22,9 @@
 //! folder.
 //!
 //! Search modifiers prefix a term or a group and say how its text matches:
-//! `case:`, `path:`, `ww:` (whole words), `prefix:` and `suffix:` (word
+//! `case:`, `diacritics:` (accents count; by default they do not),
+//! `regex:` (the text is a regular expression, see the `pattern` module),
+//! `path:`, `ww:` (whole words), `prefix:` and `suffix:` (word
 //! starts and ends), `whole:`, `startwith:`, `endwith:`, `nopunc:` and
 //! `nows:` (skip punctuation or white space in the name), `starall:`,
 //! `nowildcards:`, `metric:`, each with Everything's aliases and `no`
@@ -43,16 +45,19 @@
 //! so that a query with no new syntax is exactly the query goz has always
 //! built.
 //!
-//! Terms are folded at parse time unless they match case, so the engine
-//! compares candidate data against ready-to-use needles. A `dm:` value is
+//! Terms are folded at parse time unless they match case (with
+//! [`crate::fold::fold`], or [`crate::fold::fold_exact`] under
+//! `diacritics:`), so the engine compares candidate data against
+//! ready-to-use needles. A `dm:` value is
 //! resolved here too, to FILETIME bounds, against the [`LocalClock`] the
 //! query is parsed with.
 
 use super::dates::{DateFilter, LocalClock, date_filter};
 use super::expr::{self, Anchors, Expr, Leaf, LenOf, Skip, Target};
 use super::lex::{self, Func, Macro, ModSet, Prefix, Text, Tok, Token};
+use super::pattern::RegexTerm;
 use super::value::{self, Number};
-use crate::fold::fold;
+use crate::fold::{fold, fold_exact};
 
 pub use super::glob::{CodePointBuf, Wildcard};
 
@@ -136,9 +141,10 @@ pub enum QueryError {
     #[error(
         "unknown search function or modifier '{0}'; goz supports ext:, extension:, size:, dm:, \
          len:, parent:, ancestor:, name:, stem:, full-path:, location:, parent-name:, the macros \
-         audio:, zip:, doc:, exe:, image: and video:, and the modifiers case:, path:, file:, \
-         folder:, ww:, prefix:, suffix:, whole:, startwith:, endwith:, nopunc:, nows:, starall:, \
-         nowildcards: and metric: (each with Everything's aliases and no- forms), and matchpath:"
+         audio:, zip:, doc:, exe:, image: and video:, and the modifiers case:, diacritics:, \
+         regex:, path:, file:, folder:, ww:, prefix:, suffix:, whole:, startwith:, endwith:, \
+         nopunc:, nows:, starall:, nowildcards: and metric: (each with Everything's aliases and \
+         no- forms), and matchpath:"
     )]
     UnknownFunction(String),
     /// A `dm:` term in a query parsed without a [`LocalClock`] to resolve it.
@@ -158,6 +164,11 @@ pub enum QueryError {
     /// Groups and prefixes nested more than 64 deep.
     #[error("the query nests groups and prefixes more than {MAX_DEPTH} deep")]
     TooDeep,
+    /// A `regex:` pattern the `regex` crate refuses (look-around,
+    /// backreferences, a syntax error, a pattern too large), with its
+    /// reason.
+    #[error("bad regular expression {pattern:?}: {detail}")]
+    BadRegex { pattern: String, detail: String },
 }
 
 fn unbalanced(what: &char, column: &usize) -> String {
@@ -174,6 +185,10 @@ fn unbalanced(what: &char, column: &usize) -> String {
 /// and this cap bounds the work on each candidate, so the budget is checked
 /// often. Real queries use a few terms.
 const MAX_QUERY_TERMS: usize = 256;
+
+/// The most `regex:` terms one query may hold. Each is a regular expression
+/// matched against every name it tests, the costliest test a term makes.
+const MAX_REGEX_TERMS: usize = 32;
 
 /// How deep groups and prefixes may nest. Each level is a frame of the
 /// parser and of every walk of the expression, and the text arrives from the
@@ -257,6 +272,15 @@ fn parse(
     let terms = term_count(&q);
     if terms > MAX_QUERY_TERMS {
         return Err(QueryError::TooManyTerms(terms));
+    }
+    let regexes = q.expr.as_ref().map_or(0, expr::regex_terms);
+    if regexes > MAX_REGEX_TERMS {
+        return Err(QueryError::Malformed {
+            what: "regex:",
+            detail: format!(
+                "the query has {regexes} regex: terms; a query may have at most {MAX_REGEX_TERMS}"
+            ),
+        });
     }
     Ok(q)
 }
@@ -556,7 +580,7 @@ impl<'t> Parser<'t, '_> {
             Leaf::Drive(bytes[0].to_ascii_lowercase())
         } else {
             return Ok(with_kind(
-                self.term(None, bytes, text.literal_wild, set),
+                self.term(None, bytes, text.literal_wild, set)?,
                 mods,
                 token.global,
             ));
@@ -571,9 +595,40 @@ impl<'t> Parser<'t, '_> {
     /// make a wildcard, in quotes too, as in Everything, unless an `&ast:` or
     /// `&quest:` entity or `nowildcards:` made them literal; a wildcard
     /// matches the whole of its target, so the word and anchor modifiers do
-    /// not apply to it, as in Everything (`ww:ev*` is `ev*`).
-    fn term(&self, target: Option<Target>, bytes: &[u8], literal_wild: bool, set: ModSet) -> Expr {
+    /// not apply to it, as in Everything (`ww:ev*` is `ev*`). Under
+    /// `diacritics:` the text keeps its accents.
+    ///
+    /// Under `regex:` the text is a regular expression (see the `pattern`
+    /// module), on the name, or on the full path under `path:` or
+    /// `matchpath:` or when it holds an escaped separator, `\\`; no other
+    /// modifier but `case:` applies to it.
+    fn term(
+        &self,
+        target: Option<Target>,
+        bytes: &[u8],
+        literal_wild: bool,
+        set: ModSet,
+    ) -> Result<Expr, QueryError> {
         let case = set.case.unwrap_or(self.match_case);
+        if set.regex == Some(true) {
+            let target = target.unwrap_or_else(|| {
+                let escaped_separator = bytes.windows(2).any(|pair| pair == br"\\");
+                if set.path.unwrap_or(self.match_path || escaped_separator) {
+                    Target::FullPath
+                } else {
+                    Target::Name
+                }
+            });
+            if bytes.is_empty() && matches!(target, Target::Name | Target::FullPath) {
+                // An empty pattern matches every name and path.
+                return Ok(Expr::True);
+            }
+            return Ok(Expr::Leaf(Leaf::Regex {
+                target,
+                regex: RegexTerm::new(bytes, case)?,
+            }));
+        }
+        let diacritics = !case && set.diacritics == Some(true);
         let wildcard = set.wildcards != Some(false)
             && !literal_wild
             && bytes.iter().any(|&b| b == b'*' || b == b'?');
@@ -594,7 +649,7 @@ impl<'t> Parser<'t, '_> {
         {
             // Every entry has a name, a full path and a location, none
             // empty, and an empty value matches any text but the empty one.
-            return Expr::True;
+            return Ok(Expr::True);
         }
         let unslashed: Vec<u8> = if matches!(target, Target::FullPath | Target::Location) {
             bytes
@@ -604,21 +659,33 @@ impl<'t> Parser<'t, '_> {
         } else {
             bytes.to_vec()
         };
-        let text = if case { unslashed } else { fold(&unslashed) };
+        let text = if case {
+            unslashed
+        } else if diacritics {
+            fold_exact(&unslashed)
+        } else {
+            fold(&unslashed)
+        };
         if wildcard {
             let glob = if target == Target::FullPath {
                 Wildcard::sub_path(&text, set.star_all == Some(true))
             } else {
                 Wildcard::name(&text)
             };
-            return Expr::Leaf(Leaf::Glob { target, glob, case });
+            return Ok(Expr::Leaf(Leaf::Glob {
+                target,
+                glob,
+                case,
+                diacritics,
+            }));
         }
         let on = |o: Option<bool>| o == Some(true);
         let words = on(set.whole_words);
-        Expr::Leaf(Leaf::Text {
+        Ok(Expr::Leaf(Leaf::Text {
             target,
             needle: text,
             case,
+            diacritics,
             anchors: Anchors {
                 start: on(set.whole) || on(set.start_with),
                 end: on(set.whole) || on(set.end_with),
@@ -629,7 +696,7 @@ impl<'t> Parser<'t, '_> {
                 punct: on(set.skip_punct),
                 space: on(set.skip_space),
             },
-        })
+        }))
     }
 
     /// A function's value: a `;` list of values any one of which matches,
@@ -730,7 +797,7 @@ impl<'t> Parser<'t, '_> {
                 });
             }
         };
-        Ok(self.term(Some(target), item, literal_wild, set))
+        self.term(Some(target), item, literal_wild, set)
     }
 }
 
@@ -781,6 +848,7 @@ fn is_lone_separator(bytes: &[u8]) -> bool {
 /// list holds nothing else (`ext:;` is no extension, L2:107).
 fn ext_leaf(text: &Text, set: ModSet) -> Expr {
     let case = set.case.unwrap_or(false);
+    let diacritics = !case && set.diacritics == Some(true);
     let mut values: Vec<Vec<u8>> = Vec::new();
     let mut items: Vec<&[u8]> = text.items().collect();
     while items.len() > 1 && items.last().is_some_and(|i| i.is_empty()) {
@@ -791,7 +859,13 @@ fn ext_leaf(text: &Text, set: ModSet) -> Expr {
         if text.literal_wild && v.iter().any(|&b| b == b'*' || b == b'?') {
             continue;
         }
-        let v = if case { v.to_vec() } else { fold(v) };
+        let v = if case {
+            v.to_vec()
+        } else if diacritics {
+            fold_exact(v)
+        } else {
+            fold(v)
+        };
         if !values.contains(&v) {
             values.push(v);
         }
@@ -799,7 +873,11 @@ fn ext_leaf(text: &Text, set: ModSet) -> Expr {
     if values.is_empty() {
         Expr::False
     } else {
-        Expr::Leaf(Leaf::Ext { values, case })
+        Expr::Leaf(Leaf::Ext {
+            values,
+            case,
+            diacritics,
+        })
     }
 }
 
@@ -812,6 +890,7 @@ fn macro_ext(m: Macro) -> Expr {
             .map(|v| v.as_bytes().to_vec())
             .collect(),
         case: false,
+        diacritics: false,
     })
 }
 
@@ -860,6 +939,7 @@ mod tests {
         Expr::Leaf(Leaf::Ext {
             values: values.iter().map(|v| v.as_bytes().to_vec()).collect(),
             case: false,
+            diacritics: false,
         })
     }
 
@@ -1614,6 +1694,7 @@ mod tests {
             target,
             needle,
             case,
+            diacritics: false,
             anchors,
             skip,
         })
@@ -1899,7 +1980,8 @@ mod tests {
             ex("case:ext:TXT"),
             Expr::Leaf(Leaf::Ext {
                 values: vec![b"TXT".to_vec()],
-                case: true
+                case: true,
+                diacritics: false,
             })
         );
         assert_eq!(q("ext:TXT case:").filters.ext, Some(vec![b"txt".to_vec()]));
@@ -2319,6 +2401,17 @@ mod tests {
                     "?case:",
                     "ww:",
                     "regex:",
+                    "?regex:",
+                    "regex*:",
+                    "noregex:",
+                    "(",
+                    ")",
+                    "[^",
+                    "{9999}",
+                    "(?<=",
+                    "diacritics:",
+                    "?diac:",
+                    "é",
                     "nocase:",
                     "nopath:",
                     "prefix:",
@@ -2396,5 +2489,127 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn regex(target: Target, pattern: &str, case: bool) -> Expr {
+        Expr::Leaf(Leaf::Regex {
+            target,
+            regex: RegexTerm::new(pattern.as_bytes(), case).unwrap(),
+        })
+    }
+
+    /// `regex:` on the name, or the full path under `path:`, `matchpath:`
+    /// or an escaped separator (L1:422-423, L2:168-169); case-insensitive
+    /// unless the term or the query matches case (L1:419); never a bucket.
+    #[test]
+    fn regex_terms_as_everything_reads_them() {
+        assert_eq!(
+            ex("regex:^foo|^ever"),
+            regex(Target::Name, "^foo|^ever", false)
+        );
+        assert_eq!(
+            ex(r"regex:windows\\cmd"),
+            regex(Target::FullPath, r"windows\\cmd", false)
+        );
+        assert_eq!(ex("path:regex:fx"), regex(Target::FullPath, "fx", false));
+        assert_eq!(
+            ex("matchpath: regex:fx"),
+            regex(Target::FullPath, "fx", false)
+        );
+        assert_eq!(
+            ex(r"nopath:regex:a\\b"),
+            regex(Target::Name, r"a\\b", false)
+        );
+        assert_eq!(ex("case:regex:^Foo"), regex(Target::Name, "^Foo", true));
+        assert_eq!(ex("regex:^Foo case:"), regex(Target::Name, "^Foo", true));
+        assert_eq!(
+            ex("nocase:regex:^Foo case:"),
+            regex(Target::Name, "^Foo", false)
+        );
+        assert_eq!(ex("regex:stem:^a|b"), regex(Target::Stem, "^a|b", false));
+        assert_eq!(ex("regex*:^a b$"), regex(Target::Name, "^a b$", false));
+        assert_eq!(
+            ex("?regex: a|b c"),
+            and([
+                regex(Target::Name, "a|b", false),
+                regex(Target::Name, "c", false),
+            ])
+        );
+        let p = q("file:regex:x");
+        assert_eq!(
+            (p.filters.kind, p.expr),
+            (Some(Kind::File), Some(regex(Target::Name, "x", false)))
+        );
+        // No wildcard: `*` and `?` are the pattern's.
+        assert_eq!(ex("regex:a*"), regex(Target::Name, "a*", false));
+        // An empty pattern matches everything.
+        assert_eq!(q("regex:"), q(""));
+        assert!(matches!(
+            parse_query("regex:(?<=a)b"),
+            Err(QueryError::BadRegex { .. })
+        ));
+        assert!(matches!(
+            parse_query("regex:a(b"),
+            Err(QueryError::BadRegex { .. })
+        ));
+        let terms = |n: usize| {
+            (0..n)
+                .map(|i| format!("regex:a{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(parse_query(&terms(MAX_REGEX_TERMS)).is_ok());
+        assert!(matches!(
+            parse_query(&terms(MAX_REGEX_TERMS + 1)),
+            Err(QueryError::Malformed { what: "regex:", .. })
+        ));
+    }
+
+    /// Accents are ignored by default and kept under `diacritics:` (L1:169-
+    /// 226); `case:` compares the text as stored, accents and all (DESIGN.md
+    /// §3.5).
+    #[test]
+    fn diacritics_keep_accents_per_term() {
+        assert_eq!(q("Café").name_terms, vec![b"cafe".to_vec()]);
+        assert_eq!(q("Straße").name_terms, vec![b"strasse".to_vec()]);
+        let exact = |target, needle: &str| {
+            Expr::Leaf(Leaf::Text {
+                target,
+                needle: fold_exact(needle.as_bytes()),
+                case: false,
+                diacritics: true,
+                anchors: FREE,
+                skip: NO_SKIP,
+            })
+        };
+        assert_eq!(ex("diacritics:Café"), exact(Target::Name, "Café"));
+        assert_eq!(ex("diac:Straße"), exact(Target::Name, "Straße"));
+        assert_eq!(ex(r"diacritics:é\x"), exact(Target::FullPath, r"é\x"));
+        assert_eq!(ex("?diacritics: Café"), exact(Target::Name, "Café"));
+        assert_eq!(
+            q("?diacritics: nodiacritics:Café").name_terms,
+            vec![b"cafe".to_vec()]
+        );
+        assert_eq!(
+            ex("case:diacritics:Café"),
+            text(Target::Name, "Café", true, FREE, NO_SKIP)
+        );
+        assert!(matches!(
+            ex("diacritics:café*"),
+            Expr::Leaf(Leaf::Glob {
+                diacritics: true,
+                case: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            ex("diacritics:ext:Ä"),
+            Expr::Leaf(Leaf::Ext {
+                values: vec![fold_exact("Ä".as_bytes())],
+                case: false,
+                diacritics: true,
+            })
+        );
+        assert_eq!(q("ext:Ä").filters.ext, Some(vec![b"a".to_vec()]));
     }
 }

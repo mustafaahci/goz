@@ -10,7 +10,7 @@
 //! `FolderPaths`), plus its own name.
 
 use super::budget::{Budget, Stopped, Watch};
-use super::cexpr::{self, CNode, ExtMatcher, Scratch, Source, Subject, Volume};
+use super::cexpr::{self, CNode, ExtMatcher, Form, Scratch, Source, Subject, Volume};
 use super::folder_rank::FolderRanks;
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, ParsedQuery, SizeRange, Wildcard};
@@ -318,7 +318,7 @@ impl<'a> CompiledQuery<'a> {
                 .filters
                 .ext
                 .as_ref()
-                .map(|values| ExtMatcher::new(values, false)),
+                .map(|values| ExtMatcher::new(values, Form::Folded)),
             budget,
             name_finders: parsed
                 .name_terms
@@ -2671,9 +2671,11 @@ fn order_top(index: &VolumeIndex, cands: &mut [Candidate], sort: SortSpec, end: 
 }
 
 /// Resolves a scope folder path (WTF-8, no volume prefix) to its entry,
-/// walking components from the volume root: case-insensitively via the folded
-/// directory index, or case-sensitively against raw names when `match_case`. Returns `None`
-/// if any component is missing.
+/// walking components from the volume root: case- and accent-insensitively
+/// via the folded directory index, or case-sensitively against raw names
+/// when `match_case`. Returns `None` if any component is missing. Where
+/// sibling folders fold alike (`café` and `cafe`), the one whose accents
+/// the component has wins, and else the first.
 pub fn resolve_scope(index: &VolumeIndex, path: &[u8], match_case: bool) -> Option<EntryIdx> {
     let components: Vec<&[u8]> = path
         .split(|&b| b == b'\\' || b == b'/')
@@ -2689,9 +2691,20 @@ pub fn resolve_scope(index: &VolumeIndex, path: &[u8], match_case: bool) -> Opti
     if !match_case {
         let mut cur = index.root();
         for comp in components {
-            // Move the folded bytes into the lookup key instead of re-cloning
-            // them inside `child_dir` (which previously took `&[u8]`).
-            cur = index.child_dir(cur, fold(comp))?;
+            let folded = fold(comp);
+            let mut found = index.child_dirs(cur, &folded);
+            let first = found.next()?;
+            cur = match found.next() {
+                None => first,
+                Some(second) => {
+                    let exact = crate::fold::fold_exact(comp);
+                    [first, second]
+                        .into_iter()
+                        .chain(found)
+                        .find(|&d| crate::fold::fold_exact(index.entry(d).name()) == exact)
+                        .unwrap_or(first)
+                }
+            };
         }
         return Some(cur);
     }
@@ -2854,6 +2867,14 @@ mod tests {
             ("an expression on paths", r"zzz|docs\", None, name, None),
             ("the best of an expression", "e !zzz", None, size, Some(10)),
             ("a sub-path automaton", r"**\*e*", None, name, None),
+            ("a regular expression", "regex:e", None, name, None),
+            (
+                "a regular expression on paths",
+                r"regex:docs\\",
+                None,
+                name,
+                None,
+            ),
         ] {
             let parsed = parse_query(q).unwrap();
             let run = |budget: &Budget| {
@@ -4809,7 +4830,9 @@ mod tests {
                 .iter()
                 .map(|p| String::from_utf8(fold(p.as_bytes())).unwrap())
                 .collect();
-            let holds = |hay: &[u8], t: &[u8]| hay.windows(t.len().max(1)).any(|w| w == t);
+            // A term all of whose characters fold away (a lone combining
+            // mark) is an empty term, which matches everything.
+            let holds = |hay: &[u8], t: &[u8]| t.is_empty() || hay.windows(t.len()).any(|w| w == t);
             let mut want: Vec<String> = idx
                 .live_entries()
                 .filter(|&e| !idx.is_synthetic(e))
@@ -5334,6 +5357,7 @@ mod tests {
             Dir,
             NoFile,
             NoFolder,
+            Diacritics,
         }
 
         impl P {
@@ -5356,6 +5380,7 @@ mod tests {
                     P::Dir => "dir:",
                     P::NoFile => "no-file:",
                     P::NoFolder => "no-folder:",
+                    P::Diacritics => "diacritics:",
                 }
             }
         }
@@ -5405,6 +5430,9 @@ mod tests {
             Folder(bool, String, String),
             /// `exe:`.
             Macro,
+            /// `regex:` and its pattern, every character but a letter or a
+            /// digit escaped, so that the lexer reads it whole.
+            Regex(String),
         }
 
         #[derive(Clone, Debug)]
@@ -5431,7 +5459,7 @@ mod tests {
 
         fn spec() -> impl Strategy<Value = Spec> {
             let leaf = (
-                0u8..16,
+                0u8..17,
                 any::<Index>(),
                 any::<Index>(),
                 any::<Index>(),
@@ -5442,7 +5470,7 @@ mod tests {
             leaf.prop_recursive(3, 8, 3, |inner| {
                 prop_oneof![
                     inner.clone().prop_map(|s| Spec::Not(Box::new(s))),
-                    (0u8..17, inner.clone()).prop_map(|(p, s)| Spec::Prefixed(p, Box::new(s))),
+                    (0u8..18, inner.clone()).prop_map(|(p, s)| Spec::Prefixed(p, Box::new(s))),
                     prop::collection::vec(inner.clone(), 2..4).prop_map(Spec::And),
                     prop::collection::vec(inner, 2..4).prop_map(Spec::Or),
                 ]
@@ -5540,6 +5568,7 @@ mod tests {
                         P::Dir,
                         P::NoFile,
                         P::NoFolder,
+                        P::Diacritics,
                     ][*p as usize];
                     Q::Prefixed(p, Box::new(materialize(s, v)))
                 }
@@ -5694,6 +5723,33 @@ mod tests {
                             )
                         }
                         14 => L::Macro,
+                        16 => {
+                            // A cut of a name, or of a full path, which only
+                            // `path:` matches.
+                            let from = if n % 3 == 0 { path } else { name };
+                            let text = flip_case(cut(from, *a, *b), *flip);
+                            let mut pattern: String = text
+                                .chars()
+                                .map(|c| {
+                                    if c.is_alphanumeric() {
+                                        c.to_string()
+                                    } else {
+                                        format!("\\x{{{:X}}}", c as u32)
+                                    }
+                                })
+                                .collect();
+                            if (n >> 8) % 4 == 0 {
+                                pattern.insert(0, '^');
+                            }
+                            if (n >> 10) % 4 == 0 {
+                                pattern.push('$');
+                            }
+                            if (n >> 12) % 5 == 0 && pattern.chars().count() > 2 {
+                                // One character any.
+                                pattern.push_str(".?");
+                            }
+                            L::Regex(nonempty(pattern))
+                        }
                         _ => L::Text(nonempty(flip_case(cut(name, *a, *b), *flip))),
                     })
                 }
@@ -5760,6 +5816,7 @@ mod tests {
                     format!("{f}{}", quoted(text))
                 }
                 L::Macro => "exe:".into(),
+                L::Regex(pattern) => format!("regex:{pattern}"),
             }
         }
 
@@ -5801,10 +5858,13 @@ mod tests {
                             _ => print(i, minimal),
                         })
                         .collect();
-                    let sep = if text
-                        .iter()
-                        .any(|t| t.contains(":<") || t.contains(":!<") || t.ends_with(' '))
-                    {
+                    // A regular expression eats a `|` joined to it.
+                    let sep = if text.iter().any(|t| {
+                        t.contains(":<")
+                            || t.contains(":!<")
+                            || t.ends_with(' ')
+                            || t.contains("regex:")
+                    }) {
                         " | "
                     } else {
                         "|"
@@ -5845,6 +5905,7 @@ mod tests {
             end: Option<bool>,
             punct: Option<bool>,
             space: Option<bool>,
+            diacritics: Option<bool>,
             folder: bool,
         }
 
@@ -5899,6 +5960,10 @@ mod tests {
             crate::wtf8::to_string_lossy(&crate::fold::fold(s.as_bytes()))
         }
 
+        fn fold_exact_str(s: &str) -> String {
+            crate::wtf8::to_string_lossy(&crate::fold::fold_exact(s.as_bytes()))
+        }
+
         fn utf16(s: &str) -> u64 {
             s.encode_utf16().count() as u64
         }
@@ -5946,6 +6011,7 @@ mod tests {
                         P::EndWith => set(&mut c.end, true),
                         P::NoPunc => set(&mut c.punct, true),
                         P::NoWs => set(&mut c.space, true),
+                        P::Diacritics => set(&mut c.diacritics, true),
                         // ANDed with what follows.
                         P::File | P::NoFolder => return !e.is_dir && eval(inner, e, case, ctx),
                         P::Dir => return e.is_dir && eval(inner, e, case, ctx),
@@ -5965,7 +6031,16 @@ mod tests {
 
         fn eval_leaf(l: &L, e: &Seen, case: bool, ctx: Ctx) -> bool {
             let case = ctx.case.unwrap_or(case);
-            let fold = |s: &str| if case { s.to_string() } else { fold_str(s) };
+            let accents = ctx.diacritics == Some(true);
+            let fold = |s: &str| {
+                if case {
+                    s.to_string()
+                } else if accents {
+                    fold_exact_str(s)
+                } else {
+                    fold_str(s)
+                }
+            };
             match l {
                 L::Lone => e.is_dir,
                 L::Drive(d) if ctx.path != Some(false) => {
@@ -6046,7 +6121,15 @@ mod tests {
                         return false;
                     }
                     let case = ctx.case.unwrap_or(false);
-                    let fold = |s: &str| if case { s.to_string() } else { fold_str(s) };
+                    let fold = |s: &str| {
+                        if case {
+                            s.to_string()
+                        } else if accents {
+                            fold_exact_str(s)
+                        } else {
+                            fold_str(s)
+                        }
+                    };
                     let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
                     while values.len() > 1 && values.last() == Some(&"") {
                         values.pop();
@@ -6094,6 +6177,15 @@ mod tests {
                 L::Date(_, range, neg) => e
                     .mtime
                     .is_some_and(|t| t >= 0 && range.contains(t as u64) != *neg),
+                // On the name or the full path as stored.
+                L::Regex(pattern) => {
+                    let path = ctx.path.unwrap_or(pattern.contains("\\\\"));
+                    regex::RegexBuilder::new(pattern)
+                        .case_insensitive(!case)
+                        .build()
+                        .unwrap()
+                        .is_match(if path { &e.full } else { &e.name })
+                }
                 L::Folder(false, _, folded) => e.parent == *folded,
                 L::Folder(true, _, folded) => e.ancestors.contains(folded),
                 // `exe:` alone: its extensions, and an empty term, which
@@ -6289,5 +6381,163 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Folders `café` and `cafe`, a decomposed `café` in each and the
+    /// rest of Everything's accent pairs (DESIGN.md §10.1).
+    fn accent_index() -> VolumeIndex {
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let root = NTFS_ROOT_FRN;
+        idx.insert_enum(&enum_rec(frn(100), root, "café", true));
+        idx.insert_enum(&enum_rec(frn(101), root, "cafe", true));
+        let names = [
+            "cafe.txt",
+            "café.txt",
+            "CAFÉ2.txt",
+            "cafe\u{301}nfd.txt",
+            "Straße.txt",
+            "strasse.txt",
+            "kırmızı.txt",
+            "İstanbul.TXT",
+            "ﬁle.txt",
+            "x²y.txt",
+            "a\u{3000}b.txt",
+            "ext.café",
+            "ext.cafe",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            idx.insert_enum(&enum_rec(frn(200 + i as u64), frn(100), name, false));
+        }
+        idx.insert_enum(&enum_rec(frn(300), frn(101), "café.txt", false));
+        idx
+    }
+
+    /// Accents are ignored unless `diacritics:` asks for them, on names,
+    /// full paths, wildcards and extensions, as Everything 1.5 does
+    /// (L1:169-226); `case:` compares as stored.
+    #[test]
+    fn accents_are_ignored_unless_diacritics() {
+        let idx = accent_index();
+        let names = |q: &str| {
+            let mut got: Vec<String> = run(&idx, q)
+                .into_iter()
+                .map(|p| p.rsplit('\\').next().unwrap_or_default().to_string())
+                .collect();
+            got.sort();
+            got.dedup();
+            got
+        };
+        let set = |v: &[&str]| {
+            let mut v: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names("cafe file:"),
+            set(&[
+                "cafe.txt",
+                "café.txt",
+                "CAFÉ2.txt",
+                "cafe\u{301}nfd.txt",
+                "ext.cafe",
+                "ext.café"
+            ])
+        );
+        assert_eq!(names("CAFÉ file:"), names("cafe file:"));
+        assert_eq!(
+            names("diacritics:café"),
+            set(&[
+                "café",
+                "café.txt",
+                "CAFÉ2.txt",
+                "cafe\u{301}nfd.txt",
+                "ext.café"
+            ])
+        );
+        assert_eq!(
+            names("diacritics:cafe file:"),
+            set(&["cafe.txt", "ext.cafe"])
+        );
+        assert_eq!(
+            names("diacritics:CAFE"),
+            set(&["cafe", "cafe.txt", "ext.cafe"])
+        );
+        assert_eq!(names("case:café"), set(&["café", "café.txt", "ext.café"]));
+        assert_eq!(names("strasse"), set(&["Straße.txt", "strasse.txt"]));
+        assert_eq!(names("diacritics:straße"), set(&["Straße.txt"]));
+        assert_eq!(names("kirmizi"), set(&["kırmızı.txt"]));
+        assert_eq!(names("istanbul"), set(&["İstanbul.TXT"]));
+        assert_eq!(names("file"), set(&["ﬁle.txt"]));
+        assert_eq!(names("x2y"), set(&["x²y.txt"]));
+        assert_eq!(names(r#""a b""#), set(&["a\u{3000}b.txt"]));
+        // Wildcards count characters after folding.
+        assert_eq!(names("caf?.txt"), set(&["cafe.txt", "café.txt"]));
+        assert_eq!(
+            names("diacritics:café*.txt"),
+            set(&["café.txt", "CAFÉ2.txt", "cafe\u{301}nfd.txt"])
+        );
+        // A full path, and an extension.
+        assert_eq!(run(&idx, r"cafe\cafe.txt").len(), 3);
+        assert_eq!(
+            run(&idx, r"diacritics:café\cafe.txt"),
+            vec![r"café\cafe.txt"]
+        );
+        assert_eq!(
+            run(&idx, r"diacritics:path:cafe\café"),
+            vec![r"cafe\café.txt"]
+        );
+        assert_eq!(names("ext:cafe"), set(&["ext.cafe", "ext.café"]));
+        assert_eq!(names("diacritics:ext:café"), set(&["ext.café"]));
+        assert_eq!(names("ext:CAFÉ"), names("ext:cafe"));
+    }
+
+    /// `regex:` matches the name as stored (L1:425-433): no accent folding,
+    /// case-insensitive unless `case:`, the full path with `path:` or `\\`.
+    #[test]
+    fn regex_terms_match_names_and_paths_as_stored() {
+        let idx = accent_index();
+        let sorted = |q: &str| {
+            let mut v = run(&idx, q);
+            v.sort();
+            v
+        };
+        assert_eq!(
+            sorted("regex:^ca.e"),
+            vec!["cafe", r"café\cafe.txt", "café\\cafe\u{301}nfd.txt"]
+        );
+        assert_eq!(
+            sorted("regex:é"),
+            vec![
+                r"cafe\café.txt",
+                "café",
+                r"café\CAFÉ2.txt",
+                r"café\café.txt",
+                r"café\ext.café"
+            ]
+        );
+        assert_eq!(run(&idx, "case:regex:^CAF"), vec![r"café\CAFÉ2.txt"]);
+        assert_eq!(run(&idx, r"regex:^cafe\\caf.\.txt$"), Vec::<String>::new());
+        assert_eq!(run(&idx, r"regex:e\\caf.\.txt$"), vec![r"cafe\café.txt"]);
+        assert_eq!(run(&idx, r"path:regex:^C:\\cafe\\"), vec![r"cafe\café.txt"]);
+        assert_eq!(sorted(r"regex:\.txt$ !regex:^c"), sorted("*.txt !c*"));
+        assert_eq!(run(&idx, "regex:^x.y|^ﬁ").len(), 2);
+    }
+
+    /// A scope names a folder ignoring accents, but of two that fold alike
+    /// the one spelled as asked wins.
+    #[test]
+    fn a_scope_prefers_the_folder_spelled_as_asked() {
+        let idx = accent_index();
+        let (cafe, accented) = (idx.head_of(frn(101)), idx.head_of(frn(100)));
+        assert_eq!(resolve_scope(&idx, "café".as_bytes(), false), accented);
+        assert_eq!(resolve_scope(&idx, "CAFÉ".as_bytes(), false), accented);
+        assert_eq!(
+            resolve_scope(&idx, "cafe\u{301}".as_bytes(), false),
+            accented
+        );
+        assert_eq!(resolve_scope(&idx, b"cafe", false), cafe);
+        assert_eq!(resolve_scope(&idx, b"CAFE\\", false), cafe);
+        assert!(resolve_scope(&idx, "cafè".as_bytes(), false).is_some());
+        assert_eq!(resolve_scope(&idx, "café".as_bytes(), true), accented);
     }
 }

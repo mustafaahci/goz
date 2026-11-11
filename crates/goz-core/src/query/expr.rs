@@ -13,6 +13,7 @@
 use super::dates::DateFilter;
 use super::glob::Wildcard;
 use super::parse::{Kind, ParsedQuery, SizeRange};
+use super::pattern::RegexTerm;
 
 /// A boolean expression over the query's terms.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +99,10 @@ pub enum LenOf {
     Extension,
 }
 
-/// One term. Text is folded unless the term matches case.
+/// One term. Text is folded unless the term matches case: with
+/// [`crate::fold::fold`], case and accents ignored, or with
+/// [`crate::fold::fold_exact`] under `diacritics:`, which keeps accents
+/// (`diacritics` is never set with `case`, which keeps them too).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Leaf {
     /// The target holds `needle` (folded unless `case`), where `anchors`
@@ -108,6 +112,7 @@ pub enum Leaf {
         target: Target,
         needle: Vec<u8>,
         case: bool,
+        diacritics: bool,
         anchors: Anchors,
         skip: Skip,
     },
@@ -118,14 +123,21 @@ pub enum Leaf {
         target: Target,
         glob: Wildcard,
         case: bool,
+        diacritics: bool,
     },
+    /// The target, as stored, holds a match of a regular expression.
+    Regex { target: Target, regex: RegexTerm },
     /// Files or folders only.
     Kind(Kind),
     /// A file whose extension is one of `values` (folded unless `case`;
     /// never empty): a value of `k` dot-separated parts names the name's
     /// last `k`, a value may hold wildcards, and an empty value names a
     /// name with no dot. Folders have no extension.
-    Ext { values: Vec<Vec<u8>>, case: bool },
+    Ext {
+        values: Vec<Vec<u8>>,
+        case: bool,
+        diacritics: bool,
+    },
     /// The size is known and in range.
     Size(SizeRange),
     /// The size is unknown: a folder's (goz does not sum them), or a file's
@@ -152,6 +164,7 @@ impl Leaf {
             target,
             needle,
             case,
+            diacritics: false,
             anchors: Anchors::default(),
             skip: Skip::default(),
         }
@@ -273,6 +286,7 @@ pub(super) fn lower(e: Expr, q: &mut ParsedQuery) {
                 target: target @ (Target::Name | Target::FullPath),
                 needle,
                 case,
+                diacritics: false,
                 anchors,
                 skip,
             }) if case == q.match_case && anchors.is_free() && skip.is_none() => {
@@ -286,6 +300,7 @@ pub(super) fn lower(e: Expr, q: &mut ParsedQuery) {
                 target: Target::Name | Target::FullPath,
                 glob,
                 case,
+                diacritics: false,
             }) if case == q.match_case => {
                 if glob.is_name() {
                     q.wildcards.push(glob);
@@ -302,6 +317,7 @@ pub(super) fn lower(e: Expr, q: &mut ParsedQuery) {
             Expr::Leaf(Leaf::Ext {
                 values,
                 case: false,
+                diacritics: false,
             }) if q.filters.ext.is_none() && values.iter().all(|v| is_plain_ext(v)) => {
                 q.filters.ext = Some(values);
             }
@@ -325,6 +341,13 @@ pub(super) fn lower(e: Expr, q: &mut ParsedQuery) {
 /// wildcard.
 pub(super) fn is_plain_ext(v: &[u8]) -> bool {
     !v.is_empty() && !v.iter().any(|&b| b == b'*' || b == b'?')
+}
+
+/// How many `regex:` terms `e` holds.
+pub(super) fn regex_terms(e: &Expr) -> usize {
+    let mut n = 0;
+    e.for_each_leaf(&mut |leaf| n += usize::from(matches!(leaf, Leaf::Regex { .. })));
+    n
 }
 
 /// How many terms `e`'s leaves count for the term cap: one each, since each

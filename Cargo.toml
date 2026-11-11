@@ -29,6 +29,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
 unicode-normalization = "0.1"
+# `regex:` terms: linear-time matching, so no pattern backtracks for ever.
+regex = "1"
 # cli
 jiff = "0.2"
 # winfs

@@ -418,6 +418,7 @@ dependencies = [
  "mimalloc",
  "proptest",
  "rayon",
+ "regex",
  "rustc-hash",
  "serde",
  "serde_json",

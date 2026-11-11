@@ -64,7 +64,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected="hashbrown memchr rayon rustc-hash serde serde_json smallvec thiserror unicode-normalization zerocopy"
+          expected="hashbrown memchr rayon regex rustc-hash serde serde_json smallvec thiserror unicode-normalization zerocopy"
           actual="$(cargo tree -p goz-core --edges normal --target all --depth 1 --prefix none \
             | awk 'NF && $1 != "goz-core" { print $1 }' \
             | sort -u | tr '\n' ' ' | sed 's/ $//')"
