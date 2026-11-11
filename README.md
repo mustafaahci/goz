@@ -9,7 +9,22 @@
 
 goz indexes every filename on your fixed NTFS volumes and answers substring queries in single-digit milliseconds, from the command line or from your own tools over a named pipe.
 
-Prefer a window? **[goz-gui](https://github.com/mustafaahci/goz-gui)** is the desktop app for goz, in the style of Everything 1.5 (see [Desktop app](#desktop-app)).
+## Desktop app
+
+Looking for a window rather than a command line? **[goz-gui](https://github.com/mustafaahci/goz-gui)** is the desktop app for goz, with Everything 1.5's window, menus, keys and options: results as you type, tabs, Folders, Filters and Bookmarks sidebars, a Preview pane, thumbnails, file lists and live updates.
+
+<a href="https://github.com/mustafaahci/goz-gui">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-light.png">
+    <img src="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-light.png" alt="goz-gui showing search results as you type, with the Preview pane open" width="800">
+  </picture>
+</a>
+
+To use it:
+
+1. Install gozd, goz's search service, as described in [Install](#install).
+2. Install goz-gui from its [latest release](https://github.com/mustafaahci/goz-gui/releases/latest): the MSI installer or the portable zip.
 
 ## Highlights
 
@@ -54,18 +69,6 @@ Or install it as an auto-start Windows service (elevated):
 ```
 
 When the daemon is not running, `goz` says what state the `goz` service is in (not installed, stopped, disabled or still starting) and prints the commands that fix it, each on its own line.
-
-## Desktop app
-
-**[goz-gui](https://github.com/mustafaahci/goz-gui)** is a native Windows app on top of gozd, with Everything 1.5's window, menus, keys and options: results as you type, tabs, Folders, Filters and Bookmarks sidebars, a Preview pane, thumbnails, file lists and live updates. Once gozd is running, install it from the [latest goz-gui release](https://github.com/mustafaahci/goz-gui/releases/latest) (MSI installer or portable zip).
-
-<a href="https://github.com/mustafaahci/goz-gui">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-light.png">
-    <img src="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-light.png" alt="goz-gui showing search results as you type, with the Preview pane open" width="800">
-  </picture>
-</a>
 
 ## Usage
 
