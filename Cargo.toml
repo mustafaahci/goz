@@ -31,6 +31,9 @@ smallvec = "1"
 unicode-normalization = "0.1"
 # `regex:` terms: linear-time matching, so no pattern backtracks for ever.
 regex = "1"
+# The parser regex uses, for the literal text a `regex:` pattern's matches
+# hold (its prefilter); the version regex itself pulls in.
+regex-syntax = "0.8"
 # cli
 jiff = "0.2"
 # winfs

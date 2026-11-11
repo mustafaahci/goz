@@ -240,6 +240,27 @@ pub(super) enum Func {
     ChildFileCount,
     /// `child-folder-count:`.
     ChildFolderCount,
+    /// `child:`: a folder holds a file or folder whose name matches.
+    Child,
+    /// `child-file:`.
+    ChildFile,
+    /// `child-folder:`.
+    ChildFolder,
+    /// `descendant:`: a folder holds, at any depth, an entry whose name
+    /// matches.
+    Descendant,
+    /// `descendant-file:`.
+    DescendantFile,
+    /// `descendant-folder:`.
+    DescendantFolder,
+    /// `sibling:`: another entry of the same folder has a name that matches.
+    Sibling,
+    /// `sibling-file:`.
+    SiblingFile,
+    /// `sibling-folder:`.
+    SiblingFolder,
+    /// `ancestor-name:`: a folder above the entry has a name that matches.
+    AncestorName,
 }
 
 impl Func {
@@ -273,6 +294,16 @@ impl Func {
                 | Func::FullPath
                 | Func::Location
                 | Func::ParentName
+                | Func::Child
+                | Func::ChildFile
+                | Func::ChildFolder
+                | Func::Descendant
+                | Func::DescendantFile
+                | Func::DescendantFolder
+                | Func::Sibling
+                | Func::SiblingFile
+                | Func::SiblingFolder
+                | Func::AncestorName
         )
     }
 
@@ -299,6 +330,16 @@ impl Func {
             Func::ChildCount => "child-count:",
             Func::ChildFileCount => "child-file-count:",
             Func::ChildFolderCount => "child-folder-count:",
+            Func::Child => "child:",
+            Func::ChildFile => "child-file:",
+            Func::ChildFolder => "child-folder:",
+            Func::Descendant => "descendant:",
+            Func::DescendantFile => "descendant-file:",
+            Func::DescendantFolder => "descendant-folder:",
+            Func::Sibling => "sibling:",
+            Func::SiblingFile => "sibling-file:",
+            Func::SiblingFolder => "sibling-folder:",
+            Func::AncestorName => "ancestor-name:",
         }
     }
 }
@@ -462,6 +503,16 @@ impl Prefix {
             "childcount" => func(F::ChildCount),
             "childfilecount" => func(F::ChildFileCount),
             "childfoldercount" => func(F::ChildFolderCount),
+            "child" => func(F::Child),
+            "childfile" => func(F::ChildFile),
+            "childfolder" => func(F::ChildFolder),
+            "descendant" => func(F::Descendant),
+            "descendantfile" => func(F::DescendantFile),
+            "descendantfolder" => func(F::DescendantFolder),
+            "sibling" => func(F::Sibling),
+            "siblingfile" => func(F::SiblingFile),
+            "siblingfolder" => func(F::SiblingFolder),
+            "ancestorname" => func(F::AncestorName),
             "empty" => Named::Prefix(Prefix::Empty),
             "audio" => macro_(Macro::Audio),
             "zip" => macro_(Macro::Zip),

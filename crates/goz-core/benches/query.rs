@@ -435,6 +435,33 @@ fn bench_query(c: &mut Criterion) {
         ("count(depth:5)", "depth:5".into(), true),
         ("count(empty:)", "empty:".into(), true),
         ("count(child-count:>50)", "child-count:>50".into(), true),
+        // A case-insensitive `regex:` on the name: its literal pieces drive
+        // the scan of the folded names.
+        (
+            r"regex-name(regex:^kernel32_\d+\.dll$)",
+            r"regex:^kernel32_\d+\.dll$".into(),
+            true,
+        ),
+        // Sub-searches of other entries' names: the term runs over the
+        // names once, and the links map its matches onto folders.
+        ("related(child:kernel32)", "child:kernel32".into(), true),
+        (
+            "related(descendant:kernel32)",
+            "descendant:kernel32".into(),
+            true,
+        ),
+        ("related(sibling:kernel32)", "sibling:kernel32".into(), true),
+        (
+            "related(ancestor-name:bin_x64_05)",
+            "ancestor-name:bin_x64_05".into(),
+            true,
+        ),
+        (
+            "related(ancestor-name:module_group_007 kernel32)",
+            "ancestor-name:module_group_007 kernel32".into(),
+            true,
+        ),
+        ("related(child:*.txt)", "child:*.txt".into(), true),
     ];
     bench_group(c, "query_2M_mods", &idx, &mods);
     drop(idx);

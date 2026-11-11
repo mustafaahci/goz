@@ -212,6 +212,12 @@ const SEARCH_TEXT: &[(&str, &str)] = &[
          child-folder-count:",
     ),
     (
+        "child:*.mp3",
+        "Folders holding an entry so named (child-file:, child-folder:); \
+         descendant: at any depth; sibling: another entry of the folder; \
+         ancestor-name: a folder above",
+    ),
+    (
         "path:TEXT",
         "Full paths that contain TEXT; nopath: tests names only",
     ),

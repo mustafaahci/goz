@@ -11,9 +11,11 @@
 
 use super::budget::{Budget, Stopped, Watch};
 use super::cexpr::{self, CNode, ExtMatcher, Form, Scratch, Source, Subject, Volume};
+use super::expr::{Expr, Leaf, Target};
 use super::folder_rank::FolderRanks;
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, ParsedQuery, SizeRange, Wildcard};
+use super::related::RelatedSet;
 use crate::index::store::NamePair;
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
@@ -23,7 +25,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::ops::Range;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// One matched entry. The daemon prepends the volume mount prefix to `path`
 /// and formats `mtime` for display.
@@ -124,7 +126,8 @@ pub struct CompiledQuery<'a> {
     /// run over the distinct names.
     name_parts: Vec<&'a Glob>,
     /// The longest separator-free piece of path text that every match must
-    /// hold inside one of its names (see [`path_piece`]); drives
+    /// hold inside one of its names (see [`path_piece`]), or else the rarest
+    /// piece of a full-path `regex:` (see [`regex_path_piece`]); drives
     /// [`walk_below_names`]. `None` for a case-sensitive query, whose pieces
     /// the folded arena cannot find.
     path_piece: Option<Vec<u8>>,
@@ -152,6 +155,10 @@ pub struct CompiledQuery<'a> {
     /// Where a top-level `parent:` or `ancestor:` term says the matches
     /// lie, which the scan walks instead of the volume.
     source: Option<Source>,
+    /// A top-level sub-search (`child:`, ...), whose set of folders bounds
+    /// the candidates when nothing narrower does (see
+    /// [`RelatedSet::for_each_candidate`]).
+    related: Option<Arc<RelatedSet>>,
     /// The expression's terms on the entry, projected onto the name (see
     /// [`cexpr::name_projection`]): what the name of every match passes,
     /// beyond [`name_matches`].
@@ -265,6 +272,8 @@ impl<'a> CompiledQuery<'a> {
             raw_prefix: mount_prefix.as_bytes(),
             folded_prefix: &folded_prefix,
             parts_are_names,
+            budget,
+            related: Default::default(),
         };
         let expr = parsed.expr.as_ref().map(|e| cexpr::compile(e, &volume));
         let expr_admits = !matches!(expr, Some(CNode::False));
@@ -296,7 +305,9 @@ impl<'a> CompiledQuery<'a> {
             });
 
         let path_piece = (!parsed.match_case)
-            .then(|| path_piece(parsed, &prefix))
+            .then(|| {
+                path_piece(parsed, &prefix).or_else(|| regex_path_piece(index, parsed, &prefix))
+            })
             .flatten();
 
         // The buckets' prefilter keeps priority, so a query of plain terms
@@ -326,6 +337,7 @@ impl<'a> CompiledQuery<'a> {
             name_proj,
             names_first,
             source: expr_entry.as_ref().and_then(cexpr::source),
+            related: expr_entry.as_ref().and_then(cexpr::related_source),
             raw_prefix: mount_prefix.as_bytes().to_vec(),
             kind,
             ext: parsed
@@ -418,6 +430,64 @@ fn path_piece(parsed: &ParsedQuery, prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     best
+}
+
+/// The shortest piece of a `regex:` pattern [`regex_path_piece`] walks
+/// below: a name holding a shorter one is too common to narrow the walk.
+const REGEX_PIECE_MIN: usize = 3;
+
+/// The most pieces of `regex:` patterns [`regex_path_piece`] weighs, the
+/// longest: each costs a scan of the folded names.
+const REGEX_PIECES_WEIGHED: usize = 4;
+
+/// A separator-free piece of text that every match of the query's top-level
+/// case-insensitive `regex:` terms on the full path (or its location or
+/// parent's name) holds, folded (see [`super::pattern::Need`]), as
+/// [`path_piece`] takes one from path terms: when the prefix does not hold
+/// it, it lies inside one name of the match's path. Of several, the one the
+/// fewest entries bear a name holding, of the [`REGEX_PIECES_WEIGHED`]
+/// longest: a pattern's pieces name its folders and its file alike, and
+/// `regex:bin_x64_05\\kernel32` must walk below the few names holding `kernel32`,
+/// not below every `bin_x64_05` folder, though that piece is longer.
+fn regex_path_piece(index: &VolumeIndex, parsed: &ParsedQuery, prefix: &[u8]) -> Option<Vec<u8>> {
+    if !prefix.is_empty() && !prefix.ends_with(b"\\") {
+        return None;
+    }
+    let top = match parsed.expr.as_ref()? {
+        Expr::And(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    let mut pieces: Vec<&[u8]> = Vec::new();
+    for e in top {
+        if let Expr::Leaf(Leaf::Regex {
+            target: Target::FullPath | Target::Location | Target::ParentName,
+            regex,
+        }) = e
+            && let Some(need) = regex.need().filter(|need| need.folded)
+        {
+            for piece in need.required_pieces() {
+                pieces.extend(
+                    piece.split(|&b| b == b'\\').filter(|p| {
+                        p.len() >= REGEX_PIECE_MIN && memmem::find(prefix, p).is_none()
+                    }),
+                );
+            }
+        }
+    }
+    pieces.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+    pieces.dedup();
+    pieces.truncate(REGEX_PIECES_WEIGHED);
+    let rarest = if pieces.len() > 1 {
+        // The first of the fewest: the longest of them.
+        pieces.into_iter().min_by_key(|p| {
+            let mut bearing = 0u64;
+            for_each_prefilter_hit(index, p, |id| bearing += u64::from(index.name_refcount(id)));
+            bearing
+        })
+    } else {
+        pieces.pop()
+    };
+    rarest.map(<[u8]>::to_vec)
 }
 
 /// The leading literal of sub-path wildcard `w` when it holds a `:`: then
@@ -983,18 +1053,18 @@ fn chunk_ids(i: usize, per: usize, names: usize) -> Range<usize> {
 }
 
 /// A set of name ids, one bit per id.
-struct NameSet {
+pub(super) struct NameSet {
     words: Vec<u64>,
     len: usize,
 }
 
 impl NameSet {
-    fn contains(&self, id: NameId) -> bool {
+    pub(super) fn contains(&self, id: NameId) -> bool {
         self.words[id as usize / 64] & (1 << (id % 64)) != 0
     }
 
     /// The ids in the set, ascending.
-    fn ids(&self) -> impl Iterator<Item = NameId> + '_ {
+    pub(super) fn ids(&self) -> impl Iterator<Item = NameId> + '_ {
         word_ids(0, &self.words)
     }
 }
@@ -1233,6 +1303,72 @@ fn match_scan_names(
             .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     });
     (NameSet { words, len }, bearing)
+}
+
+/// The distinct names `node`, a term on the name alone, matches: those of
+/// a sub-search (see the `related` module), with only the names a folder
+/// may bear when `folders`. The names are matched in chunks across cores,
+/// as in [`match_names`]: in each, the names holding the term's needles
+/// are found in the folded names and tested, or with no needle every live
+/// name is. Each test counts against `budget`, and a spent one leaves the
+/// set unfinished.
+pub(super) fn names_passing(
+    index: &VolumeIndex,
+    node: &CNode,
+    folders: bool,
+    budget: &Budget,
+) -> NameSet {
+    use rayon::prelude::*;
+    let names = index.name_count();
+    let per = chunk_words(names);
+    let needles = cexpr::plan(std::iter::once(node)).unwrap_or_default();
+    let mut words = vec![0u64; names.div_ceil(64)];
+    let chunks = words.len().div_ceil(per);
+    let len = on_name_pool(chunks, || {
+        words
+            .par_chunks_mut(per)
+            .enumerate()
+            .map(|(i, words)| {
+                let ids = chunk_ids(i, per, names);
+                let base = ids.start;
+                let mut scratch = Scratch::default();
+                let mut watch = Watch::new(budget);
+                let mut seen = Seen::of(&needles, &ids);
+                let mut len = 0usize;
+                let mut mark = |id: NameId| {
+                    if seen.as_mut().is_some_and(|seen| !seen.first(id))
+                        || index.name_refcount(id) == 0
+                        || (folders && !index.name_may_bear_folder(id))
+                        || watch.tick()
+                    {
+                        return;
+                    }
+                    // A name's own test: the query's case does not reach
+                    // it, as it tells only how full paths are folded.
+                    if node.eval(&mut Subject::name_level(
+                        index,
+                        id,
+                        false,
+                        budget,
+                        &mut scratch,
+                    )) {
+                        let at = id as usize - base;
+                        words[at / 64] |= 1 << (at % 64);
+                        len += 1;
+                    }
+                };
+                if needles.is_empty() {
+                    ids.map(|id| id as NameId).for_each(&mut mark);
+                } else {
+                    for needle in &needles {
+                        for_each_prefilter_hit_in(index, needle, ids.clone(), &mut mark);
+                    }
+                }
+                len
+            })
+            .sum()
+    });
+    NameSet { words, len }
 }
 
 /// The summed size of the files bearing a name in `matched`, as
@@ -1775,6 +1911,33 @@ fn scan_with(
     {
         // Every match is at or below a name holding the piece, and the walk
         // visited each of those entries once.
+    } else if let Some(set) = &compiled.related {
+        // A top-level sub-search: only the entries its folders give can
+        // match, each once. (A path walk that grew past its share may have
+        // left some.)
+        candidates.clear();
+        set.for_each_candidate(index, |idx| {
+            if watch.tick() {
+                return false;
+            }
+            if !index.is_synthetic(idx)
+                && let Some(c) = evaluate(
+                    index,
+                    parsed,
+                    compiled,
+                    idx,
+                    scope,
+                    &mut scope_memo,
+                    &mut dir_paths,
+                    &mut folders,
+                    false,
+                    &mut scratch,
+                )
+            {
+                candidates.push(c);
+            }
+            true
+        });
     } else if compiled.names_first {
         // Something to test of the name: the names come first.
         candidates.clear();
@@ -2683,7 +2846,7 @@ fn walk_below_names(
 /// Whether [`walk_below_names`] walks from `top`: its chain reaches a top
 /// other than lost+found within [`MAX_PATH_HOPS`] entries, and passes no
 /// other of `tops` (sorted), whose walk covers it.
-fn walk_starts_at(index: &VolumeIndex, top: EntryIdx, tops: &[EntryIdx]) -> bool {
+pub(super) fn walk_starts_at(index: &VolumeIndex, top: EntryIdx, tops: &[EntryIdx]) -> bool {
     let mut cur = top;
     for _ in 0..MAX_PATH_HOPS {
         let parent = index.entry(cur).parent();
@@ -6849,6 +7012,473 @@ mod tests {
         check(r"file: child-count:0 \w\", &[]);
     }
 
+    /// The live Everything fixture's folder index stood at a folder
+    /// `C:\Users\musta\...\gozd\ev\fx` (a temporary folder, shortened
+    /// here): Everything names that root by its path, which
+    /// `ancestor-name:` reads, so its answers hold for this one alike.
+    const FIXTURE_ROOT: &str = r"C:\Users\musta\scratch\gozd\ev\fx\";
+
+    /// [`count_index`]'s tree `w` and a few more of the live fixture's
+    /// folders: `words` (`!bang.txt`), `p` and `dia` (an accent each way),
+    /// `desktop` (names with spaces).
+    fn related_index() -> VolumeIndex {
+        let mut idx = count_index();
+        let tree: &[(u64, u64, &str, bool)] = &[
+            (200, 0, "words", true),
+            (201, 200, "!bang.txt", false),
+            (202, 200, "ever.txt", false),
+            (203, 200, "wow!.txt", false),
+            (210, 0, "p", true),
+            (211, 210, "aéb.txt", false),
+            (212, 210, "a b.txt", false),
+            (220, 0, "dia", true),
+            (221, 220, "aeble.txt", false),
+            (222, 220, "café.txt", false),
+            (230, 0, "desktop", true),
+            (231, 230, "First Level First", true),
+            (232, 231, "f.txt", false),
+            (233, 231, "inner", true),
+            (234, 233, "g.txt", false),
+            (235, 230, "other", true),
+            (236, 235, "h.txt", false),
+        ];
+        for &(rec, parent, name, is_dir) in tree {
+            let parent = if parent == 0 {
+                NTFS_ROOT_FRN
+            } else {
+                frn(parent)
+            };
+            idx.insert_enum(&enum_rec(frn(rec), parent, name, is_dir));
+        }
+        idx.optimize_storage();
+        idx
+    }
+
+    /// `child:`, `descendant:`, `sibling:` and `ancestor-name:` (and the
+    /// `-file:` and `-folder:` forms) answer as a live Everything
+    /// 1.5.0.1424b did over the same tree (W7, 65 queries): the value is a
+    /// term on the other entry's name with the term's modifiers (`whole:`,
+    /// `case:`, `diacritics:`, `regex:`), a `;` list or a group of values;
+    /// its leading `!` is text; a sibling is another entry, not the entry
+    /// itself; and the root is named by its path, so `ancestor-name:musta`
+    /// holds for every entry while `whole:ancestor-name:fx` holds for none.
+    /// Only the root, which goz never lists and Everything did, is left out
+    /// of the `descendant:` answers.
+    #[test]
+    fn related_searches_answer_as_everything_does() {
+        let idx = related_index();
+        let check = |query: &str, want: &[&str]| {
+            let parsed = parse_query(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let out = run_query(
+                &idx,
+                FIXTURE_ROOT,
+                &parsed,
+                None,
+                SortSpec::default(),
+                0,
+                None,
+            );
+            let mut got: Vec<String> = out
+                .hits
+                .iter()
+                .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                .collect();
+            got.sort();
+            let mut want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{query}");
+        };
+        let w_all: &[&str] = &[
+            r"w\windows\sub\deep",
+            r"w\windows\system32\drivers",
+            r"w\windows\emptydir",
+            r"w\mywindows",
+            r"w\windows\sub",
+            r"w\windows\system32",
+            r"w\windows",
+            r"w\windows.old",
+            r"w\windows2",
+            r"w\windows\sub\deep\a.exe",
+            r"w\windows2\b.exe",
+            r"w\mywindows\c.exe",
+            r"w\windows\cmd.exe",
+            r"w\windows\system32\cmd.exe",
+            r"w\windows.old\d.exe",
+            r"w\windows\notepad.exe",
+            r"w\windows\system32\drivers\x.sys",
+        ];
+        let but = |out: &[&str]| -> Vec<&str> {
+            w_all.iter().copied().filter(|p| !out.contains(p)).collect()
+        };
+        let cmd_dirs = [r"w\windows\system32", r"w\windows"];
+        let exe_dirs = [
+            r"w\windows\sub\deep",
+            r"w\mywindows",
+            r"w\windows\system32",
+            r"w\windows",
+            r"w\windows.old",
+            r"w\windows2",
+        ];
+        let nonempty = [
+            r"w\windows\sub\deep",
+            r"w\windows\system32\drivers",
+            r"w\mywindows",
+            r"w\windows\sub",
+            r"w\windows\system32",
+            r"w\windows",
+            r"w\windows.old",
+            r"w\windows2",
+        ];
+
+        // child:
+        check(r"child:cmd \w\", &cmd_dirs);
+        check(r"child:*.exe \w\", &exe_dirs);
+        check(r"child:exe \w\", &exe_dirs);
+        check("child:windows", &["w"]);
+        check(r"child-file:sub \w\", &[]);
+        check(r"child-folder:sub \w\", &[r"w\windows"]);
+        check(r"childfolder:sub \w\", &[r"w\windows"]);
+        check(r"!child:cmd \w\", &but(&cmd_dirs));
+        check(r"child: \w\", &nonempty);
+        check(r"whole:child:cmd \w\", &[]);
+        check(r"whole:child:cmd.exe \w\", &cmd_dirs);
+        check(r"case:child:CMD \w\", &[]);
+        check(r"child:CMD \w\", &cmd_dirs);
+        check(r"child:cmd;notepad \w\", &cmd_dirs);
+        check(r"child:sub\deep \w\", &[]);
+        check("child:aeb", &["dia", "p"]);
+        check("diacritics:child:aeb", &["dia"]);
+        check("child:aéb", &["dia", "p"]);
+        check(r"file: child:cmd \w\", &[]);
+        check(
+            r"child:<cmd|x.sys> \w\",
+            &[
+                r"w\windows\system32\drivers",
+                r"w\windows\system32",
+                r"w\windows",
+            ],
+        );
+        check(r"child:!cmd \w\", &[]);
+        check(r"child:!!cmd \w\", &[]);
+        check("child:!bang", &["words"]);
+        check("whole:child:!bang.txt", &["words"]);
+        check("child-file:windows", &[]);
+        check("child-folder:windows", &["w"]);
+        check(r#"child:"first level first""#, &["desktop"]);
+        check(r"regex:child:^cmd \w\", &cmd_dirs);
+        check(r"child:regex:^cmd \w\", &[]);
+
+        // descendant:
+        let to_x = [
+            r"w\windows\system32\drivers",
+            r"w\windows\system32",
+            "w",
+            r"w\windows",
+        ];
+        check("descendant:x.sys", &to_x);
+        check(
+            r"descendant-folder:deep \w\",
+            &[r"w\windows\sub", r"w\windows"],
+        );
+        check(r"descendant-file:deep \w\", &[]);
+        check(
+            "descendant:a.exe",
+            &[r"w\windows\sub\deep", r"w\windows\sub", "w", r"w\windows"],
+        );
+        check(
+            r"!descendant:exe \w\",
+            &[
+                r"w\windows\system32\drivers",
+                r"w\windows\emptydir",
+                r"w\windows\sub\deep\a.exe",
+                r"w\windows2\b.exe",
+                r"w\mywindows\c.exe",
+                r"w\windows\cmd.exe",
+                r"w\windows\system32\cmd.exe",
+                r"w\windows.old\d.exe",
+                r"w\windows\notepad.exe",
+                r"w\windows\system32\drivers\x.sys",
+            ],
+        );
+        check(r"descendant: \w\", &nonempty);
+        check("descendant:windows", &["w"]);
+        check("descendant:!bang", &["words"]);
+        check("descendant-file:windows", &[]);
+
+        // sibling:
+        check(
+            r"sibling:notepad \w\",
+            &[
+                r"w\windows\emptydir",
+                r"w\windows\sub",
+                r"w\windows\system32",
+                r"w\windows\cmd.exe",
+            ],
+        );
+        let cmd_siblings = [
+            r"w\windows\system32\drivers",
+            r"w\windows\emptydir",
+            r"w\windows\sub",
+            r"w\windows\system32",
+            r"w\windows\notepad.exe",
+        ];
+        check(r"sibling:cmd \w\", &cmd_siblings);
+        check(r"sibling-file:cmd \w\", &cmd_siblings);
+        check(
+            r"sibling-folder:sub \w\",
+            &[
+                r"w\windows\emptydir",
+                r"w\windows\system32",
+                r"w\windows\cmd.exe",
+                r"w\windows\notepad.exe",
+            ],
+        );
+        check(
+            "sibling:windows",
+            &[
+                r"w\mywindows",
+                r"w\windows",
+                r"w\windows.old",
+                r"w\windows2",
+            ],
+        );
+        check(
+            "whole:sibling:windows",
+            &[r"w\mywindows", r"w\windows.old", r"w\windows2"],
+        );
+        check("sibling:c.exe", &[]);
+        check(
+            r"sibling: \w\",
+            &[
+                r"w\windows\system32\drivers",
+                r"w\windows\emptydir",
+                r"w\mywindows",
+                r"w\windows\sub",
+                r"w\windows\system32",
+                r"w\windows",
+                r"w\windows.old",
+                r"w\windows2",
+                r"w\windows\cmd.exe",
+                r"w\windows\system32\cmd.exe",
+                r"w\windows\notepad.exe",
+            ],
+        );
+        check(r"!sibling:cmd \w\", &but(&cmd_siblings));
+        check(
+            r"sibling:*.exe \w\",
+            &[
+                r"w\windows\system32\drivers",
+                r"w\windows\emptydir",
+                r"w\windows\sub",
+                r"w\windows\system32",
+                r"w\windows\cmd.exe",
+                r"w\windows\notepad.exe",
+            ],
+        );
+        check(
+            r"sibling:!bang \words\",
+            &[r"words\ever.txt", r"words\wow!.txt"],
+        );
+        check(r"sibling-file:sub \w\", &[]);
+        check(r"sibling-folder:cmd \w\", &[]);
+
+        // ancestor-name:
+        let below_windows = [
+            r"w\windows\sub\deep",
+            r"w\windows\system32\drivers",
+            r"w\windows\emptydir",
+            r"w\windows\sub",
+            r"w\windows\system32",
+            r"w\windows\sub\deep\a.exe",
+            r"w\windows\cmd.exe",
+            r"w\windows\system32\cmd.exe",
+            r"w\windows\notepad.exe",
+            r"w\windows\system32\drivers\x.sys",
+        ];
+        let mut below_any: Vec<&str> = below_windows.to_vec();
+        below_any.extend([
+            r"w\windows2\b.exe",
+            r"w\mywindows\c.exe",
+            r"w\windows.old\d.exe",
+        ]);
+        check(r"ancestor-name:windows \w\", &below_any);
+        check("whole:ancestor-name:windows", &below_windows);
+        check(
+            "ancestor-name:sub",
+            &[r"w\windows\sub\deep", r"w\windows\sub\deep\a.exe"],
+        );
+        let everything: Vec<String> = {
+            let parsed = parse_query("").unwrap();
+            let out = run_query(
+                &idx,
+                FIXTURE_ROOT,
+                &parsed,
+                None,
+                SortSpec::default(),
+                0,
+                None,
+            );
+            out.hits
+                .iter()
+                .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                .collect()
+        };
+        let everything: Vec<&str> = everything.iter().map(String::as_str).collect();
+        check("ancestor-name:fx", &everything);
+        check("whole:ancestor-name:fx", &[]);
+        check(r"ancestor-name:musta \w\", w_all);
+        check("whole:ancestor-name:w", w_all);
+        check(r"ancestor-name:w* \w\", w_all);
+        check(
+            r"!ancestor-name:windows \w\",
+            &[
+                r"w\mywindows",
+                r"w\windows",
+                r"w\windows.old",
+                r"w\windows2",
+            ],
+        );
+        check(
+            "ancestor-name:system32;sub",
+            &[
+                r"w\windows\sub\deep",
+                r"w\windows\system32\drivers",
+                r"w\windows\sub\deep\a.exe",
+                r"w\windows\system32\cmd.exe",
+                r"w\windows\system32\drivers\x.sys",
+            ],
+        );
+        check(r"ancestor-name: \w\", w_all);
+        check(
+            "ancestorname:sub",
+            &[r"w\windows\sub\deep", r"w\windows\sub\deep\a.exe"],
+        );
+        check(r"ancestor-name:!windows \w\", &[]);
+        check(
+            r#"ancestor-name:"First Level" \desktop\"#,
+            &[
+                r"desktop\First Level First\inner",
+                r"desktop\First Level First\f.txt",
+                r"desktop\First Level First\inner\g.txt",
+            ],
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The sub-searches against a plain reference over random trees
+        /// whose names repeat, fold alike and nest: each term's answer is
+        /// worked out entry by entry from the parent links (a folder's
+        /// children, its subtree, the entry's folder's other entries, the
+        /// folders above it), and the engine must give the same entries,
+        /// alone, negated, and ANDed or ORed with a name term.
+        #[test]
+        fn related_searches_agree_with_a_reference(
+            nodes in prop::collection::vec(
+                (any::<prop::sample::Index>(), 0usize..6, 0u8..3),
+                1..60,
+            ),
+            value in 0usize..6,
+            func in 0usize..10,
+            whole in any::<bool>(),
+            shape in 0u8..5,
+        ) {
+            const NAMES: [&str; 6] = ["a", "A", "ab", "b.txt", "é", "e\u{301}x"];
+            let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+            let mut dirs = vec![NTFS_ROOT_FRN];
+            for (i, (parent, name, kind)) in nodes.iter().enumerate() {
+                let f = frn(1000 + i as u64);
+                let is_dir = *kind == 0;
+                idx.insert_enum(&enum_rec(f, dirs[parent.index(dirs.len())], NAMES[*name], is_dir));
+                if is_dir {
+                    dirs.push(f);
+                }
+            }
+            idx.optimize_storage();
+            let funcs = [
+                "child:", "child-file:", "child-folder:", "descendant:", "descendant-file:",
+                "descendant-folder:", "sibling:", "sibling-file:", "sibling-folder:",
+                "ancestor-name:",
+            ];
+            let text = ["a", "b", "ab", "e", "x", ""][value];
+            let term = format!("{}{}{text}", if whole { "whole:" } else { "" }, funcs[func]);
+            let query = match shape {
+                0 => term.clone(),
+                1 => format!("!{term}"),
+                2 => format!("{term} a"),
+                3 => format!("{term}|b"),
+                // A path term, whose walk below the names holding `a` may
+                // grow past its share and leave the scan to the sub-search.
+                _ => format!("{term} a\\"),
+            };
+            // The reference: what the name term matches, and how entries
+            // relate, from the links.
+            let live: Vec<EntryIdx> = idx.live_entries().filter(|&e| !idx.is_synthetic(e)).collect();
+            let name_of = |e: EntryIdx| crate::fold::fold(idx.entry(e).name());
+            let named = |e: EntryIdx| {
+                let n = name_of(e);
+                let t = text.as_bytes();
+                // An empty value is any name, `whole:` or not.
+                t.is_empty() || if whole { n == t } else { memmem::find(&n, t).is_some() }
+            };
+            let kind_ok = |e: EntryIdx| match func % 3 {
+                _ if func == 9 => idx.entry(e).is_dir(),
+                1 => !idx.entry(e).is_dir(),
+                2 => idx.entry(e).is_dir(),
+                _ => true,
+            };
+            let hit = |e: EntryIdx| named(e) && kind_ok(e);
+            let above = |e: EntryIdx| {
+                let mut out = Vec::new();
+                let mut cur = idx.entry(e).parent();
+                while cur != NIL && cur != idx.root() {
+                    out.push(cur);
+                    cur = idx.entry(cur).parent();
+                }
+                out
+            };
+            let related = |e: EntryIdx| -> bool {
+                match func {
+                    0..=2 => live.iter().any(|&c| idx.entry(c).parent() == e && hit(c)),
+                    3..=5 => live.iter().any(|&c| above(c).contains(&e) && hit(c)),
+                    6..=8 => live
+                        .iter()
+                        .any(|&s| s != e && idx.entry(s).parent() == idx.entry(e).parent() && hit(s)),
+                    // The root's name is the prefix, `C:`, which none of the
+                    // values but the empty one is in.
+                    _ => text.is_empty() || above(e).into_iter().any(hit),
+                }
+            };
+            let name_a = |e: EntryIdx| memmem::find(&name_of(e), b"a").is_some();
+            let name_b = |e: EntryIdx| memmem::find(&name_of(e), b"b").is_some();
+            let path_of = |e: EntryIdx| {
+                let mut p = Vec::new();
+                idx.path_of(e, &mut p);
+                p
+            };
+            let mut want: Vec<String> = live
+                .iter()
+                .copied()
+                .filter(|&e| match shape {
+                    0 => related(e),
+                    1 => !related(e),
+                    2 => related(e) && name_a(e),
+                    3 => related(e) || name_b(e),
+                    _ => {
+                        related(e)
+                            && memmem::find(&crate::fold::fold(&path_of(e)), b"a\\").is_some()
+                    }
+                })
+                .map(|e| String::from_utf8(path_of(e)).unwrap())
+                .collect();
+            want.sort();
+            let mut got = run(&idx, &query);
+            got.sort();
+            prop_assert_eq!(got, want, "{}", query);
+        }
+    }
+
     fn accent_index() -> VolumeIndex {
         let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
         let root = NTFS_ROOT_FRN;
@@ -6985,6 +7615,122 @@ mod tests {
         assert_eq!(run(&idx, r"path:regex:^C:\\cafe\\"), vec![r"cafe\café.txt"]);
         assert_eq!(sorted(r"regex:\.txt$ !regex:^c"), sorted("*.txt !c*"));
         assert_eq!(run(&idx, "regex:^x.y|^ﬁ").len(), 2);
+    }
+
+    /// Name parts with case variants in and beyond ASCII, accents
+    /// precomposed and not, a ligature and Hangul, for the `regex:`
+    /// prefilter's test.
+    const REGEX_PARTS: &[&str] = &[
+        "a", "K", "k", "\u{212A}", "s", "S", "\u{17F}", "ß", "ẞ", "SS", "é", "e\u{301}", "É", "가",
+        "\u{11A8}", "x_1", ".", "b", "ﬁ", "fi",
+    ];
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// `regex:` answers with its literal prefilter (the pieces tested
+        /// before the pattern, the names they find, the folder names a
+        /// full-path pattern walks below) exactly as a plain test of the
+        /// pattern on every entry's name or full path does: patterns cut
+        /// from the tree's own names and paths, in other cases, with a
+        /// letter widened to a class, a letter made optional, an
+        /// alternation with text no name holds, or a wildcard part, matching
+        /// case or not.
+        #[test]
+        fn regex_prefilters_change_no_answer(
+            nodes in prop::collection::vec(
+                (
+                    any::<prop::sample::Index>(),
+                    prop::collection::vec(0..REGEX_PARTS.len(), 1..5),
+                    any::<bool>(),
+                ),
+                1..40,
+            ),
+            from in any::<prop::sample::Index>(),
+            cut in (any::<prop::sample::Index>(), any::<prop::sample::Index>()),
+            shape in 0u64..1 << 16,
+            case in prop::bool::weighted(0.2),
+        ) {
+            let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+            let mut dirs = vec![NTFS_ROOT_FRN];
+            for (i, (parent, parts, is_dir)) in nodes.iter().enumerate() {
+                let f = frn(1000 + i as u64);
+                let name: String = parts.iter().map(|&p| REGEX_PARTS[p]).collect();
+                idx.insert_enum(&enum_rec(f, dirs[parent.index(dirs.len())], &name, *is_dir));
+                if *is_dir {
+                    dirs.push(f);
+                }
+            }
+            idx.optimize_storage();
+            // Every entry with its name and full path as stored.
+            let entries: Vec<(String, String, String)> = idx
+                .live_entries()
+                .filter(|&e| !idx.is_synthetic(e))
+                .filter_map(|e| {
+                    let mut p = Vec::new();
+                    (idx.path_of(e, &mut p) == crate::index::volume::PathStatus::Ok).then(|| {
+                        let path = String::from_utf8(p).unwrap();
+                        let name = String::from_utf8(idx.entry(e).name().to_vec()).unwrap();
+                        (name, format!(r"C:\{path}"), path)
+                    })
+                })
+                .collect();
+            prop_assume!(!entries.is_empty());
+            // A pattern cut from a full path crosses folders when it holds
+            // a separator; one cut from a name tests names.
+            let (name, full, _) = &entries[from.index(entries.len())];
+            let on_path = shape % 3 == 0;
+            let source: Vec<char> = if on_path { full.chars().collect() } else { name.chars().collect() };
+            let (a, b) = (cut.0.index(source.len() + 1), cut.1.index(source.len() + 1));
+            let piece = &source[a.min(b)..a.max(b)];
+            prop_assume!(!piece.is_empty());
+            let mut pattern = String::new();
+            for (k, &c) in piece.iter().enumerate() {
+                let c = if (shape >> 2) & 1 == 1 {
+                    c.to_uppercase().next().unwrap_or(c)
+                } else {
+                    c
+                };
+                // Every character but a letter or a digit escaped, so that
+                // the lexer reads the pattern whole (`^:` is a prefix).
+                let lit = if c.is_alphanumeric() {
+                    c.to_string()
+                } else {
+                    format!("\\x{{{:X}}}", c as u32)
+                };
+                match (shape >> (3 + (k % 4) * 2)) & 3 {
+                    // A class of it and another letter.
+                    0 if k % 3 == 1 => pattern.push_str(&format!("[{lit}z]")),
+                    // Optional.
+                    1 if k % 3 == 2 => pattern.push_str(&format!("{lit}?")),
+                    _ => pattern.push_str(&lit),
+                }
+            }
+            match (shape >> 12) % 4 {
+                0 => pattern = format!("(?:{pattern}|qqq)"),
+                1 => pattern.push_str(".*b"),
+                2 => pattern.insert(0, '^'),
+                _ => {}
+            }
+            let query = format!(
+                "{}{}regex:{pattern}",
+                if case { "case:" } else { "" },
+                if on_path { "path:" } else { "" }
+            );
+            let regex = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(!case)
+                .build()
+                .unwrap();
+            let mut want: Vec<String> = entries
+                .iter()
+                .filter(|(name, full, _)| regex.is_match(if on_path { full } else { name }))
+                .map(|(_, _, path)| path.clone())
+                .collect();
+            want.sort();
+            let mut got = run(&idx, &query);
+            got.sort();
+            prop_assert_eq!(got, want, "{}", query);
+        }
     }
 
     /// A scope names a folder ignoring accents, but of two that fold alike

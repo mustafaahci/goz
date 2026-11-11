@@ -13,6 +13,10 @@
 //! those that need the entry, so the first can run in the pass over the
 //! distinct names, the fast path of a name-level query.
 //!
+//! A sub-search (`child:`, `descendant:`, `sibling:`, `ancestor-name:`) is
+//! worked out here too, once per volume, into the set of entries it holds
+//! for (see the `related` module), so that testing an entry is a lookup.
+//!
 //! The children of each AND and OR are ordered cheapest first (a kind, a
 //! size or date compare, a name search, a wildcard, an extension, a full-path
 //! search, a sub-path wildcard), since AND and OR do not care about order and
@@ -21,10 +25,11 @@
 use super::budget::Budget;
 use super::dates::DateFilter;
 use super::engine::{CACHED_PATH_MAX, anchored_lead, kind_matches, size_matches, term_admits};
-use super::expr::{CountOf, Expr, FolderPath, Leaf, LenOf, Target};
+use super::expr::{CountOf, Expr, FolderPath, Leaf, LenOf, Relation, Target};
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, SizeRange, Wildcard};
 use super::pattern::RegexTerm;
+use super::related::{RelatedSet, name_term_matches};
 use super::text::{TextMatcher, utf16_len};
 use crate::fold::{fold_exact_into, fold_into};
 use crate::index::volume::MAX_PATH_HOPS;
@@ -33,6 +38,8 @@ use crate::types::{EntryIdx, NIL};
 use memchr::memmem;
 use rustc_hash::FxHashSet;
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 /// How a leaf compares text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +153,8 @@ pub(super) enum CNode<'a> {
         target: Target,
         regex: &'a RegexTerm,
     },
+    /// A sub-search, worked out for the volume.
+    Related(Arc<RelatedSet>),
 }
 
 /// What [`compile`] compiles an expression against: one volume.
@@ -157,6 +166,12 @@ pub(super) struct Volume<'i> {
     /// The prefix ends with a separator, so the last part of a full path is
     /// the last part of the name.
     pub(super) parts_are_names: bool,
+    /// The query's budget, which a sub-search's work counts against.
+    pub(super) budget: &'i Budget<'i>,
+    /// The sub-searches worked out so far, by their leaf: an expression is
+    /// compiled twice for a volume (see `CompiledQuery::new`), and each
+    /// sub-search is worked out once.
+    pub(super) related: RefCell<Vec<(*const Leaf, Arc<RelatedSet>)>>,
 }
 
 impl Volume<'_> {
@@ -167,6 +182,39 @@ impl Volume<'_> {
             Form::Folded => Cow::Borrowed(self.folded_prefix),
             Form::Accented => Cow::Owned(crate::fold::fold_exact(self.raw_prefix)),
         }
+    }
+
+    /// Sub-search `leaf` on this volume, worked out now unless it was
+    /// already.
+    fn related(
+        &self,
+        leaf: &Leaf,
+        relation: Relation,
+        kind: Option<Kind>,
+        name: &CNode<'_>,
+    ) -> Arc<RelatedSet> {
+        let key: *const Leaf = leaf;
+        if let Some((_, set)) = self.related.borrow().iter().find(|(k, _)| *k == key) {
+            return Arc::clone(set);
+        }
+        let set = Arc::new(RelatedSet::new(
+            self.index,
+            relation,
+            kind,
+            name,
+            self.budget,
+        ));
+        self.related.borrow_mut().push((key, Arc::clone(&set)));
+        set
+    }
+
+    /// The name Everything gives the volume's root: its path, the mount
+    /// prefix without its last separator (`C:`, or `C:\mnt\data` for a
+    /// volume mounted in a folder).
+    fn root_name(&self) -> &[u8] {
+        self.raw_prefix
+            .strip_suffix(b"\\")
+            .unwrap_or(self.raw_prefix)
     }
 
     /// The folders `paths` (absolute, folded) name on this volume: `Ok`
@@ -376,6 +424,24 @@ fn compile_leaf<'a>(leaf: &'a Leaf, volume: &Volume) -> CNode<'a> {
                 CNode::False
             }
         }
+        Leaf::Related {
+            relation,
+            kind,
+            name,
+        } => {
+            // Above every entry is the root, named by the prefix.
+            if *relation == Relation::Ancestor
+                && name_term_matches(name, volume.root_name(), volume.budget)
+            {
+                return CNode::True;
+            }
+            let name = compile(name, volume);
+            if matches!(name, CNode::False) {
+                // No name matches: no entry is related to a match.
+                return CNode::False;
+            }
+            CNode::Related(volume.related(leaf, *relation, *kind, &name))
+        }
     }
 }
 
@@ -439,6 +505,19 @@ pub(super) fn source(node: &CNode<'_>) -> Option<Source> {
             CNode::Ancestor(dirs) if dirs.len() == 1 => Some(Source::Subtree(dirs[0])),
             _ => None,
         })
+    })
+}
+
+/// The first top-level sub-search of `node`, the expression's terms on the
+/// entry: every match is among the entries its set gives.
+pub(super) fn related_source(node: &CNode<'_>) -> Option<Arc<RelatedSet>> {
+    let items = match node {
+        CNode::And(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    items.iter().find_map(|i| match i {
+        CNode::Related(set) => Some(Arc::clone(set)),
+        _ => None,
     })
 }
 
@@ -560,6 +639,8 @@ impl<'a> CNode<'a> {
                 4
             }
             CNode::Ext(_) | CNode::Ancestor(_) | CNode::Count { .. } => 5,
+            // Worked out before the search: a lookup or two.
+            CNode::Related(_) => 2,
             CNode::Regex { target, .. } if target.by_name() => 6,
             CNode::Path { .. }
             | CNode::Text { .. }
@@ -606,11 +687,13 @@ impl<'a> CNode<'a> {
     }
 
     /// The needles of [`plan`] for this node: a name search's own needle, a
-    /// name wildcard's longest literal, `.ext` for each of a few extensions;
-    /// the best of an AND's children; all of an OR's, when each has some.
-    /// What a NOT, a kind, size or date term, a path term, a regular
-    /// expression or a term that matches case or accents matches holds no
-    /// needle its folded name must hold.
+    /// name wildcard's longest literal, `.ext` for each of a few extensions,
+    /// the literal pieces of a case-insensitive regular expression on the
+    /// name (see [`super::pattern::Need`]); the best of an AND's children;
+    /// all of an OR's, when each has some. What a NOT, a kind, size or date
+    /// term, a path term, any other regular expression or a term that
+    /// matches case or accents matches holds no needle its folded name must
+    /// hold.
     fn needles(&self) -> Option<Vec<Vec<u8>>> {
         match self {
             CNode::Name {
@@ -645,6 +728,15 @@ impl<'a> CNode<'a> {
                 ..
             } => lit.clone().map(|lit| vec![lit]),
             CNode::Ext(ext) => ext.needles(),
+            // The pieces of its text every match of a case-insensitive
+            // pattern on the name holds, folded as the names are.
+            CNode::Regex {
+                target: Target::Name | Target::Stem | Target::Extension,
+                regex,
+            } => regex
+                .need()
+                .filter(|need| need.folded)
+                .and_then(|need| need.needles()),
             CNode::And(items) => best(items.iter().filter_map(CNode::needles)),
             CNode::Or(items) => {
                 let mut all = Vec::new();
@@ -716,6 +808,20 @@ impl<'a> CNode<'a> {
                 })
             }
             CNode::Regex { target, regex } => {
+                // The text every match holds first: a `memmem` or two on the
+                // folded text, which a case-insensitive query has read
+                // already, turn most entries away before the stored text is
+                // read and the pattern runs.
+                if let Some(need) = regex.need() {
+                    let form = if need.folded { Form::Folded } else { Form::Raw };
+                    let budget = s.budget;
+                    let holds = s
+                        .hay(*target, form)
+                        .is_some_and(|(hay, _)| !long_and_spent(hay, budget) && need.holds(hay));
+                    if !holds {
+                        return false;
+                    }
+                }
                 // Read the text once to count it, as a spent budget stops
                 // the match before it runs; reading it again costs nothing.
                 let Some(len) = s.hay(*target, Form::Raw).map(|(hay, _)| hay.len()) else {
@@ -769,6 +875,7 @@ impl<'a> CNode<'a> {
             CNode::Parent(dirs) => s
                 .entry
                 .is_some_and(|e| dirs.binary_search(&s.index.entry(e).parent()).is_ok()),
+            CNode::Related(set) => s.entry.is_some_and(|e| set.holds(s.index, e)),
             CNode::Ancestor(dirs) => s.entry.is_some_and(|e| {
                 let mut cur = s.index.entry(e).parent();
                 for _ in 0..MAX_PATH_HOPS {
@@ -1507,11 +1614,14 @@ mod tests {
         let parsed = parse_query(query).unwrap();
         let index = VolumeIndex::new(crate::index::NTFS_ROOT_FRN, crate::index::FrnMap::sparse());
         let folded = crate::fold::fold(prefix.as_bytes());
+        let budget = Budget::unlimited();
         let volume = Volume {
             index: &index,
             raw_prefix: prefix.as_bytes(),
             folded_prefix: &folded,
             parts_are_names: true,
+            budget: &budget,
+            related: RefCell::default(),
         };
         let e = parsed.expr.as_ref().expect("an expression");
         f(&compile(e, &volume));
@@ -1568,11 +1678,14 @@ mod tests {
         });
         let parsed = parse_query("<a|b> <c|file:> <d|x\\y> <ww:e|len:3>").unwrap();
         let index = VolumeIndex::new(crate::index::NTFS_ROOT_FRN, crate::index::FrnMap::sparse());
+        let budget = Budget::unlimited();
         let volume = Volume {
             index: &index,
             raw_prefix: br"C:\",
             folded_prefix: br"c:\",
             parts_are_names: true,
+            budget: &budget,
+            related: RefCell::default(),
         };
         let node = compile(parsed.expr.as_ref().unwrap(), &volume);
         let (name, entry) = split(node);
@@ -1590,11 +1703,14 @@ mod tests {
     fn needles_of(query: &str) -> Option<Vec<String>> {
         let parsed = parse_query(query).unwrap();
         let index = VolumeIndex::new(crate::index::NTFS_ROOT_FRN, crate::index::FrnMap::sparse());
+        let budget = Budget::unlimited();
         let volume = Volume {
             index: &index,
             raw_prefix: br"C:\",
             folded_prefix: br"c:\",
             parts_are_names: true,
+            budget: &budget,
+            related: RefCell::default(),
         };
         let node = compile(parsed.expr.as_ref().expect("an expression"), &volume);
         plan([&node]).map(|needles| {

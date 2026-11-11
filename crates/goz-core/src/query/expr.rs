@@ -114,6 +114,23 @@ pub enum CountOf {
     ChildFolders,
 }
 
+/// How the entries a sub-search names relate to the entry tested: the four
+/// functions that search other entries' names (`child:`, `descendant:`,
+/// `sibling:`, `ancestor-name:`), each answered from the parent and child
+/// links the index keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Relation {
+    /// The entry is a folder that holds one directly.
+    Child,
+    /// The entry is a folder that holds one at any depth.
+    Descendant,
+    /// Another entry of the entry's folder.
+    Sibling,
+    /// A folder above the entry, the volume's root included, whose name is
+    /// then the mount prefix (`C:`), as Everything names a root by its path.
+    Ancestor,
+}
+
 /// One term. Text is folded unless the term matches case: with
 /// [`crate::fold::fold`], case and accents ignored, or with
 /// [`crate::fold::fold_exact`] under `diacritics:`, which keeps accents
@@ -171,6 +188,16 @@ pub enum Leaf {
     Ancestor(Vec<FolderPath>),
     /// The entry is on this drive (an ASCII letter, lower-cased): `d:`.
     Drive(u8),
+    /// An entry related to this one as `relation` says, and of `kind` when
+    /// set (`child-file:`), has a name that `name` matches: a term on the
+    /// name (text, a wildcard or a regular expression, with its modifiers),
+    /// or an OR of them, or `True` for an empty value, which any name
+    /// matches.
+    Related {
+        relation: Relation,
+        kind: Option<Kind>,
+        name: Box<Expr>,
+    },
 }
 
 /// A folder `parent:` or `ancestor:` names.
@@ -249,13 +276,19 @@ impl Expr {
         Expr::Not(Box::new(self))
     }
 
-    /// Visits every leaf.
+    /// Visits every leaf, and the leaves of a sub-search's term on the name
+    /// after the sub-search's own.
     pub fn for_each_leaf<'a>(&'a self, f: &mut impl FnMut(&'a Leaf)) {
         match self {
             Expr::True | Expr::False => {}
             Expr::And(items) | Expr::Or(items) => items.iter().for_each(|e| e.for_each_leaf(f)),
             Expr::Not(inner) => inner.for_each_leaf(f),
-            Expr::Leaf(leaf) => f(leaf),
+            Expr::Leaf(leaf) => {
+                f(leaf);
+                if let Leaf::Related { name, .. } = leaf {
+                    name.for_each_leaf(f);
+                }
+            }
         }
     }
 }
@@ -386,6 +419,14 @@ pub(super) fn is_plain_ext(v: &[u8]) -> bool {
 pub(super) fn regex_terms(e: &Expr) -> usize {
     let mut n = 0;
     e.for_each_leaf(&mut |leaf| n += usize::from(matches!(leaf, Leaf::Regex { .. })));
+    n
+}
+
+/// How many sub-searches (`child:`, `descendant:`, `sibling:`,
+/// `ancestor-name:`) `e` holds.
+pub(super) fn related_terms(e: &Expr) -> usize {
+    let mut n = 0;
+    e.for_each_leaf(&mut |leaf| n += usize::from(matches!(leaf, Leaf::Related { .. })));
     n
 }
 

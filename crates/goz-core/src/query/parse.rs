@@ -33,7 +33,10 @@
 //! folders. Functions test what the name alone does not hold: `ext:`,
 //! `extension:`, `size:`, `dm:`, the lengths (`len:`, ...), `parent:`,
 //! `ancestor:`, and the parts of a full path (`name:`, `stem:`,
-//! `full-path:`, `location:`, `parent-name:`); a function's value may be a
+//! `full-path:`, `location:`, `parent-name:`), the counts (`parent-count:`,
+//! `child-count:` ...), and the sub-searches of other entries' names
+//! (`child:`, `descendant:`, `sibling:`, `ancestor-name:`, whose value is a
+//! term on those names, modifiers and all); a function's value may be a
 //! `;` list (any one matches) or a group (`ext:<pdf|txt>`). The macros
 //! `audio:`, `zip:`, `doc:`, `exe:`, `image:` (`pic:`) and `video:` keep
 //! the files of Everything's own filters. `case:` and `matchpath:` with no
@@ -53,7 +56,7 @@
 //! query is parsed with.
 
 use super::dates::{DateFilter, LocalClock, date_filter};
-use super::expr::{self, Anchors, CountOf, Expr, FolderPath, Leaf, LenOf, Skip, Target};
+use super::expr::{self, Anchors, CountOf, Expr, FolderPath, Leaf, LenOf, Relation, Skip, Target};
 use super::lex::{self, Func, Macro, ModSet, Prefix, Text, Tok, Token};
 use super::pattern::RegexTerm;
 use super::value::{self, Number};
@@ -140,7 +143,9 @@ pub enum QueryError {
     /// would match nothing, since no name contains `:`.
     #[error(
         "unknown search function or modifier '{0}'; goz supports ext:, extension:, size:, dm:, \
-         len:, parent:, ancestor:, name:, stem:, full-path:, location:, parent-name:, the macros \
+         len:, parent:, ancestor:, name:, stem:, full-path:, location:, parent-name:, \
+         parent-count:, child-count:, child-file-count:, child-folder-count:, empty:, child:, \
+         descendant:, sibling: (each with -file: and -folder: forms), ancestor-name:, the macros \
          audio:, zip:, doc:, exe:, image: and video:, and the modifiers case:, diacritics:, \
          regex:, path:, file:, folder:, ww:, prefix:, suffix:, whole:, startwith:, endwith:, \
          nopunc:, nows:, starall:, nowildcards: and metric: (each with Everything's aliases and \
@@ -191,6 +196,12 @@ const MAX_QUERY_TERMS: usize = 256;
 /// and each keeps caches on every thread of the pass over the names (see
 /// the `pattern` module): 8 keep a hostile query's memory to tens of MiB.
 const MAX_REGEX_TERMS: usize = 8;
+
+/// The most sub-searches (`child:`, `descendant:`, `sibling:`,
+/// `ancestor-name:`, a `;` list being one) one query may hold. Each is a
+/// pass over the names and a set of the volume's entries, a bit each, made
+/// before the search: 8 keep a hostile query's to a few MB.
+const MAX_RELATED_TERMS: usize = 8;
 
 /// How deep groups and prefixes may nest. Each level is a frame of the
 /// parser and of every walk of the expression, and the text arrives from the
@@ -281,6 +292,16 @@ fn parse(
             what: "regex:",
             detail: format!(
                 "the query has {regexes} regex: terms; a query may have at most {MAX_REGEX_TERMS}"
+            ),
+        });
+    }
+    let related = q.expr.as_ref().map_or(0, expr::related_terms);
+    if related > MAX_RELATED_TERMS {
+        return Err(QueryError::Malformed {
+            what: "sub-search",
+            detail: format!(
+                "the query has {related} child:, descendant:, sibling: and ancestor-name: terms; \
+                 a query may have at most {MAX_RELATED_TERMS}"
             ),
         });
     }
@@ -720,6 +741,9 @@ impl<'t> Parser<'t, '_> {
         let set = mods.set.over(global);
         let e = if func == Func::Ext {
             ext_leaf(text, set)
+        } else if related_of(func).is_some() {
+            // A list is one sub-search, of any of its values.
+            self.related(func, text.items(), text.literal_wild, set)?
         } else {
             let mut items = Vec::new();
             for item in text.items() {
@@ -762,8 +786,20 @@ impl<'t> Parser<'t, '_> {
                     Leaf::Ancestor(vec![path])
                 }));
             }
-            // `value` reads an `ext:` list whole.
+            // `value` reads an `ext:` list whole, and a sub-search's.
             Func::Ext => return Ok(ext_leaf(&Text::default(), set)),
+            Func::Child
+            | Func::ChildFile
+            | Func::ChildFolder
+            | Func::Descendant
+            | Func::DescendantFile
+            | Func::DescendantFolder
+            | Func::Sibling
+            | Func::SiblingFile
+            | Func::SiblingFolder
+            | Func::AncestorName => {
+                return self.related(func, std::iter::once(item), literal_wild, set);
+            }
             Func::Date => {
                 // A value's own `!` negates it, here as before the list.
                 let (nots, item) = bangs(item);
@@ -826,6 +862,56 @@ impl<'t> Parser<'t, '_> {
         };
         self.term(Some(target), item, literal_wild, set)
     }
+}
+
+impl Parser<'_, '_> {
+    /// A sub-search (`child:`, `descendant:`, `sibling:`, `ancestor-name:`)
+    /// of `values`, any one of which an other entry's name matches: each a
+    /// term on the name under the term's modifiers, so `whole:child:cmd.exe`
+    /// names a child called `cmd.exe` and `regex:child:^cmd` one whose name
+    /// starts so. A value's leading `!` is text, as in Everything
+    /// (`child:!bang` is a folder holding `!bang.txt`), and so is a `\`: a
+    /// name holds none, so `child:sub\deep` matches nothing, as there.
+    fn related<'v>(
+        &self,
+        func: Func,
+        values: impl Iterator<Item = &'v [u8]>,
+        literal_wild: bool,
+        set: ModSet,
+    ) -> Result<Expr, QueryError> {
+        let Some((relation, kind)) = related_of(func) else {
+            return Ok(Expr::False);
+        };
+        let mut name = Expr::False;
+        for value in values {
+            name = Expr::or(
+                name,
+                self.term(Some(Target::Name), value, literal_wild, set)?,
+            );
+        }
+        Ok(Expr::Leaf(Leaf::Related {
+            relation,
+            kind,
+            name: Box::new(expr::simplify(name)),
+        }))
+    }
+}
+
+/// The relation and kind of a sub-search function; `None` for any other.
+fn related_of(func: Func) -> Option<(Relation, Option<Kind>)> {
+    Some(match func {
+        Func::Child => (Relation::Child, None),
+        Func::ChildFile => (Relation::Child, Some(Kind::File)),
+        Func::ChildFolder => (Relation::Child, Some(Kind::Folder)),
+        Func::Descendant => (Relation::Descendant, None),
+        Func::DescendantFile => (Relation::Descendant, Some(Kind::File)),
+        Func::DescendantFolder => (Relation::Descendant, Some(Kind::Folder)),
+        Func::Sibling => (Relation::Sibling, None),
+        Func::SiblingFile => (Relation::Sibling, Some(Kind::File)),
+        Func::SiblingFolder => (Relation::Sibling, Some(Kind::Folder)),
+        Func::AncestorName => (Relation::Ancestor, Some(Kind::Folder)),
+        _ => return None,
+    })
 }
 
 /// A number's or a date's own `!` (`size:!1kb`, `dm:!today`, `extlen:!3`):
@@ -2133,6 +2219,98 @@ mod tests {
         assert!(matches!(
             parse_query("len:1kb"),
             Err(QueryError::Malformed { what: "len:", .. })
+        ));
+    }
+
+    /// The sub-searches (W7, checked against a live Everything 1.5): the
+    /// value is a term on the other entry's name under the term's
+    /// modifiers, a `;` list one sub-search of any of its values, a leading
+    /// `!` text; each spelling with and without its hyphens; at most 8 in a
+    /// query.
+    #[test]
+    fn sub_searches_take_a_term_on_the_name() {
+        let rel = |relation, kind, name: Expr| {
+            Expr::Leaf(Leaf::Related {
+                relation,
+                kind,
+                name: Box::new(name),
+            })
+        };
+        assert_eq!(ex("child:CMD"), rel(Relation::Child, None, name("cmd")));
+        assert_eq!(
+            ex("child-file:a;b"),
+            rel(
+                Relation::Child,
+                Some(Kind::File),
+                or([name("a"), name("b")])
+            )
+        );
+        assert_eq!(
+            ex("childfolder:x"),
+            rel(Relation::Child, Some(Kind::Folder), name("x"))
+        );
+        assert_eq!(
+            ex("descendant-folder:x"),
+            rel(Relation::Descendant, Some(Kind::Folder), name("x"))
+        );
+        assert_eq!(
+            ex("siblingfile:x"),
+            rel(Relation::Sibling, Some(Kind::File), name("x"))
+        );
+        assert_eq!(
+            ex("sibling:!bang"),
+            rel(Relation::Sibling, None, name("!bang"))
+        );
+        assert_eq!(
+            ex("ancestorname:"),
+            rel(Relation::Ancestor, Some(Kind::Folder), Expr::True)
+        );
+        // A separator is text: no name holds one.
+        assert_eq!(
+            ex(r"child:sub\deep"),
+            rel(Relation::Child, None, name(r"sub\deep"))
+        );
+        assert_eq!(
+            ex("child:<a|b>"),
+            or([
+                rel(Relation::Child, None, name("a")),
+                rel(Relation::Child, None, name("b"))
+            ])
+        );
+        let Expr::Leaf(Leaf::Related { name: whole, .. }) = ex("whole:child:a") else {
+            panic!()
+        };
+        assert!(
+            matches!(*whole, Expr::Leaf(Leaf::Text { anchors, .. }) if anchors.start && anchors.end)
+        );
+        let Expr::Leaf(Leaf::Related { name: re, .. }) = ex("regex:child:^c") else {
+            panic!()
+        };
+        assert!(matches!(
+            *re,
+            Expr::Leaf(Leaf::Regex {
+                target: Target::Name,
+                ..
+            })
+        ));
+        // `regex:` inside the value is text.
+        assert_eq!(
+            ex("child:regex:^cmd"),
+            rel(Relation::Child, None, name("regex:^cmd"))
+        );
+        assert!(parse_query(&"child:a ".repeat(8)).is_ok());
+        assert!(parse_query("child:a;b;c;d;e;f;g;h;i").is_ok());
+        assert!(matches!(
+            parse_query(&"sibling:a ".repeat(9)),
+            Err(QueryError::Malformed {
+                what: "sub-search",
+                ..
+            })
+        ));
+        // Its terms count toward the regex cap.
+        assert!(matches!(
+            parse_query(&"regex:child:a ".repeat(9)),
+            Err(QueryError::Malformed { what: "regex:", .. })
         ));
     }
 

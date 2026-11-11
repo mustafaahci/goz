@@ -20,6 +20,7 @@ pub mod parse;
 #[cfg(test)]
 mod parse_v060;
 mod pattern;
+mod related;
 mod text;
 mod value;
 
