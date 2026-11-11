@@ -16,6 +16,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(windows)]
 mod bootstrap;
 #[cfg(windows)]
+mod config;
+#[cfg(windows)]
 mod local_clock;
 #[cfg(windows)]
 mod pulse;

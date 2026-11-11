@@ -11,6 +11,7 @@
 
 use super::budget::{Budget, Stopped, Watch};
 use super::cexpr::{self, CNode, ExtMatcher, Form, Scratch, Source, Subject, Volume};
+use super::disk::{DiskProps, prop_value, sort_column};
 use super::expr::{Expr, Leaf, Target};
 use super::folder_rank::FolderRanks;
 use super::glob::{CodePointBuf, Glob, decode_into};
@@ -25,7 +26,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::ops::Range;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// One matched entry. The daemon prepends the volume mount prefix to `path`
 /// and formats `mtime` for display.
@@ -181,6 +182,19 @@ impl<'a> CompiledQuery<'a> {
         mount_prefix: &str,
         budget: &'a Budget<'a>,
     ) -> Self {
+        Self::new_with(index, parsed, mount_prefix, budget, None)
+    }
+
+    /// [`Self::new`] with the optional columns' values read from disk for
+    /// the query's second search, or `None` for its first (see
+    /// `cexpr::compile`).
+    pub fn new_with(
+        index: &VolumeIndex,
+        parsed: &'a ParsedQuery,
+        mount_prefix: &str,
+        budget: &'a Budget<'a>,
+        disk: Option<Arc<DiskProps>>,
+    ) -> Self {
         // The prefilter is the longest literal from any name term, wildcard, or
         // single `ext:` value;
         // every match must contain it, so scanning for it yields a superset of
@@ -274,6 +288,7 @@ impl<'a> CompiledQuery<'a> {
             parts_are_names,
             budget,
             related: Default::default(),
+            disk,
         };
         let expr = parsed.expr.as_ref().map(|e| cexpr::compile(e, &volume));
         let expr_admits = !matches!(expr, Some(CNode::False));
@@ -617,20 +632,40 @@ pub fn run_query_refs(
     )
 }
 
-/// The page of a query as references: the one implementation behind
-/// [`run_query`] and [`run_query_refs`].
-///
-/// A name-sorted query whose predicates are all decided by the file name (see
-/// [`is_name_level`]) never builds a candidate: it matches the distinct names
-/// (about a quarter of the entries on a real volume, since names are
-/// interned), counts matches from each name's refcount, and pages by walking
-/// the matched names in name order and their same-name chains. No sort runs,
-/// and a 100-row page of a broad query leaves as soon as 100 entries have
-/// been walked. A bounded page sorted by an entry key keeps only its best
-/// rows as it scans (see [`top_k_refs`]). Everything else takes the
-/// candidate path: scan, order, slice. `fast` exists for the tests that hold
-/// these paths equal to the candidate path. See [`run_query_refs`] for what
-/// `budget` stops.
+/// [`run_query_refs`] for a query that reads optional columns from disk
+/// (see [`super::disk::disk_columns`]): its first search, with `disk`
+/// `None`, finds the entries whose values the daemon then reads, and its
+/// second, with what it read, gives the page. The daemon reads them
+/// outside the index lock.
+#[allow(clippy::too_many_arguments)]
+pub fn run_query_refs_disk(
+    index: &VolumeIndex,
+    mount_prefix: &str,
+    parsed: &ParsedQuery,
+    scope: Option<EntryIdx>,
+    sort: SortSpec,
+    offset: u32,
+    limit: Option<u32>,
+    sum_sizes: bool,
+    budget: &Budget,
+    disk: Option<Arc<DiskProps>>,
+) -> Result<RefOutcome, Stopped> {
+    page_refs_disk(
+        index,
+        mount_prefix,
+        parsed,
+        scope,
+        sort,
+        offset,
+        limit,
+        sum_sizes,
+        true,
+        budget,
+        disk,
+    )
+}
+
+/// [`page_refs_disk`] with nothing read from disk.
 #[allow(clippy::too_many_arguments)]
 fn page_refs(
     index: &VolumeIndex,
@@ -644,7 +679,51 @@ fn page_refs(
     fast: bool,
     budget: &Budget,
 ) -> Result<RefOutcome, Stopped> {
-    let compiled = CompiledQuery::new(index, parsed, mount_prefix, budget);
+    page_refs_disk(
+        index,
+        mount_prefix,
+        parsed,
+        scope,
+        sort,
+        offset,
+        limit,
+        sum_sizes,
+        fast,
+        budget,
+        None,
+    )
+}
+
+/// The page of a query as references: the one implementation behind
+/// [`run_query`] and [`run_query_refs`].
+///
+/// A name-sorted query whose predicates are all decided by the file name (see
+/// [`is_name_level`]) never builds a candidate: it matches the distinct names
+/// (about a quarter of the entries on a real volume, since names are
+/// interned), counts matches from each name's refcount, and pages by walking
+/// the matched names in name order and their same-name chains. No sort runs,
+/// and a 100-row page of a broad query leaves as soon as 100 entries have
+/// been walked. A bounded page sorted by an entry key keeps only its best
+/// rows as it scans (see [`top_k_refs`]). Everything else takes the
+/// candidate path: scan, order, slice. `fast` exists for the tests that hold
+/// these paths equal to the candidate path. See [`run_query_refs`] for what
+/// `budget` stops, and [`run_query_refs_disk`] for `disk`.
+#[allow(clippy::too_many_arguments)]
+fn page_refs_disk(
+    index: &VolumeIndex,
+    mount_prefix: &str,
+    parsed: &ParsedQuery,
+    scope: Option<EntryIdx>,
+    sort: SortSpec,
+    offset: u32,
+    limit: Option<u32>,
+    sum_sizes: bool,
+    fast: bool,
+    budget: &Budget,
+    disk: Option<Arc<DiskProps>>,
+) -> Result<RefOutcome, Stopped> {
+    let compiled = CompiledQuery::new_with(index, parsed, mount_prefix, budget, disk.clone());
+    let disk = disk.as_deref();
     // A top-level `ancestor:` is a scope: its subtree is walked as one is.
     let scope = scope.or(match compiled.source {
         Some(Source::Subtree(dir)) => Some(dir),
@@ -684,7 +763,9 @@ fn page_refs(
         && let Some(limit) = limit
         && top_k_applies(index, parsed, &compiled, scope, sort, offset, Some(limit))
     {
-        return top_k_refs(index, parsed, &compiled, sort, offset, limit, sum_sizes);
+        return top_k_refs(
+            index, parsed, &compiled, sort, offset, limit, sum_sizes, disk,
+        );
     }
     let mut candidates = scan(index, parsed, &compiled, scope);
     if budget.spent() {
@@ -693,7 +774,7 @@ fn page_refs(
     let total = candidates.len() as u64;
     let total_size = sum_sizes.then(|| files_size(index, candidates.iter().map(|c| c.idx)));
     let (start, end) = page_bounds(candidates.len(), offset, limit);
-    order(index, &mut candidates, sort, end);
+    order(index, &mut candidates, sort, end, disk);
     let refs = candidates[start..end]
         .iter()
         .map(|c| HitRef {
@@ -1555,6 +1636,7 @@ fn top_k_refs(
     offset: u32,
     limit: u32,
     sum_sizes: bool,
+    disk: Option<&DiskProps>,
 ) -> Result<RefOutcome, Stopped> {
     use rayon::prelude::*;
     let needles = compiled.needles(parsed);
@@ -1626,7 +1708,7 @@ fn top_k_refs(
                 if want == 0 {
                     continue;
                 }
-                c.key = entry_key(index, sort, idx);
+                c.key = entry_key(index, sort, idx, disk);
                 if kept.len() == 2 * want {
                     kept.select_nth_unstable_by(want - 1, cmp);
                     kept.truncate(want);
@@ -2088,21 +2170,54 @@ fn page_bounds(n: usize, offset: u32, limit: Option<u32>) -> (usize, usize) {
 /// Orders `candidates` so that `[..end]` holds the first `end` matches under
 /// `sort`, in order (see [`order_top`]). A path sort first ranks each distinct
 /// parent directory; no candidate carries a key string.
-fn order(index: &VolumeIndex, candidates: &mut [Candidate], sort: SortSpec, end: usize) {
+fn order(
+    index: &VolumeIndex,
+    candidates: &mut [Candidate],
+    sort: SortSpec,
+    end: usize,
+    disk: Option<&DiskProps>,
+) {
     if sort.key == SortKey::Path {
         path_keys(index, candidates);
     } else {
         for c in candidates.iter_mut() {
-            c.key = entry_key(index, sort, c.idx);
+            c.key = entry_key(index, sort, c.idx, disk);
+        }
+        if sort.key == SortKey::Attributes {
+            with_name_ranks(index, candidates);
         }
     }
     order_top(index, candidates, sort, end);
 }
 
+/// Folds each candidate's name rank key into its key, below the rank of its
+/// key among the few distinct ones: an attributes sort ties on most rows (a
+/// volume has a handful of attribute sets), and each tie compared two folded
+/// names, which made a full sort of 3M entries take 405 ms against a date
+/// sort's 139 ms (W9, one pass); integers alone take it back to the dates'.
+/// The order is the same: key, then name, as [`cmp_candidate`] breaks ties.
+fn with_name_ranks(index: &VolumeIndex, candidates: &mut [Candidate]) {
+    let mut keys: Vec<u64> = candidates.iter().map(|c| c.key).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    // A name rank key is below 2^33 (see `NameStore::rank_key`).
+    if keys.len() >= 1 << 30 {
+        return;
+    }
+    let rank: FxHashMap<u64, u64> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, &k)| (k, i as u64))
+        .collect();
+    for c in candidates.iter_mut() {
+        c.key = (rank[&c.key] << 33) | index.name_rank_key(index.name_id(c.idx));
+    }
+}
+
 /// The key a name, size or date sort orders entry `idx` by. A path sort's
 /// keys need every candidate's folder ranked first, which [`path_keys`]
 /// does, so a path sort is never asked here.
-fn entry_key(index: &VolumeIndex, sort: SortSpec, idx: EntryIdx) -> u64 {
+fn entry_key(index: &VolumeIndex, sort: SortSpec, idx: EntryIdx, disk: Option<&DiskProps>) -> u64 {
     match sort.key {
         // Two integers per comparison instead of two folded names: see
         // `NameStore::rank_key`. Names still waiting outside the order get a
@@ -2111,6 +2226,33 @@ fn entry_key(index: &VolumeIndex, sort: SortSpec, idx: EntryIdx) -> u64 {
         SortKey::Size => size_key(index.entry(idx).size(), sort.dir),
         SortKey::DateModified => mtime_key(index.entry(idx).mtime(), sort.dir),
         SortKey::Path => 0,
+        SortKey::DateCreated
+        | SortKey::DateAccessed
+        | SortKey::Attributes
+        | SortKey::DateRecentlyChanged => column_key(index, idx, sort, disk),
+    }
+}
+
+/// The key a sort by an optional column orders entry `idx` by: its date as
+/// [`mtime_key`] keys one, or its attributes as a number, an unknown value
+/// last; the index's value while the column is settled, else what `disk`
+/// read. 0 for any other key. The daemon's merge of several volumes keys
+/// by this one function too.
+pub fn column_key(
+    index: &VolumeIndex,
+    idx: EntryIdx,
+    sort: SortSpec,
+    disk: Option<&DiskProps>,
+) -> u64 {
+    let Some(column) = sort_column(sort.key) else {
+        return 0;
+    };
+    match prop_value(index, idx, column, disk) {
+        (_, Some(attrib)) => {
+            unknown_last(Some(crate::output::attribute_sort_key(attrib)), sort.dir)
+        }
+        (date, None) if sort.key != SortKey::Attributes => mtime_key(date, sort.dir),
+        _ => unknown_last(None, sort.dir),
     }
 }
 
@@ -3475,6 +3617,7 @@ mod tests {
                 name_lossy: false,
                 dos_only: false,
             }],
+            ..Default::default()
         });
     }
 
@@ -3556,6 +3699,7 @@ mod tests {
                 name(NTFS_ROOT_FRN, "twin1.bin"),
                 name(frn(100), "twin2.bin"),
             ],
+            ..Default::default()
         });
         for (query, rows, size) in [("twin", 2, 2000), ("twin2", 1, 1000)] {
             let parsed = parse_query(query).unwrap();
@@ -6673,6 +6817,12 @@ mod tests {
                         }
                         SortKey::DateModified => {
                             (mtime_key(entry.mtime(), sort.dir), Vec::new(), fold_name(e))
+                        }
+                        SortKey::DateCreated
+                        | SortKey::DateAccessed
+                        | SortKey::Attributes
+                        | SortKey::DateRecentlyChanged => {
+                            (column_key(idx, e, sort, None), Vec::new(), fold_name(e))
                         }
                     };
                     (key, e)

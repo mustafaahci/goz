@@ -21,7 +21,8 @@ mod exit;
 mod help;
 
 pub use argv::{
-    Command, EsFatal, EsPlan, HelpScreen, OutputFormat, parse_argv, parse_command_line,
+    Command, ConfigCommand, EsFatal, EsPlan, HelpScreen, OutputFormat, parse_argv,
+    parse_command_line,
 };
 pub use exit::Exit;
 pub use help::{VERSION_LINE, help};

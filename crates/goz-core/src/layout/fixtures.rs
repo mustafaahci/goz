@@ -68,11 +68,22 @@ impl LayoutNameFixture {
 pub struct LayoutInfoFixture {
     /// `LastWriteTime` as a Windows FILETIME.
     pub mtime: i64,
+    /// `CreationTime`.
+    pub ctime: i64,
+    /// `LastAccessTime`.
+    pub atime: i64,
+    /// `FileAttributes`; `None` writes the entry's own.
+    pub attributes: Option<u32>,
 }
 
 impl LayoutInfoFixture {
     pub fn with_mtime(mtime: i64) -> Self {
-        Self { mtime }
+        Self {
+            mtime,
+            ctime: 0,
+            atime: 0,
+            attributes: None,
+        }
     }
 }
 
@@ -143,6 +154,12 @@ impl LayoutFileFixture {
         let is_dir = self.attributes & 0x10 != 0;
         let names = self.names.iter().map(LayoutNameFixture::expected).collect();
         let mtime_ft = self.info.as_ref().map(|i| i.mtime);
+        let ctime_ft = self.info.as_ref().map(|i| i.ctime);
+        let atime_ft = self.info.as_ref().map(|i| i.atime);
+        let basic_attributes = self
+            .info
+            .as_ref()
+            .map(|i| i.attributes.unwrap_or(self.attributes));
         let size = if is_dir {
             None
         } else {
@@ -156,6 +173,9 @@ impl LayoutFileFixture {
             attributes: self.attributes,
             size,
             mtime_ft,
+            ctime_ft,
+            atime_ft,
+            basic_attributes,
             names,
         }
     }
@@ -251,14 +271,17 @@ fn append_file(buf: &mut Vec<u8>, entry_off: usize, file: &LayoutFileFixture) {
         let rel = (buf.len() - entry_off) as u32;
         patch_u32(buf, extra_info_pos, rel);
         patch_u32(buf, extra_info_len_pos, INFO_ENTRY_LEN as u32);
-        // FILE_LAYOUT_INFO_ENTRY.BasicInformation: the parser reads the first
-        // 24 bytes (CreationTime, LastAccessTime, LastWriteTime).
-        push_i64(buf, 0); // CreationTime
-        push_i64(buf, 0); // LastAccessTime
+        // FILE_LAYOUT_INFO_ENTRY.BasicInformation: the parser reads its
+        // first 36 bytes (CreationTime, LastAccessTime, LastWriteTime,
+        // ChangeTime, FileAttributes).
+        push_i64(buf, info.ctime); // CreationTime
+        push_i64(buf, info.atime); // LastAccessTime
         push_i64(buf, info.mtime); // LastWriteTime
-        // Remainder up to INFO_ENTRY_LEN (ChangeTime, attrs, ids, Usn): the
-        // parser never reads these; zeros keep offsets honest.
-        buf.resize(buf.len() + (INFO_ENTRY_LEN - 24), 0);
+        push_i64(buf, 0); // ChangeTime
+        push_u32(buf, info.attributes.unwrap_or(file.attributes)); // FileAttributes
+        // Remainder up to INFO_ENTRY_LEN (padding, ids, Usn): the parser
+        // never reads these; zeros keep offsets honest.
+        buf.resize(buf.len() + (INFO_ENTRY_LEN - 36), 0);
     }
 
     // Stream chain.

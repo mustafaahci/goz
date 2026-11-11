@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
+use goz_core::index::{Column, Columns, FrnMap, NTFS_ROOT_FRN, VolumeIndex};
 use goz_core::layout::{RECOMMENDED_LAYOUT_FLAGS, walk_layout_buffer};
 use goz_core::types::VolumePhase;
 use goz_core::usn::walk_enum_buffer;
@@ -30,7 +30,7 @@ const JOURNAL_MAX_SIZE: u64 = 1024 * 1024 * 1024;
 /// purpose: NTFS trims slowly, and a large delta stalls the writer.
 const JOURNAL_ALLOC_DELTA: u64 = 8 * 1024 * 1024;
 /// 1 MiB ioctl buffer: ~100 ENUM round-trips per million files.
-const IO_BUFFER_BYTES: usize = 1024 * 1024;
+pub(crate) const IO_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// A freshly bootstrapped volume, as `gozd scan` reports it.
 pub(crate) struct BootstrappedVolume {
@@ -138,7 +138,8 @@ fn bootstrap_volume(vol: &VolumeInfo) -> Result<BootstrappedVolume> {
     // MFT directly, so an unavailable journal is not fatal here.
     let journal = ensure_journal(&handle, &vol.guid_path);
     // A one-shot scan passes no stop flag, so the build can never abort.
-    let built = build_index(&handle, None)?.expect("build_index cannot abort without a stop flag");
+    let built = build_index(&handle, None, crate::config::wanted_columns())?
+        .expect("build_index cannot abort without a stop flag");
 
     Ok(BootstrappedVolume {
         guid_path: vol.guid_path.clone(),
@@ -176,12 +177,20 @@ pub(crate) struct BuiltIndex {
 /// runs only when the FILE_LAYOUT pass stops part way, into the same index, so
 /// a failed read still drops no file; the files it names carry no size or
 /// date. Approach measured and proposed by SynoSoftware in issue #1.
+///
+/// The optional `columns` switched on are filled from the same pass (its
+/// info entry is `FILE_BASIC_INFORMATION`), and settle when it completes;
+/// the date recently changed holds what the journal says from then on.
 pub(crate) fn build_index(
     handle: &VolumeHandle,
     stop: Option<&AtomicBool>,
+    columns: Columns,
 ) -> Result<Option<BuiltIndex>> {
     let cancelled = || stop.is_some_and(|s| s.load(Ordering::Relaxed));
     let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+    for c in columns.iter() {
+        index.set_column(c, true);
+    }
     let mut buf = vec![0u8; IO_BUFFER_BYTES];
 
     // --- FILE_LAYOUT: names, links, sizes, dates in one MFT read ----------
@@ -240,6 +249,12 @@ pub(crate) fn build_index(
             next_frn = walk.next_start_frn;
         }
         enum_secs = Some(enum_start.elapsed().as_secs_f64());
+    }
+
+    for c in columns.iter() {
+        if layout_complete || c == Column::RecentChange {
+            index.settle_column(c);
+        }
     }
 
     // Every record has been seen: densify the FRN map, build the name

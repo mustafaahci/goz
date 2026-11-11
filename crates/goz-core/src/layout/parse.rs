@@ -136,7 +136,7 @@ pub struct LayoutName {
 
 /// One file record parsed from a `FILE_LAYOUT_ENTRY` and its satellite
 /// name/info/stream chains.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LayoutFile {
     /// 64-bit NTFS file reference number.
     pub frn: Frn,
@@ -150,9 +150,24 @@ pub struct LayoutFile {
     /// 1601-01-01 UTC), from `FILE_LAYOUT_INFO_ENTRY.BasicInformation`.
     /// `None` when the info entry is absent.
     pub mtime_ft: Option<i64>,
+    /// `CreationTime`, from the same `BasicInformation`.
+    pub ctime_ft: Option<i64>,
+    /// `LastAccessTime`, from the same `BasicInformation`.
+    pub atime_ft: Option<i64>,
+    /// `BasicInformation.FileAttributes`, when the info entry reaches it;
+    /// see [`LayoutFile::attributes_now`].
+    pub basic_attributes: Option<u32>,
     /// Every hard-link name of this file, in chain order (including DOS-only
     /// aliases, marked via [`LayoutName::dos_only`]).
     pub names: Vec<LayoutName>,
+}
+
+impl LayoutFile {
+    /// The file's attributes for the attributes column: the info entry's
+    /// `FILE_BASIC_INFORMATION`, else the entry's own.
+    pub fn attributes_now(&self) -> u32 {
+        self.basic_attributes.unwrap_or(self.attributes)
+    }
 }
 
 /// Structural corruption detected while walking a layout buffer.
@@ -299,16 +314,28 @@ struct RawNameEntry {
 }
 
 /// Prefix of `FILE_LAYOUT_INFO_ENTRY.BasicInformation` through
-/// `LastWriteTime` (24 bytes): all this parser needs from the info entry.
+/// `LastWriteTime` (24 bytes): what an info entry too short for
+/// [`RawBasicInfo`] still gives.
 #[derive(FromBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct RawInfoPrefix {
-    // Layout-bearing only; never read individually.
-    #[allow(dead_code)]
     creation_time: I64,
-    #[allow(dead_code)]
     last_access_time: I64,
     last_write_time: I64,
+}
+
+/// `FILE_LAYOUT_INFO_ENTRY.BasicInformation` through `FileAttributes` (36
+/// bytes): the dates and the attributes the optional columns keep.
+#[derive(FromBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct RawBasicInfo {
+    creation_time: I64,
+    last_access_time: I64,
+    last_write_time: I64,
+    // Layout-bearing only; never read individually.
+    #[allow(dead_code)]
+    change_time: I64,
+    file_attributes: U32,
 }
 
 /// `STREAM_LAYOUT_ENTRY` fixed part (48 bytes); `StreamIdentifier` (UTF-16LE,
@@ -470,8 +497,11 @@ fn parse_file(
         }
     }
 
-    // --- extra info (mtime) -----------------------------------------------
+    // --- extra info (dates, attributes) -------------------------------------
     let mut mtime_ft = None;
+    let mut ctime_ft = None;
+    let mut atime_ft = None;
+    let mut basic_attributes = None;
     if entry.extra_info_offset.get() != 0 {
         let info_off = follow_offset(
             buf,
@@ -489,9 +519,17 @@ fn parse_file(
         } else {
             declared
         };
-        if available >= size_of::<RawInfoPrefix>() {
+        if available >= size_of::<RawBasicInfo>() {
+            let info: RawBasicInfo = read_struct(buf, info_off, "FILE_LAYOUT_INFO_ENTRY")?;
+            mtime_ft = Some(info.last_write_time.get());
+            ctime_ft = Some(info.creation_time.get());
+            atime_ft = Some(info.last_access_time.get());
+            basic_attributes = Some(info.file_attributes.get());
+        } else if available >= size_of::<RawInfoPrefix>() {
             let info: RawInfoPrefix = read_struct(buf, info_off, "FILE_LAYOUT_INFO_ENTRY")?;
             mtime_ft = Some(info.last_write_time.get());
+            ctime_ft = Some(info.creation_time.get());
+            atime_ft = Some(info.last_access_time.get());
         }
     }
 
@@ -545,6 +583,9 @@ fn parse_file(
         attributes,
         size,
         mtime_ft,
+        ctime_ft,
+        atime_ft,
+        basic_attributes,
         names,
     })
 }

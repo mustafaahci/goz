@@ -117,13 +117,15 @@ use win::execute;
 mod win {
     use super::client::{Client, ClientError};
     use super::timing::Timing;
-    use goz_core::escompat::{EsPlan, Exit, OutputFormat, VERSION_LINE};
+    use goz_core::escompat::{ConfigCommand, EsPlan, Exit, OutputFormat, VERSION_LINE};
     use goz_core::output::{
         CsvOptions, DigitGrouping, Format, ListKind, ListOptions, PlainOptions, ResultWriter,
         filetime_to_unix_ms,
     };
-    use goz_core::proto::{PROTO_VERSION, QueryRequest, QueryResults, Request, Response};
-    use goz_core::types::{EsColumn, SortSpec};
+    use goz_core::proto::{
+        CONFIG_KEYS, PROTO_VERSION, QueryRequest, QueryResults, Request, Response, feature,
+    };
+    use goz_core::types::{EsColumn, SortKey, SortSpec};
     use std::io::Write;
     use std::process::ExitCode;
     use std::time::Instant;
@@ -191,8 +193,20 @@ mod win {
         if plan.status {
             return status(&mut connection);
         }
+        if let Some(command) = plan.config {
+            require(&mut connection, feature::CONFIG, "--config")?;
+            return config(&mut connection, command);
+        }
 
         let query = build_query(&plan);
+        // What an older gozd cannot read: ask it first rather than have it
+        // refuse the query.
+        if let Some(name) = sort_feature(query.sort.key) {
+            require(&mut connection, name, "this sort")?;
+        }
+        if query.want_ctime || query.want_atime || query.want_attrib || query.want_rtime {
+            require(&mut connection, feature::COLUMNS, "these columns")?;
+        }
         if !plan.result_count && !plan.total_size {
             return stream(&plan, &mut connection, query, export_file, timing);
         }
@@ -356,7 +370,15 @@ mod win {
         // zone is resolved once, and only when a date is shown: es's JSON and
         // file lists carry the raw FILETIME.
         let want_date = matches!(format, Format::Csv(_) | Format::Plain(_))
-            && plan.columns.contains(&EsColumn::DateModified);
+            && plan.columns.iter().any(|c| {
+                matches!(
+                    c,
+                    EsColumn::DateModified
+                        | EsColumn::DateCreated
+                        | EsColumn::DateAccessed
+                        | EsColumn::DateRecentlyChanged
+                )
+            });
         let tz = want_date.then(jiff::tz::TimeZone::system);
         let date = |ft| {
             tz.as_ref()
@@ -440,6 +462,93 @@ mod win {
             want_mtime: true,
             match_case: plan.match_case,
             want_total_size: plan.total_size && !plan.result_count,
+            // The optional columns only when shown: one the index does not
+            // hold is read from disk for each row.
+            want_ctime: plan.columns.contains(&EsColumn::DateCreated),
+            want_atime: plan.columns.contains(&EsColumn::DateAccessed),
+            want_attrib: plan.columns.contains(&EsColumn::Attributes),
+            want_rtime: plan.columns.contains(&EsColumn::DateRecentlyChanged),
+        }
+    }
+
+    /// The `Hello.features` name a sort key needs, for the keys an older
+    /// gozd does not know.
+    fn sort_feature(key: SortKey) -> Option<&'static str> {
+        match key {
+            SortKey::DateCreated => Some(feature::SORT_DATE_CREATED),
+            SortKey::DateAccessed => Some(feature::SORT_DATE_ACCESSED),
+            SortKey::Attributes => Some(feature::SORT_ATTRIBUTES),
+            SortKey::DateRecentlyChanged => Some(feature::SORT_DATE_RECENTLY_CHANGED),
+            SortKey::Name | SortKey::Path | SortKey::Size | SortKey::DateModified => None,
+        }
+    }
+
+    /// Asks gozd, with a `Hello`, whether it lists `name` in its features;
+    /// a gozd that does not (an older one) gets nothing it cannot read, and
+    /// goz exits 7 saying what it lacks.
+    fn require(connection: &mut Client, name: &str, what: &str) -> Result<(), ExitCode> {
+        let hello = Request::Hello {
+            proto_min: PROTO_VERSION,
+            proto_max: PROTO_VERSION,
+            client: VERSION_LINE.to_owned(),
+        };
+        match connection.request(&hello) {
+            Ok(Response::Hello {
+                features, server, ..
+            }) => {
+                if features.iter().any(|f| f == name) {
+                    Ok(())
+                } else {
+                    eprintln!(
+                        "goz: {server} does not support {what} (it lists no \"{name}\" feature); \
+                         update gozd"
+                    );
+                    Err(Exit::Protocol.into())
+                }
+            }
+            Ok(Response::Error { message, .. }) => {
+                eprintln!("goz: {message}");
+                Err(Exit::Protocol.into())
+            }
+            Ok(_) => {
+                eprintln!("goz: unexpected reply to hello");
+                Err(Exit::Protocol.into())
+            }
+            Err(error) => Err(request_failed(error)),
+        }
+    }
+
+    /// `--config get` prints gozd's index options, one `key=0|1` a line;
+    /// `--config set KEY=0|1...` changes them, which gozd allows an elevated
+    /// administrator alone, then prints them as they now are.
+    fn config(connection: &mut Client, command: ConfigCommand) -> Result<ExitCode, ExitCode> {
+        let request = match command {
+            ConfigCommand::Get => Request::GetConfig,
+            ConfigCommand::Set(change) => Request::SetConfig(change),
+        };
+        match connection.request(&request) {
+            Ok(Response::Config(config)) => {
+                let mut out = String::new();
+                for key in CONFIG_KEYS {
+                    let on = config.get(key).unwrap_or(false);
+                    out.push_str(&format!("{key}={}\n", u8::from(on)));
+                }
+                Ok(super::print(&out))
+            }
+            Ok(Response::Error { message, .. }) => {
+                eprintln!("goz: {message}");
+                if message.starts_with("needs administrator") {
+                    eprintln!(
+                        "goz: run goz --config set from an elevated prompt (Run as administrator)"
+                    );
+                }
+                Err(Exit::BadParam.into())
+            }
+            Ok(_) => {
+                eprintln!("goz: unexpected reply to --config");
+                Err(Exit::Protocol.into())
+            }
+            Err(error) => Err(request_failed(error)),
         }
     }
 

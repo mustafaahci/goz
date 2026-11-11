@@ -77,9 +77,17 @@ goz --json kernel32.dll
 
 # index and daemon status
 goz --status
+
+# attributes, dates created and accessed, and their columns and sorts
+goz /ah -attrib -dc -sort-date-created ext:log
+goz attrib:rs dc:thisyear
+
+# gozd's index options (Everything's Options > Indexes)
+goz --config get
+goz --config set index_date_created=1 index_attributes=1   # elevated prompt
 ```
 
-`goz` reads its command line as `es.exe` does and accepts the search, sort and output switches of `es.exe`, with `-` or `/`: `-path`, `-parent`, `-parent-path`, `-n`, `-o`, `-i`, `-p`, `-r`, `-ww`, `-a`, `-prefix`, `-suffix`, `-ignore-punctuation`, `-ignore-white-space`, `/ad`, `/a-d`, `/s`, `/on`, `/o-s`, the `-sort` family, `-size`, `-dm`, `-csv`, `-tsv`, `-efu`, `-txt`, `-m3u`, `-m3u8`, `-json`, each with its `-export-*` form, and more; `goz --help` lists them all. It matches `es.exe`'s exit codes. A switch `es.exe` has and goz lacks, such as `-attrib` or `/ah`, exits `6`, the same as an unknown one, instead of searching for its text. A size or date sort lists the entries without that value last, whichever way it runs: folders, since goz keeps no folder sizes, and files whose size or date is not read yet.
+`goz` reads its command line as `es.exe` does and accepts the search, sort and output switches of `es.exe`, with `-` or `/`: `-path`, `-parent`, `-parent-path`, `-n`, `-o`, `-i`, `-p`, `-r`, `-ww`, `-a`, `-prefix`, `-suffix`, `-ignore-punctuation`, `-ignore-white-space`, `/ad`, `/a-d`, the attribute filters `/a<attributes>` (`/ah`, `/a-h`, `/ar-hs`: each letter of `R H S D A V X N T L C O I E U P M` an attribute the entry has, each after a `-` one it lacks), `/s`, `/on`, `/o-s`, the `-sort` family (with `-sort-date-created`, `-sort-date-accessed`, `-sort-attributes`, `-sort-date-recently-changed`), `-size`, `-dm`, `-dc`, `-da`, `-attributes`, `-rc`, `-csv`, `-tsv`, `-efu`, `-txt`, `-m3u`, `-m3u8`, `-json`, each with its `-export-*` form, and more; `goz --help` lists them all. It matches `es.exe`'s exit codes. A switch `es.exe` has and goz lacks, such as `-date-run` or `-highlight`, exits `6`, the same as an unknown one, instead of searching for its text. A sort lists the entries without its value last, whichever way it runs: folders by size, since goz keeps no folder sizes, files whose size or date is not read yet, and every entry whose date recently changed gozd has not seen (Everything lists those first in an ascending sort). Everything also lists folders before files in every sort; goz orders them together.
 
 The search switches of `es.exe` become the search syntax below: `-ww` (`-w`, `-whole-word`), `-a` (`-diacritics`), `-prefix`, `-suffix`, `-ignore-punctuation` and `-ignore-white-space` are `?ww:`, `?diacritics:`, `?prefix:`, `?suffix:`, `?nopunc:` and `?nows:` in front of the search text, and their `-no-` forms turn them off again. `-r PATTERN` (`-regex`) is `es.exe`'s regex mode: the whole search text, `PATTERN` included, is one regular expression (`goz -r "^report_\d+\.pdf$"`). `-parent DIR` keeps the entries right in `DIR` (`parent:`), and `-parent-path PATH` searches below the folder that holds `PATH`; both are made absolute as `-path` is.
 
@@ -87,7 +95,29 @@ Quotes keep their meaning from the command line: `goz "annual report"` finds tha
 
 `--json` prints one object: `total` (every match), `items`, `more` (true when `-n` left matches out), `volumes_incomplete`, `metadata_pending` and `generation`, which is always 0 and only kept for compatibility.
 
-With `-size` and `-dm` the listing shows `es.exe`'s console columns: the size right-aligned, with your regional digit grouping, then the date as local `YYYY-MM-DDTHH:MM:SS`, then the path.
+With `-size` and `-dm` the listing shows `es.exe`'s console columns: the size right-aligned, with your regional digit grouping, then the date as local `YYYY-MM-DDTHH:MM:SS`, then the path. `-dc`, `-da` and `-rc` add the date created, accessed and recently changed the same way, and `-attributes` the attribute letters, as Everything's column shows them (`RHSA`, `HD`); a CSV or file list writes the attributes as a number.
+
+### Index options
+
+gozd has Everything 1.5's Options > Indexes switches, under Everything's names and with its defaults:
+
+| Option | Default | What it does in goz |
+| --- | --- | --- |
+| `index_folder_size` | on | Folder sizes |
+| `index_date_created` | off | Keeps each entry's date created in the index |
+| `index_date_accessed` | off | Keeps each entry's date accessed in the index |
+| `index_attributes` | off | Keeps each entry's attributes in the index |
+| `index_recent_changes` | off | Keeps the date recently changed: when gozd saw a create, write, move or rename of the entry in the journal |
+| `fast_size_sort`, `fast_date_modified_sort` | on | Accepted, kept and reported (see below) |
+| `fast_date_created_sort`, `fast_date_accessed_sort`, `fast_attributes_sort`, `fast_extension_sort` | off | Accepted, kept and reported (see below) |
+
+`goz --config get` prints them; `goz --config set index_attributes=1 ...` changes them, which gozd allows only a caller whose token is an elevated administrator (run it from an elevated prompt; anyone else gets "needs administrator", exit `4`). gozd keeps them in `%SystemRoot%\Logs\goz\gozd.ini`, beside its log, which everyone may read and only administrators and SYSTEM may change.
+
+A column that is off costs no memory at all. One that is on costs 8 bytes an entry for a date (its exact FILETIME, so a sort by date created orders files made within one second as Everything does) and 2 for the attributes (a fixed map of the bits Everything's letters name): on a 4M-entry volume 32 MB a date, 8 MB the attributes. Switched on, a column is built in the background, a buffer of the volume's MFT at a time between the journal's batches, and `goz --status` shows how far it has come; it counts as indexed (`indexed:date_created` ... in `Hello.features`) once it is complete. Switched off, it is freed at once. The bootstrap fills the columns that are on from the same MFT pass that reads names and sizes, and the journal and the live enricher keep them current. The date recently changed starts unknown for every entry, as in Everything, and each change gozd sees sets it.
+
+A property that is not indexed still works, as in Everything, only slower: the columns are read from disk for the rows a page shows (outside the index lock), and a search or a sort that needs one runs in two steps: a first search with those terms weakened as far as their place under NOTs allows finds the candidates, gozd reads their values from disk by FRN with the index lock released, and a second search answers exactly. That read counts against the query's 10 s budget, so `attrib:h` alone over a whole volume is refused as too slow while `attrib:h ext:dll` is quick. The date recently changed exists only in the index, so with `index_recent_changes` off every entry's is unknown: `rc:today` finds nothing and `!rc:today` everything, as in Everything.
+
+The `fast_*_sort` switches ask Everything to keep a sorted order of a column. goz sorts a column when a query asks, under the index lock, with integer keys: measured once on a 3M-entry synthetic volume, a full sort by date created took 127 ms and by date modified 92 ms, and by attributes 248 ms (most rows tie on a few attribute sets, so their names break the ties, as name ranks folded into the key). None is slow enough to pay for a kept order, which would cost 4 bytes an entry per column and its upkeep on every change, so goz keeps none: the switches are accepted, kept and reported, and change nothing.
 
 `goz -h` (or `-?`) prints a quick help and `goz --help` the full reference: every switch, the search syntax and the exit codes. `goz --version` prints the client's version and `goz --server-version` the running daemon's. None of them needs the daemon except `--server-version`.
 
@@ -116,7 +146,8 @@ Functions take a value, a `;` list of values (OR), or a `<...|...>` group of val
 
 - `ext:pdf;docx`: the extension, files only; `ext:` alone is files without one, `ext:mp?` takes wildcards, `ext:tar.gz` is a suffix. `extension:` is "contains".
 - `size:`: `size:>1mb`, `size:<=4kb`, `size:1kb..2mb`, `size:1.5mb`; `size:1kb` is 1024 to 2047 bytes (one unit of the last digit written), `size:=1024` exact; constants `empty`, `tiny`, `small`, `medium`, `large`, `huge`, `gigantic`, `unknown`. goz keeps no folder sizes, so `size:` never matches a folder.
-- `dm:` (`date:`, `datemodified:`): see below.
+- `dm:` (`date:`, `datemodified:`): see below. `dc:` (`datecreated:`, `date-created:`), `da:` (`dateaccessed:`, `date-accessed:`) and `rc:` (`recentchange:`, `date-recently-changed:`) take the same values for the date created, accessed and recently changed (see Index options for where they come from); `rc:!today` keeps an entry whose date recently changed is unknown, as `!rc:today` does, as in Everything.
+- `attrib:` (`attributes:`, `attr:`): the entries with every attribute named, by Everything's letters, any case: `A` archive, `C` compressed, `D` directory, `E` encrypted, `H` hidden, `I` not content indexed, `L` reparse point, `M` recall on data access, `N` normal, `O` offline, `P` pinned, `R` read-only, `S` system, `T` temporary, `U` unpinned, `V` integrity stream, `X` no scrub data; or a number, decimal or `0x` hex (`attrib:0x200` is sparse). As a live Everything 1.5 reads it, any other character is ignored (`attrib:!h` is `attrib:h`, `attrib:` and `attrib:q` match everything, bad hex is 0); `!attrib:h` is the files and folders that are not hidden.
 - `len:>40` (the name's length; with `path:` the full path's), `namelen:`, `pathlen:`, `pathpartlen:`, `extlen:`.
 - `parent:C:\src` (`infolder:`): the entries right in that folder; `ancestor:C:\src`: everything below it. Both take an absolute path.
 - `name:`, `stem:`, `full-path:`, `location:` (`pp:`), `parent-name:`: text in that part of the path.
@@ -134,7 +165,7 @@ A comparison goes before a value: `=`, `==`, `!=`, `<`, `<=`, `>`, `>=`; `size:!
 
 `dm:` (or `date:`, `datemodified:`) takes `today`, `yesterday`, `tomorrow`, `now`, `thisweek`/`thismonth`/`thisyear`, `lastweek`/`lastmonth`/`lastyear` (rolling: the last 7 days, month, year, as in Everything 1.5), `prevweek`/`prevmonth`/`prevyear` (the previous calendar period; what goz 0.6 called `last*`), `nextweek`, `prev2months`, `next3days`, `coming2weeks`, an age (`7days`, `last2hours`, `3mo`), `mtd`/`ytd`, month and weekday names (`may`, `dec2025`, `mon` is Monday), a year, month, day or hour (`2024`, `24`, `2024-05`, `2024-05-01`, `20240501`, `2024-05-01T10`, `5/1/2024` in the regional date order), `unknown`, each optionally after a comparison, or as a range `2024-01-01..2024-03-31`. An age compares as an age: `dm:<30days` is newer than 30 days, `dm:>30days` older. Days run between midnights in the machine's time zone, a week starts on the first day of the week of the service's regional format, and a file whose date goz has not read yet matches only `dm:unknown`.
 
-Not supported yet, each refused with exit code `4` and a message naming it: extended `wildcards:`, group expansion (`gr<a|e>y`), `root:` (which lists the volumes themselves), the functions of related entries that need what goz does not index (`child-size:`, `child-folder-size:` and `parent-size:`, which compare folder sizes; the child date created, accessed, recently changed and run, run count and attribute forms, `ancestor-attrib:`, `parent-date-created:`; the occurrence counts; the counts read from disk), Everything's `$name:` substitutions (`*.txt !sibling:$stem:.doc` fills in each entry's own stem, so the term differs from entry to entry and is no rewrite of the search), its attribute, content and other-date functions (`attrib:`, `content:`, `dc:`, `da:` ...), quarters, ISO weeks and date wildcards. Unlike Everything, goz refuses malformed search text instead of guessing: an unbalanced `<` or `>` exits `4` with its column.
+Not supported yet, each refused with exit code `4` and a message naming it: extended `wildcards:`, group expansion (`gr<a|e>y`), `root:` (which lists the volumes themselves), the functions of related entries that need what goz does not index (`child-size:`, `child-folder-size:` and `parent-size:`, which compare folder sizes; the child date created, accessed, recently changed and run, run count and attribute forms, `ancestor-attrib:`, `parent-date-created:`; the occurrence counts; the counts read from disk), Everything's `$name:` substitutions (`*.txt !sibling:$stem:.doc` fills in each entry's own stem, so the term differs from entry to entry and is no rewrite of the search), its content and other-date functions (`content:`, `date-changed:`, `date-run:` ...), quarters, ISO weeks and date wildcards. Unlike Everything, goz refuses malformed search text instead of guessing: an unbalanced `<` or `>` exits `4` with its column.
 
 On the command line, cmd and PowerShell treat `|`, `<` and `>` as their own. Either escape them (`goz report^|invoice` in cmd, `goz 'report|invoice'` in PowerShell) or pass `-argv` and quote the whole search text, which works in both: `goz -argv "report|invoice !draft"`. Without `-argv`, quotes reach the search as in `es.exe`: `goz "a|b"` searches for the phrase `a|b`, and a value with `<` or `>` is quoted alone, as in `goz size:">1mb"`. `-ad`, `-a-d` and `-p` apply to the whole search, operators included.
 

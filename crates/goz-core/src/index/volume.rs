@@ -16,13 +16,18 @@
 //! - Slot reuse can never alias. The FRN map is keyed by record number and
 //!   every hit is re-checked against the full FRN (sequence included).
 
+use super::columns::{self, Column, Columns};
 use super::store::{
     ComponentBytes, EntryFlags, EntryTable, FrnMap, MTIME_UNKNOWN, NameId, NamePair, NameStore,
     SIZE_UNKNOWN,
 };
 use crate::layout::LayoutFile;
 use crate::types::{EntryIdx, Frn, NIL};
-use crate::usn::record::FILE_ATTRIBUTE_DIRECTORY;
+use crate::usn::record::{
+    FILE_ATTRIBUTE_DIRECTORY, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
+    USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
+    USN_REASON_RENAME_NEW_NAME,
+};
 use crate::usn::{ParsedUsnRecord, UsnOp, ops_for};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -163,6 +168,25 @@ impl IndexMemory {
     }
 }
 
+/// What the date recently changed records, as Everything's help says: a
+/// create, a write, a move or a rename.
+const RECENT_CHANGE_REASONS: u32 = USN_REASON_FILE_CREATE
+    | USN_REASON_DATA_OVERWRITE
+    | USN_REASON_DATA_EXTEND
+    | USN_REASON_DATA_TRUNCATION
+    | USN_REASON_RENAME_NEW_NAME;
+
+/// The live enricher's fresh read of one file, by its FRN.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatInfo {
+    pub size: u64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub atime: i64,
+    /// `FILE_ATTRIBUTE_*` bits.
+    pub attributes: u32,
+}
+
 /// Side effects a batch produced that the daemon must service out of band.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ApplyOutcome {
@@ -221,6 +245,9 @@ pub struct VolumeIndex {
     /// [`Self::prune_cycle_suspects`] finds the cycle gone. Empty on a
     /// healthy index.
     cycle_suspects: Vec<EntryIdx>,
+    /// The optional columns that are on and hold every entry's value (see
+    /// [`Self::settle_column`]).
+    settled_columns: Columns,
 }
 
 impl VolumeIndex {
@@ -269,6 +296,7 @@ impl VolumeIndex {
             dirty: 0,
             dir_children: FxHashMap::default(),
             cycle_suspects: Vec::new(),
+            settled_columns: Columns::NONE,
         };
         this.link_same_name(root, root_name);
         this.link_same_name(lost_found, lf_name);
@@ -400,6 +428,111 @@ impl VolumeIndex {
                 cur = self.entries.next_link(cur);
             }
         }
+        if !self.columns().is_empty() {
+            self.fill_columns(file, self.columns());
+        }
+    }
+
+    // -- optional columns ---------------------------------------------------
+
+    /// The optional columns that are on (see [`super::columns`]).
+    pub fn columns(&self) -> Columns {
+        self.entries.columns()
+    }
+
+    /// The columns that are on and hold every entry's value: those a query
+    /// reads from the index rather than from the disk.
+    pub fn settled_columns(&self) -> Columns {
+        self.settled_columns
+    }
+
+    /// Switches column `c` on, every value unknown and the column not
+    /// settled, or off, freeing its memory. Switching it to what it is
+    /// changes nothing.
+    pub fn set_column(&mut self, c: Column, on: bool) {
+        if self.columns().contains(c) != on {
+            self.entries.set_column(c, on);
+            self.settled_columns = self.settled_columns.with(c, false);
+        }
+    }
+
+    /// Marks column `c`, when it is on, as holding every entry's value.
+    pub fn settle_column(&mut self, c: Column) {
+        if self.columns().contains(c) {
+            self.settled_columns = self.settled_columns.with(c, true);
+        }
+    }
+
+    /// The heap bytes of column `c` (none while it is off).
+    pub fn column_memory(&self, c: Column) -> ComponentBytes {
+        self.entries.column_memory(c)
+    }
+
+    /// Sets the columns of `cols` that are on and that a FILE_LAYOUT record
+    /// gives (all but the date recently changed) on every name of the file,
+    /// and nothing else: the build of a column switched on while the volume
+    /// is live, and the bootstrap's. Returns whether the index holds the
+    /// file.
+    pub fn fill_columns(&mut self, file: &LayoutFile, cols: Columns) -> bool {
+        let cols = cols.with(Column::RecentChange, false);
+        let Some(head) = self.head_of(file.frn) else {
+            return false;
+        };
+        if cols.is_empty() {
+            return true;
+        }
+        let ctime = file.ctime_ft.map(columns::date_of);
+        let atime = file.atime_ft.map(columns::date_of);
+        let attrib = columns::packed_of(file.attributes_now());
+        let mut cur = head;
+        while cur != NIL {
+            for c in cols.iter() {
+                match c {
+                    Column::DateCreated => {
+                        if let Some(s) = ctime {
+                            self.entries.set_date(c, cur, s);
+                        }
+                    }
+                    Column::DateAccessed => {
+                        if let Some(s) = atime {
+                            self.entries.set_date(c, cur, s);
+                        }
+                    }
+                    Column::Attributes => self.entries.set_packed_attrib(cur, attrib),
+                    Column::RecentChange => {}
+                }
+            }
+            cur = self.entries.next_link(cur);
+        }
+        true
+    }
+
+    /// The attributes and the date recently changed a journal record gives
+    /// its file, on every name of it, for the columns that are on. Every
+    /// record carries the file's attributes; the date recently changed is
+    /// the record's when it is a create, a write, a move or a rename.
+    fn record_columns(&mut self, rec: &ParsedUsnRecord) {
+        let cols = self.columns();
+        let attrib = cols.contains(Column::Attributes);
+        let changed =
+            cols.contains(Column::RecentChange) && rec.reason & RECENT_CHANGE_REASONS != 0;
+        if !attrib && !changed {
+            return;
+        }
+        let packed = columns::packed_of(rec.attributes);
+        let date = columns::date_of(rec.timestamp_ft);
+        let Some(mut cur) = self.head_of(rec.frn) else {
+            return;
+        };
+        while cur != NIL {
+            if attrib {
+                self.entries.set_packed_attrib(cur, packed);
+            }
+            if changed {
+                self.entries.set_date(Column::RecentChange, cur, date);
+            }
+            cur = self.entries.next_link(cur);
+        }
     }
 
     /// Ingests one FILE_LAYOUT record when FILE_LAYOUT is the bootstrap's
@@ -465,6 +598,9 @@ impl VolumeIndex {
                     UsnOp::RenameOldSeen { .. } => self.stats.rename_old_seen += 1,
                 }
             }
+            if rec.reason & USN_REASON_FILE_DELETE == 0 && !self.columns().is_empty() {
+                self.record_columns(rec);
+            }
         }
         // Names interned since the last merge join the name order once enough
         // have gathered (see `NameStore::wants_merge`): O(names), a few
@@ -523,6 +659,35 @@ impl VolumeIndex {
                 self.entries.set_size(cur, size);
             }
             self.entries.set_mtime(cur, mtime);
+            cur = self.entries.next_link(cur);
+        }
+    }
+
+    /// [`Self::set_stat`] with the dates and attributes the optional
+    /// columns keep, for those that are on.
+    pub fn set_stat_info(&mut self, frn: Frn, s: &StatInfo) {
+        self.set_stat(frn, s.size, s.mtime);
+        let cols = self.columns();
+        if cols.is_empty() {
+            return;
+        }
+        let Some(mut cur) = self.head_of(frn) else {
+            return;
+        };
+        let packed = columns::packed_of(s.attributes);
+        while cur != NIL {
+            for c in cols.iter() {
+                match c {
+                    Column::DateCreated => {
+                        self.entries.set_date(c, cur, columns::date_of(s.ctime));
+                    }
+                    Column::DateAccessed => {
+                        self.entries.set_date(c, cur, columns::date_of(s.atime));
+                    }
+                    Column::Attributes => self.entries.set_packed_attrib(cur, packed),
+                    Column::RecentChange => {}
+                }
+            }
             cur = self.entries.next_link(cur);
         }
     }
@@ -1665,6 +1830,24 @@ impl EntryView<'_> {
     pub fn mtime(&self) -> Option<i64> {
         let m = self.index.entries.mtime(self.idx);
         (m != MTIME_UNKNOWN).then_some(m)
+    }
+    /// The date created the index keeps, `None` while it is unknown or the
+    /// column is off.
+    pub fn ctime(&self) -> Option<i64> {
+        columns::known(self.index.entries.date(Column::DateCreated, self.idx))
+    }
+    /// The date accessed the index keeps, as [`Self::ctime`].
+    pub fn atime(&self) -> Option<i64> {
+        columns::known(self.index.entries.date(Column::DateAccessed, self.idx))
+    }
+    /// The date recently changed the index keeps, as [`Self::ctime`].
+    pub fn rtime(&self) -> Option<i64> {
+        columns::known(self.index.entries.date(Column::RecentChange, self.idx))
+    }
+    /// The `FILE_ATTRIBUTE_*` bits the index keeps (see
+    /// [`columns::attrib_of`]), `None` while unknown or the column is off.
+    pub fn attrib(&self) -> Option<u32> {
+        columns::attrib_of(self.index.entries.packed_attrib(self.idx), self.is_dir())
     }
     pub fn parent(&self) -> EntryIdx {
         self.index.entries.parent(self.idx)

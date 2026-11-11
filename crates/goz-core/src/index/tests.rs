@@ -1088,6 +1088,7 @@ proptest! {
                     name_lossy: false,
                     dos_only: false,
                 }],
+                ..Default::default()
             });
         }
         if layout_stop.is_some() {
@@ -1140,6 +1141,7 @@ fn enrich_with_renamed_directory_never_orphans_children() {
             name_lossy: false,
             dos_only: false,
         }],
+        ..Default::default()
     });
 
     // The child is still correctly under the (renamed) directory, and a later
@@ -1498,6 +1500,7 @@ fn enrich_reclaims_the_records_previous_tenant() {
             name_lossy: false,
             dos_only: false,
         }],
+        ..Default::default()
     });
     // The journal replay from the cursor captured before the build.
     let outcome = idx.apply_batch(&[
@@ -1652,6 +1655,7 @@ fn a_layout_name_under_its_own_records_previous_tenant_goes_to_lost_found() {
             name_lossy: false,
             dos_only: false,
         }],
+        ..Default::default()
     });
 
     assert_eq!(path_status(&idx, tenant), Some(PathStatus::InLostFound));

@@ -26,8 +26,9 @@
 
 use super::budget::Budget;
 use super::dates::DateFilter;
+use super::disk::{DiskProps, prop_value};
 use super::engine::{CACHED_PATH_MAX, anchored_lead, kind_matches, size_matches, term_admits};
-use super::expr::{CountOf, Expr, FolderPath, Leaf, LenOf, Relation, Target};
+use super::expr::{CountOf, Expr, FolderPath, Leaf, LenOf, PropTest, Relation, Target};
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, SizeRange, Wildcard};
 use super::pattern::RegexTerm;
@@ -35,7 +36,7 @@ use super::related::{CountSet, RelatedSet, Worked, name_term_matches, total_chil
 use super::text::{TextMatcher, utf16_len};
 use crate::fold::{fold_exact_into, fold_into};
 use crate::index::volume::MAX_PATH_HOPS;
-use crate::index::{NameId, VolumeIndex};
+use crate::index::{Column, NameId, VolumeIndex};
 use crate::types::{EntryIdx, NIL};
 use memchr::memmem;
 use rustc_hash::FxHashSet;
@@ -161,6 +162,13 @@ pub(super) enum CNode<'a> {
     },
     /// A sub-search, worked out for the volume.
     Related(Arc<RelatedSet>),
+    /// A property of the optional columns passes: the index's value while
+    /// its column is settled, else what `disk` read, else unknown.
+    Prop {
+        column: Column,
+        test: PropTest,
+        disk: Option<Arc<DiskProps>>,
+    },
 }
 
 /// What [`compile`] compiles an expression against: one volume.
@@ -178,6 +186,10 @@ pub(super) struct Volume<'i> {
     /// expression is compiled twice for a volume (see
     /// `CompiledQuery::new`), and each is worked out once.
     pub(super) related: RefCell<Vec<(*const Leaf, Worked)>>,
+    /// The optional columns' values the daemon read from disk for this
+    /// search, or `None` for the first search of a query that needs some
+    /// (see [`compile`]).
+    pub(super) disk: Option<Arc<DiskProps>>,
 }
 
 impl Volume<'_> {
@@ -284,13 +296,49 @@ impl Volume<'_> {
 
 /// Compiles `e` for `volume`, folding each term the volume decides into a
 /// constant and the tree around it.
+///
+/// A term of an optional column the volume does not hold settled, whose
+/// value only the disk has, compiles for the first search of its query,
+/// when `volume.disk` is `None`, to the constant that keeps the most
+/// entries: `True` where the term is under an even number of NOTs and
+/// `False` under an odd one. Since AND and OR only grow with their
+/// children, every entry the query matches, whatever the disk says, passes
+/// that weaker expression, and the cheaper terms narrow the entries whose
+/// values the daemon then reads, outside the index lock. The second search
+/// compiles the term against what it read.
 pub(super) fn compile<'a>(e: &'a Expr, volume: &Volume) -> CNode<'a> {
+    compile_in(e, volume, true)
+}
+
+fn compile_in<'a>(e: &'a Expr, volume: &Volume, positive: bool) -> CNode<'a> {
     let node = match e {
         Expr::True => CNode::True,
         Expr::False => CNode::False,
-        Expr::And(items) => CNode::And(items.iter().map(|i| compile(i, volume)).collect()),
-        Expr::Or(items) => CNode::Or(items.iter().map(|i| compile(i, volume)).collect()),
-        Expr::Not(inner) => CNode::Not(Box::new(compile(inner, volume))),
+        Expr::And(items) => CNode::And(
+            items
+                .iter()
+                .map(|i| compile_in(i, volume, positive))
+                .collect(),
+        ),
+        Expr::Or(items) => CNode::Or(
+            items
+                .iter()
+                .map(|i| compile_in(i, volume, positive))
+                .collect(),
+        ),
+        Expr::Not(inner) => CNode::Not(Box::new(compile_in(inner, volume, !positive))),
+        Expr::Leaf(Leaf::Prop { column, test }) => {
+            let settled = volume.index.settled_columns().contains(*column);
+            if !settled && column.on_disk() && volume.disk.is_none() {
+                if positive { CNode::True } else { CNode::False }
+            } else {
+                CNode::Prop {
+                    column: *column,
+                    test: *test,
+                    disk: if settled { None } else { volume.disk.clone() },
+                }
+            }
+        }
         Expr::Leaf(leaf) => compile_leaf(leaf, volume),
     };
     node.folded()
@@ -298,6 +346,8 @@ pub(super) fn compile<'a>(e: &'a Expr, volume: &Volume) -> CNode<'a> {
 
 fn compile_leaf<'a>(leaf: &'a Leaf, volume: &Volume) -> CNode<'a> {
     match leaf {
+        // Compiled with its polarity by `compile_in`.
+        Leaf::Prop { .. } => CNode::True,
         Leaf::Text {
             target,
             needle,
@@ -665,7 +715,11 @@ impl<'a> CNode<'a> {
                     .fold((0, 0), |(class, leaves), (c, l)| (class.max(c), leaves + l));
             }
             CNode::Kind(_) => 1,
-            CNode::Size(_) | CNode::SizeUnknown | CNode::Date(_) | CNode::Parent(_) => 2,
+            CNode::Size(_)
+            | CNode::SizeUnknown
+            | CNode::Date(_)
+            | CNode::Parent(_)
+            | CNode::Prop { .. } => 2,
             CNode::Name { .. } => 3,
             CNode::Len {
                 of: LenOf::Name | LenOf::Extension,
@@ -890,6 +944,10 @@ impl<'a> CNode<'a> {
             // folder's size is known (L7:446).
             CNode::SizeUnknown => s.entry.is_some() && !s.is_dir() && s.size().is_none(),
             CNode::Date(date) => date.matches(s.mtime()),
+            CNode::Prop { column, test, disk } => s.entry.is_some_and(|e| {
+                let (date, attrib) = prop_value(s.index, e, *column, disk.as_deref());
+                test.matches(date, attrib)
+            }),
             CNode::Len { of, range } => {
                 let len = match of {
                     LenOf::Name => Some(utf16_len(s.stored_name(Form::Raw))),
@@ -1674,6 +1732,7 @@ mod tests {
             parts_are_names: true,
             budget: &budget,
             related: RefCell::default(),
+            disk: None,
         };
         let e = parsed.expr.as_ref().expect("an expression");
         f(&compile(e, &volume));
@@ -1738,6 +1797,7 @@ mod tests {
             parts_are_names: true,
             budget: &budget,
             related: RefCell::default(),
+            disk: None,
         };
         let node = compile(parsed.expr.as_ref().unwrap(), &volume);
         let (name, entry) = split(node);
@@ -1763,6 +1823,7 @@ mod tests {
             parts_are_names: true,
             budget: &budget,
             related: RefCell::default(),
+            disk: None,
         };
         let node = compile(parsed.expr.as_ref().expect("an expression"), &volume);
         plan([&node]).map(|needles| {

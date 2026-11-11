@@ -101,6 +101,22 @@ pub fn write_csv_row(opts: &CsvOptions, row: &Row<'_>, out: &mut Vec<u8>) {
                     out.extend_from_slice(mtime.as_bytes());
                 }
             }
+            EsColumn::DateCreated | EsColumn::DateAccessed | EsColumn::DateRecentlyChanged => {
+                let date = match col {
+                    EsColumn::DateCreated => row.ctime,
+                    EsColumn::DateAccessed => row.atime,
+                    _ => row.rtime,
+                };
+                if let Some(date) = date {
+                    out.extend_from_slice(date.as_bytes());
+                }
+            }
+            // The number, as an Everything file list writes it.
+            EsColumn::Attributes => {
+                if let Some(attrib) = row.attrib {
+                    out.extend_from_slice(attrib.to_string().as_bytes());
+                }
+            }
         }
         out.push(opts.separator);
     }
@@ -117,6 +133,10 @@ fn column_display_name(col: EsColumn) -> &'static str {
     match col {
         EsColumn::Size => "Size",
         EsColumn::DateModified => "Date Modified",
+        EsColumn::DateCreated => "Date Created",
+        EsColumn::DateAccessed => "Date Accessed",
+        EsColumn::Attributes => "Attributes",
+        EsColumn::DateRecentlyChanged => "Date Recently Changed",
     }
 }
 
@@ -159,6 +179,7 @@ mod tests {
             size: Some(size),
             mtime: Some(mtime),
             is_dir: false,
+            ..Default::default()
         }
     }
 
@@ -224,18 +245,21 @@ mod tests {
                 size: None,
                 mtime: Some("2026-07-12T09:01:00"),
                 is_dir: true,
+                ..Default::default()
             },
             Row {
                 path: "C:\\proj\\sized-dir",
                 size: Some(4096),
                 mtime: None,
                 is_dir: true,
+                ..Default::default()
             },
             Row {
                 path: "C:\\proj\\unknown.bin",
                 size: None,
                 mtime: None,
                 is_dir: false,
+                ..Default::default()
             },
         ];
         let out = write(&size_dm_opts(), rows);
@@ -485,6 +509,7 @@ mod tests {
                     size: *size,
                     mtime: mtime.as_deref(),
                     is_dir: *is_dir,
+                    ..Default::default()
                 }),
                 &mut out,
             );

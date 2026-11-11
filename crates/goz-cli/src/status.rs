@@ -78,6 +78,23 @@ fn volume(out: &mut String, v: &VolumeStatus) {
             v.stale_slots, v.delete_of_unknown, v.placeholders_created
         );
     }
+    // The optional columns switched on (`goz --config`): settled, or how far
+    // their background build has come, and what each holds.
+    for c in &v.columns {
+        let state = if c.settled {
+            "indexed".to_string()
+        } else if c.of > 0 && c.built > 0 {
+            format!("building {}%", (c.built.min(c.of) * 100) / c.of)
+        } else {
+            "waiting to build; read from disk meanwhile".to_string()
+        };
+        let _ = writeln!(
+            out,
+            "           {}: {state}, {:.1} MB",
+            c.column,
+            c.bytes as f64 / 1e6
+        );
+    }
     // Index memory, component by component. `alloc` differing from `used` is
     // capacity slack held by that component.
     if let Some(m) = &v.memory {
@@ -132,6 +149,7 @@ mod tests {
             stale_slots: 0,
             link_reconciles_dropped: 0,
             memory: None,
+            columns: Vec::new(),
         }
     }
 

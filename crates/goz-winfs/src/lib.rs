@@ -18,6 +18,8 @@ mod ioctl;
 mod util;
 
 #[cfg(windows)]
+mod admin;
+#[cfg(windows)]
 mod cancel_io;
 #[cfg(windows)]
 mod clock;
@@ -57,6 +59,10 @@ mod test_support;
 pub use error::WinError;
 
 #[cfg(windows)]
+pub use admin::{
+    current_process_is_elevated_admin, pipe_client_is_elevated_admin, write_admin_only,
+};
+#[cfg(windows)]
 pub use cancel_io::{ThreadIoHandle, cancel_synchronous_io, current_thread_io_handle};
 #[cfg(windows)]
 pub use clock::awake_time;
@@ -89,7 +95,7 @@ pub use file_layout::{query_file_layout, query_file_layout_raw};
 pub use links::link_paths;
 
 #[cfg(windows)]
-pub use file_stat::{FileStat, stat_file};
+pub use file_stat::{FileBasic, FileStat, VolumeHint, basic_info, stat_file};
 
 #[cfg(windows)]
 pub use pipe_sd::{PipeSecurity, build_pipe_security};

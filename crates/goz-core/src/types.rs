@@ -56,6 +56,14 @@ pub enum SortKey {
     Path,
     Size,
     DateModified,
+    /// Wave 9 keys: sent only to a daemon whose `Hello.features` lists
+    /// `sort:date_created` (and so on); an older daemon cannot read them. A
+    /// key whose column is not indexed sorts by reading each match's value
+    /// from disk, within the query's budget.
+    DateCreated,
+    DateAccessed,
+    Attributes,
+    DateRecentlyChanged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,12 +79,16 @@ pub struct SortSpec {
 }
 
 impl SortSpec {
-    /// es.exe's default direction per sort key: name/path ascending,
-    /// size/date descending.
+    /// es.exe's default direction per sort key: name/path/attributes
+    /// ascending, size/dates descending.
     pub fn default_for(key: SortKey) -> Self {
         let dir = match key {
-            SortKey::Name | SortKey::Path => SortDir::Asc,
-            SortKey::Size | SortKey::DateModified => SortDir::Desc,
+            SortKey::Name | SortKey::Path | SortKey::Attributes => SortDir::Asc,
+            SortKey::Size
+            | SortKey::DateModified
+            | SortKey::DateCreated
+            | SortKey::DateAccessed
+            | SortKey::DateRecentlyChanged => SortDir::Desc,
         };
         Self { key, dir }
     }
@@ -96,6 +108,10 @@ impl Default for SortSpec {
 pub enum EsColumn {
     Size,
     DateModified,
+    DateCreated,
+    DateAccessed,
+    Attributes,
+    DateRecentlyChanged,
 }
 
 /// Lifecycle phase of one indexed volume, reported over IPC.

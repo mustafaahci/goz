@@ -49,7 +49,7 @@ impl<'a> Budget<'a> {
     /// that call it, which run it far less often than their own steps.
     #[cold]
     #[inline(never)]
-    pub(crate) fn check(&self) -> bool {
+    pub fn check(&self) -> bool {
         if self.spent() {
             return true;
         }
