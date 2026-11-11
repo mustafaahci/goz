@@ -42,7 +42,17 @@
 //! - What `-ad`, `-a-d` and `-p` add goes before the search text, where no
 //!   operator, open quote or `name*:` of the text can reach it: `foo|` with
 //!   `-ad` is `folder: foo|`, every folder, where `foo| folder:` would be
-//!   `foo` or any folder.
+//!   `foo` or any folder. So do the search modifiers es sets for the whole
+//!   search (`-ww`, `-a`, `-prefix`, `-suffix`, `-ignore-punctuation`,
+//!   `-ignore-white-space`), as `?ww:` and the like, which apply to every
+//!   term after them.
+//! - `-r PATTERN` (`-regex`) puts es in regex mode, where the whole search
+//!   text is one regular expression: PATTERN joins the search text where it
+//!   stands, and the text goes to gozd as `regex*:TEXT`, which reads the
+//!   rest of the query, verbatim, as one `regex:` term.
+//! - `-parent DIR` keeps the entries right in DIR (`parent:`), and
+//!   `-parent-path PATH` searches below the folder holding PATH; the CLI
+//!   makes DIR and PATH absolute, as it does `-path`.
 //! - Search text that is malformed whatever gozd's clock, such as an
 //!   unbalanced `<`, is refused here with exit 4 and the parser's message,
 //!   whose column counts in the text as typed. es passes such text on and
@@ -115,6 +125,13 @@ pub struct EsPlan {
     /// `-path` value, verbatim. The CLI absolutizes it (GetFullPathName
     /// semantics, no existence check); the core stays path-API-free.
     pub scope: Option<String>,
+    /// The scope came from `-parent-path`: it is the folder holding
+    /// `scope`, once absolutized.
+    pub scope_is_parent_of: bool,
+    /// `-parent` value, verbatim: only the entries right in this folder.
+    /// The CLI absolutizes it and puts it before the search text as a
+    /// `parent:` term (see [`EsPlan::query_with_parent`]).
+    pub parent: Option<String>,
     /// `-n` / `-max-results` value: return only the top N results after
     /// sorting. `None` means unlimited.
     pub limit: Option<u32>,
@@ -178,6 +195,8 @@ impl Default for EsPlan {
         Self {
             query: String::new(),
             scope: None,
+            scope_is_parent_of: false,
+            parent: None,
             limit: None,
             offset: 0,
             columns: Vec::new(),
@@ -214,6 +233,17 @@ impl EsPlan {
     pub fn wants_header(&self) -> bool {
         self.header
             .unwrap_or(self.format != Some(OutputFormat::Txt))
+    }
+
+    /// The search text with `-parent`'s folder, made absolute (`absolute`),
+    /// as a `parent:` term before it. Quoted, as a folder's path may hold
+    /// spaces or `;`; no Windows path holds a quote.
+    pub fn query_with_parent(&self, absolute: &str) -> String {
+        if self.query.is_empty() {
+            format!("parent:\"{absolute}\"")
+        } else {
+            format!("parent:\"{absolute}\" {}", self.query)
+        }
     }
 }
 
@@ -317,6 +347,18 @@ pub(super) enum SwitchAction {
     MatchPath(bool),
     /// `-ad` / `-a-d`: add this filter to the search text.
     Filter(&'static str),
+    /// `-ww`, `-a`, `-prefix` and the like: switch the search modifier of
+    /// this name on or off for the whole search text, as `?ww:` does.
+    Modifier(&'static str, bool),
+    /// `-r` / `-regex`: consume the next token as search text, and read the
+    /// whole search text as one regular expression.
+    Regex,
+    /// `-parent`: consume the next token as a folder whose entries alone
+    /// match.
+    Parent,
+    /// `-parent-path`: consume the next token as a path; the scope is the
+    /// folder holding it.
+    ParentScope,
     /// `-q`: consume the next token, its quotes removed, as search text.
     SearchParam,
     /// `-q*`: the rest of the command line is search text, untouched.
@@ -350,7 +392,9 @@ impl SwitchAction {
     pub(super) fn param(self) -> Option<&'static str> {
         match self {
             SwitchAction::Limit | SwitchAction::Offset => Some("N"),
-            SwitchAction::Scope => Some("DIR"),
+            SwitchAction::Scope | SwitchAction::Parent => Some("DIR"),
+            SwitchAction::ParentScope => Some("PATH"),
+            SwitchAction::Regex => Some("PATTERN"),
             SwitchAction::Export(_) => Some("FILE"),
             SwitchAction::SortParam => Some("KEY"),
             SwitchAction::SearchParam => Some("TEXT"),
@@ -364,6 +408,7 @@ impl SwitchAction {
             | SwitchAction::MatchCase(_)
             | SwitchAction::MatchPath(_)
             | SwitchAction::Filter(_)
+            | SwitchAction::Modifier(..)
             | SwitchAction::SearchRest
             | SwitchAction::Argv(_)
             | SwitchAction::Json
@@ -485,6 +530,96 @@ pub(super) const SWITCHES: &[Switch] = &[
         Group::Search,
         SwitchAction::Filter("file:"),
         "Only files",
+    ),
+    row(
+        &["parent"],
+        Group::Search,
+        SwitchAction::Parent,
+        "Only the files and folders right in DIR, not below it",
+    ),
+    row(
+        &["parent-path"],
+        Group::Search,
+        SwitchAction::ParentScope,
+        "Search only below the folder that holds PATH",
+    ),
+    row(
+        &["r", "regex"],
+        Group::Search,
+        SwitchAction::Regex,
+        "Read the search text, PATTERN included, as one regular expression",
+    ),
+    row(
+        &["w", "ww", "whole-word", "whole-words"],
+        Group::Search,
+        SwitchAction::Modifier("ww", true),
+        "Match whole words only, as ?ww: does",
+    ),
+    row(
+        &["no-w", "no-ww", "no-whole-word", "no-whole-words"],
+        Group::Search,
+        SwitchAction::Modifier("ww", false),
+        "Match anywhere in a word, the default",
+    ),
+    row(
+        &["prefix"],
+        Group::Search,
+        SwitchAction::Modifier("prefix", true),
+        "Match at the start of a word, as ?prefix: does",
+    ),
+    row(
+        &["no-prefix"],
+        Group::Search,
+        SwitchAction::Modifier("prefix", false),
+        "Turn -prefix off, the default",
+    ),
+    row(
+        &["suffix"],
+        Group::Search,
+        SwitchAction::Modifier("suffix", true),
+        "Match at the end of a word, as ?suffix: does",
+    ),
+    row(
+        &["no-suffix"],
+        Group::Search,
+        SwitchAction::Modifier("suffix", false),
+        "Turn -suffix off, the default",
+    ),
+    row(
+        &["a", "diacritics"],
+        Group::Search,
+        SwitchAction::Modifier("diacritics", true),
+        "Match accents, as ?diacritics: does",
+    ),
+    row(
+        &["no-a", "no-diacritics"],
+        Group::Search,
+        SwitchAction::Modifier("diacritics", false),
+        "Ignore accents, the default: cafe finds the accented name too",
+    ),
+    row(
+        &["ignore-punctuation", "ignore-punc"],
+        Group::Search,
+        SwitchAction::Modifier("nopunc", true),
+        "Skip punctuation in names, as ?nopunc: does",
+    ),
+    row(
+        &["no-ignore-punctuation", "no-ignore-punc"],
+        Group::Search,
+        SwitchAction::Modifier("nopunc", false),
+        "Turn -ignore-punctuation off, the default",
+    ),
+    row(
+        &["ignore-white-space", "ignore-ws"],
+        Group::Search,
+        SwitchAction::Modifier("nows", true),
+        "Skip white space in names, as ?nows: does",
+    ),
+    row(
+        &["no-ignore-white-space", "no-ignore-ws"],
+        Group::Search,
+        SwitchAction::Modifier("nows", false),
+        "Turn -ignore-white-space off, the default",
     ),
     row(
         &["q", "search"],
@@ -1085,6 +1220,11 @@ struct Pending {
     terms: Vec<String>,
     filters: Vec<&'static str>,
     match_path: bool,
+    /// The search modifiers set for the whole search, each once, the last
+    /// setting winning.
+    modifiers: Vec<(&'static str, bool)>,
+    /// `-r`: the whole search text is one regular expression.
+    regex: bool,
     sort_key: Option<SortKey>,
     sort_dir: Option<SortDir>,
 }
@@ -1109,16 +1249,24 @@ fn parse_tokens(mut tokens: impl Tokens) -> Result<Command, EsFatal> {
         }
     }
 
-    let text = pending.terms.join(" ");
+    let mut text = pending.terms.join(" ");
+    if pending.regex {
+        text.insert_str(0, "regex*:");
+    }
     check_search_text(&text, plan.match_case)?;
     // The switches' terms go first: after the text, an operator, an open
     // quote or a `name*:` there would take them in (see the module docs).
-    let mut query: Vec<&str> = pending.filters.clone();
+    let mut query: Vec<String> = pending.filters.iter().map(|f| f.to_string()).collect();
     if pending.match_path {
-        query.push("matchpath:");
+        query.push("matchpath:".to_string());
+    }
+    for (name, on) in &pending.modifiers {
+        if *on {
+            query.push(format!("?{name}:"));
+        }
     }
     if !text.is_empty() {
-        query.push(&text);
+        query.push(text);
     }
     plan.query = query.join(" ");
     let key = pending.sort_key.unwrap_or(plan.sort.key);
@@ -1260,7 +1408,23 @@ fn apply_switch(
     match action {
         SwitchAction::Limit => plan.limit = Some(take_count(tokens, token)?),
         SwitchAction::Offset => plan.offset = take_count(tokens, token)?,
-        SwitchAction::Scope => plan.scope = Some(take_param(tokens, token)?),
+        SwitchAction::Scope => {
+            plan.scope = Some(take_param(tokens, token)?);
+            plan.scope_is_parent_of = false;
+        }
+        SwitchAction::ParentScope => {
+            plan.scope = Some(take_param(tokens, token)?);
+            plan.scope_is_parent_of = true;
+        }
+        SwitchAction::Parent => plan.parent = Some(take_param(tokens, token)?),
+        SwitchAction::Regex => {
+            pending.terms.push(take_param(tokens, token)?);
+            pending.regex = true;
+        }
+        SwitchAction::Modifier(name, on) => {
+            pending.modifiers.retain(|(other, _)| *other != name);
+            pending.modifiers.push((name, on));
+        }
         SwitchAction::Export(format) => {
             plan.export_file = Some(take_param(tokens, token)?);
             plan.format = Some(format);
@@ -1972,6 +2136,8 @@ mod tests {
         );
         let msg = refused(&["regex:(?<=a)b"]);
         assert!(msg.contains("look-around"), "{msg}");
+        let msg = refused(&["-r", "a(b"]);
+        assert!(msg.contains("unclosed group"), "{msg}");
         let msg = refused(&["size:huge2"]);
         assert!(msg.contains("size:"), "{msg}");
         assert_eq!(
@@ -2090,7 +2256,14 @@ mod tests {
     #[test]
     fn es_switches_goz_lacks_are_refused_in_either_form() {
         for name in [
-            "w", "ww", "r", "regex", "a", "oe", "o-e", "parent", "lf", "name",
+            "oe",
+            "o-e",
+            "lf",
+            "name",
+            "punc",
+            "ws",
+            "no-punc",
+            "white-space",
         ] {
             for token in [format!("-{name}"), format!("/{name}"), format!("--{name}")] {
                 let err = fatal(&[&token]);
@@ -2103,10 +2276,61 @@ mod tests {
             assert_eq!(fatal(&[token]).exit_code, 6, "{token}");
         }
         // Dashes stay optional in them.
-        assert_eq!(fatal(&["/wholeword"]).exit_code, 6);
+        assert_eq!(fatal(&["/nopunctuation"]).exit_code, 6);
         // A slash on anything else is still search text.
         assert_eq!(plan(&["/"]).query, "/");
         assert_eq!(plan(&["/downloads"]).query, "/downloads");
+    }
+
+    /// The search options es sets for the whole search become the
+    /// modifiers that do so, before the search text; `-r` reads the whole
+    /// search text as one regular expression; `-parent` and `-parent-path`
+    /// keep their paths for the CLI to make absolute.
+    #[test]
+    fn es_search_options_map_to_the_search_syntax() {
+        assert_eq!(plan(&["-ww", "foo"]).query, "?ww: foo");
+        assert_eq!(plan(&["/w", "foo"]).query, "?ww: foo");
+        assert_eq!(plan(&["-whole-words", "-no-ww", "foo"]).query, "foo");
+        assert_eq!(
+            plan(&["-ad", "-p", "-a", "-prefix", "x"]).query,
+            "folder: matchpath: ?diacritics: ?prefix: x"
+        );
+        assert_eq!(plan(&["-diacritics", "-no-a"]).query, "");
+        assert_eq!(
+            plan(&["-suffix", "-no-suffix", "-suffix", "y"]).query,
+            "?suffix: y"
+        );
+        assert_eq!(
+            plan(&["-ignore-punctuation", "-ignorews", "a"]).query,
+            "?nopunc: ?nows: a"
+        );
+        assert_eq!(plan(&["-no-ignore-punc", "a"]).query, "a");
+        // `-r`: es's regex mode, where the whole search text is the pattern.
+        assert_eq!(plan(&["-r", "^foo.*bar$"]).query, "regex*:^foo.*bar$");
+        assert_eq!(plan(&["foo", "-regex", "b|c"]).query, "regex*:foo b|c");
+        assert_eq!(plan(&["-ad", "-r", "x y"]).query, "folder: regex*:x y");
+        assert_eq!(fatal(&["-r"]).exit_code, 4, "-r needs its pattern");
+        let p = plan(&["-parent", r"C:\Program Files", "x"]);
+        assert_eq!(p.parent.as_deref(), Some(r"C:\Program Files"));
+        assert_eq!(
+            p.query_with_parent(r"C:\Program Files"),
+            r#"parent:"C:\Program Files" x"#
+        );
+        assert_eq!(
+            plan(&["-parent", r"C:\"]).query_with_parent(r"C:\"),
+            r#"parent:"C:\""#
+        );
+        crate::query::parse_query(&p.query_with_parent(r"C:\a;b c")).unwrap();
+        let p = plan(&["-parent-path", r"sub\a.txt"]);
+        assert_eq!(
+            (p.scope.as_deref(), p.scope_is_parent_of),
+            (Some(r"sub\a.txt"), true)
+        );
+        let p = plan(&["-parent-path", "a.txt", "-path", "d"]);
+        assert_eq!(
+            (p.scope.as_deref(), p.scope_is_parent_of),
+            (Some("d"), false)
+        );
     }
 
     /// No name is both accepted and refused.

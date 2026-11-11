@@ -116,9 +116,11 @@ const INTRO: &str = "goz prints the full path of every indexed file and folder t
      search, as in es: \"a|b\" is a phrase whose | is text, and a value is quoted \
      alone, as in size:\">1mb\". A modifier such as case: or ww: applies to the \
      term or <group> it prefixes, is turned off by no, as in nocase:, and with a \
-     leading ?, as in ?case:, applies to every later term. Search text goz cannot \
-     search as written, such as an unbalanced <, or a function it lacks, such as \
-     regex: or diacritics:, exits 4.";
+     leading ?, as in ?case:, applies to every later term. Case and accents are \
+     ignored unless case: or diacritics: says otherwise, so cafe finds the \
+     accented name too. Search text goz cannot search as written, such as an \
+     unbalanced <, a function it lacks, such as content:, or a regular \
+     expression the regex crate refuses, exits 4.";
 
 const QUICK_FOOTER: &str = "Run goz --help for every switch, the search syntax and the exit codes.";
 
@@ -223,6 +225,17 @@ const SEARCH_TEXT: &[(&str, &str)] = &[
     (
         "case:TEXT",
         "Match case for this term; case: alone, for the whole search",
+    ),
+    (
+        "diacritics:TEXT",
+        "Match accents for this term: diacritics:cafe misses the accented \
+         name, which cafe alone finds",
+    ),
+    (
+        "regex:TEXT",
+        "TEXT is a regular expression, up to the next space; | and ; are its \
+         own; on the full path with path: or a \\\\ in it; regex*: takes the \
+         rest of the search",
     ),
     (
         "ww:TEXT",
@@ -424,7 +437,21 @@ mod tests {
     /// Whether a query holds only what a switch adds to it, or nothing: no
     /// token was taken as search text. `text` is the sample for `-q TEXT`.
     fn holds_no_search_text(query: &str) -> bool {
-        ["", "folder:", "file:", "matchpath:", "text"].contains(&query)
+        [
+            "",
+            "folder:",
+            "file:",
+            "matchpath:",
+            "text",
+            "regex*:text",
+            "?ww:",
+            "?prefix:",
+            "?suffix:",
+            "?diacritics:",
+            "?nopunc:",
+            "?nows:",
+        ]
+        .contains(&query)
     }
 
     /// Whether `parse_argv` takes `token` alone as a switch rather than as
@@ -475,6 +502,8 @@ mod tests {
                         *param = match *param {
                             "N" => "5",
                             "DIR" => r"C:\repo",
+                            "PATH" => r"C:\repo\a.txt",
+                            "PATTERN" => "text",
                             "FILE" => "out.csv",
                             "KEY" => "size",
                             "TEXT" => "text",

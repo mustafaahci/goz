@@ -163,6 +163,7 @@ fn malformed_search_text_exits_4() {
             &["!content:x"][..],
             "unknown search function or modifier 'content:'",
         ),
+        (&["-r", "(?<=a)b"][..], "look-around"),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_goz"))
             .args(args)

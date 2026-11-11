@@ -414,9 +414,24 @@ mod win {
         } else {
             (plan.sort, plan.offset, plan.limit)
         };
+        // `-parent` names a folder, made absolute as `-path` is, whose
+        // entries alone match; `-parent-path` searches below the folder
+        // holding a path.
+        let query = match &plan.parent {
+            Some(parent) => plan.query_with_parent(&absolutize(parent)),
+            None => plan.query.clone(),
+        };
+        let scope = plan.scope.as_ref().map(|s| {
+            let scope = absolutize(s);
+            if plan.scope_is_parent_of {
+                folder_of(&scope)
+            } else {
+                scope
+            }
+        });
         QueryRequest {
-            query: plan.query.clone(),
-            scope: plan.scope.as_ref().map(|s| absolutize(s)),
+            query,
+            scope,
             sort,
             offset,
             limit,
@@ -446,6 +461,15 @@ mod win {
                 path.to_owned()
             }
         }
+    }
+
+    /// The folder holding `path` (absolute): its parent, or `path` itself
+    /// for a drive's root, which has none.
+    fn folder_of(path: &str) -> String {
+        std::path::Path::new(path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .map_or_else(|| path.to_owned(), str::to_owned)
     }
 
     /// `-get-result-count` and `-get-total-size`: the number alone, on stdout
@@ -541,6 +565,45 @@ mod win {
                 eprintln!("goz: pipe server not trusted");
                 Exit::Untrusted.into()
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use goz_core::escompat::{Command, parse_argv};
+
+        fn request(args: &[&str]) -> QueryRequest {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let Ok(Command::Run(plan)) = parse_argv(&args) else {
+                panic!("{args:?}");
+            };
+            build_query(&plan)
+        }
+
+        /// `-parent` becomes a `parent:` term with an absolute folder, and
+        /// `-parent-path` the scope of the folder holding the path.
+        #[test]
+        fn parent_switches_take_absolute_folders() {
+            let r = request(&["-parent", r"C:\Program Files", "x"]);
+            assert_eq!(r.query, r#"parent:"C:\Program Files" x"#);
+            assert_eq!(r.scope, None);
+            let r = request(&["-parent", "sub"]);
+            let cwd = std::env::current_dir().unwrap();
+            let want = format!("parent:\"{}\"", cwd.join("sub").display());
+            assert_eq!(r.query, want);
+            goz_core::query::parse_query(&r.query).unwrap();
+            let r = request(&["-parent-path", r"C:\repo\a.txt", "y"]);
+            assert_eq!(r.scope.as_deref(), Some(r"C:\repo"));
+            assert_eq!(r.query, "y");
+            assert_eq!(
+                request(&["-parent-path", r"C:\"]).scope.as_deref(),
+                Some(r"C:\")
+            );
+            assert_eq!(
+                request(&["-path", r"C:\repo"]).scope.as_deref(),
+                Some(r"C:\repo")
+            );
         }
     }
 }
