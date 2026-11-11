@@ -800,8 +800,12 @@ fn long_and_spent(path: &[u8], budget: &Budget) -> bool {
 /// name, `*` every file, L7:528-530); an empty value names a name with no
 /// dot.
 pub(super) struct ExtMatcher {
-    form: Form,
-    /// The plain values, in `form`.
+    /// The values match case: an extension is compared as stored.
+    case: bool,
+    /// The values keep their accents (`diacritics:`).
+    accented: bool,
+    /// The plain values, folded unless `case`, keeping accents if
+    /// `accented`.
     plain: Plain,
     /// How many dot-separated parts the plain values have, fewest first.
     parts: Vec<usize>,
@@ -853,7 +857,8 @@ impl ExtMatcher {
             _ => Plain::Set(plain.into_iter().collect()),
         };
         ExtMatcher {
-            form,
+            case: form == Form::Raw,
+            accented: form == Form::Accented,
             plain,
             last_part_only: globs.is_empty() && parts.iter().all(|&k| k == 1),
             parts,
@@ -942,22 +947,20 @@ impl ExtMatcher {
             .any(|glob| glob.matches_decoded(cps, budget))
     }
 
-    /// `tail`, a part of a name, in the values' form: as stored, or folded
-    /// into `fold_buf`.
+    /// `tail`, a part of a name, as the values are: as stored, or folded
+    /// into `fold_buf`. The default, folded, is tested as v0.6.0 tested it,
+    /// on the hot path of every `ext:` query; keeping accents is out of
+    /// line.
     #[inline(always)]
     fn folded<'b>(&self, tail: &'b [u8], fold_buf: &'b mut Vec<u8>) -> &'b [u8] {
-        match self.form {
-            Form::Raw => tail,
-            Form::Folded => {
-                fold_buf.clear();
-                fold_into(tail, fold_buf);
-                fold_buf.as_slice()
-            }
-            Form::Accented => {
-                fold_buf.clear();
-                fold_exact_into(tail, fold_buf);
-                fold_buf.as_slice()
-            }
+        if self.case {
+            tail
+        } else if !self.accented {
+            fold_buf.clear();
+            fold_into(tail, fold_buf);
+            fold_buf.as_slice()
+        } else {
+            accented_into(tail, fold_buf)
         }
     }
 
@@ -966,7 +969,7 @@ impl ExtMatcher {
     /// values matching case or accents, which the folded names cannot be
     /// scanned for.
     fn needles(&self) -> Option<Vec<Vec<u8>>> {
-        if self.form != Form::Folded || self.none || !self.globs.is_empty() {
+        if self.case || self.accented || self.none || !self.globs.is_empty() {
             return None;
         }
         let dotted = |v: &Vec<u8>| [&b"."[..], v].concat();
@@ -977,6 +980,14 @@ impl ExtMatcher {
             _ => None,
         }
     }
+}
+
+/// `tail` folded keeping accents into `fold_buf`.
+#[inline(never)]
+fn accented_into<'b>(tail: &[u8], fold_buf: &'b mut Vec<u8>) -> &'b [u8] {
+    fold_buf.clear();
+    fold_exact_into(tail, fold_buf);
+    fold_buf.as_slice()
 }
 
 /// Scratch buffers a search reuses from one candidate to the next, so that
@@ -999,14 +1010,39 @@ pub(super) struct Scratch {
     pub(super) other_cps: CodePointBuf,
     /// A target decoded, for a match that skips or a wildcard.
     pub(super) text_cps: CodePointBuf,
-    /// A name folded keeping accents, for `diacritics:`.
-    pub(super) accented_name: Vec<u8>,
-    /// A full path folded keeping accents.
-    pub(super) accented_path: Vec<u8>,
-    /// That path decoded.
-    pub(super) accented_cps: CodePointBuf,
+    /// The buffers of `diacritics:` terms, made when one first needs them,
+    /// so that the search of every other query carries one word for them.
+    pub(super) accented: Option<Box<Accented>>,
     /// The bytes `regex:` terms matched since the budget's last check.
     pub(super) regex_bytes: usize,
+}
+
+/// The scratch buffers of `diacritics:` terms.
+#[derive(Default)]
+pub(super) struct Accented {
+    /// A name folded keeping accents.
+    name: Vec<u8>,
+    /// A full path folded keeping accents.
+    path: Vec<u8>,
+    /// That path decoded.
+    cps: CodePointBuf,
+}
+
+impl Scratch {
+    /// The buffers of `diacritics:` terms, made now if need be.
+    fn accented(&mut self) -> &mut Accented {
+        self.accented.get_or_insert_with(Box::default)
+    }
+}
+
+/// The buffers of `diacritics:` terms, or empty ones where none were made:
+/// a buffer is read only after it was filled, so `None` reads as empty.
+fn accented_name(accented: &Option<Box<Accented>>) -> &[u8] {
+    accented.as_deref().map_or(&[], |a| &a.name)
+}
+
+fn accented_path(accented: &Option<Box<Accented>>) -> &[u8] {
+    accented.as_deref().map_or(&[], |a| &a.path)
 }
 
 /// Fills its buffer with an entry's full path (as the query compares it)
@@ -1117,7 +1153,7 @@ impl<'s, 'x> Subject<'s, 'x> {
         }
     }
 
-    /// Folds the name keeping accents into `scratch.accented_name`, when
+    /// Folds the name keeping accents into the accented scratch name, when
     /// that is not its folded name, and says whether it did: an ASCII name
     /// has no accents to keep.
     fn accent_name(&mut self) -> bool {
@@ -1126,8 +1162,9 @@ impl<'s, 'x> Subject<'s, 'x> {
             return false;
         }
         if !self.name_accented {
-            self.scratch.accented_name.clear();
-            fold_exact_into(raw, &mut self.scratch.accented_name);
+            let accented = self.scratch.accented();
+            accented.name.clear();
+            fold_exact_into(raw, &mut accented.name);
             self.name_accented = true;
         }
         true
@@ -1136,7 +1173,7 @@ impl<'s, 'x> Subject<'s, 'x> {
     /// The name in `form`.
     fn name(&mut self, form: Form) -> &[u8] {
         if form == Form::Accented && self.accent_name() {
-            &self.scratch.accented_name
+            accented_name(&self.scratch.accented)
         } else {
             self.stored_name(form)
         }
@@ -1146,7 +1183,7 @@ impl<'s, 'x> Subject<'s, 'x> {
         if self.name_decoded != Some(form) {
             if form == Form::Accented && self.accent_name() {
                 let scratch = &mut *self.scratch;
-                decode_into(&scratch.accented_name, &mut scratch.cps);
+                decode_into(accented_name(&scratch.accented), &mut scratch.cps);
             } else {
                 decode_into(self.stored_name(form), &mut self.scratch.cps);
             }
@@ -1209,12 +1246,13 @@ impl<'s, 'x> Subject<'s, 'x> {
                 let Scratch {
                     path,
                     other_path,
-                    accented_path,
+                    accented,
                     ..
                 } = &mut *self.scratch;
                 let raw = if query_case { path } else { other_path };
-                accented_path.clear();
-                fold_exact_into(raw, accented_path);
+                let accented = accented.get_or_insert_with(Box::default);
+                accented.path.clear();
+                fold_exact_into(raw, &mut accented.path);
             }
             self.accented = if found {
                 Fetched::Read
@@ -1285,7 +1323,7 @@ impl<'s, 'x> Subject<'s, 'x> {
                 };
                 let name: &[u8] = match src {
                     Src::Name(name) => name,
-                    _ => &self.scratch.accented_name,
+                    _ => accented_name(&self.scratch.accented),
                 };
                 let dot = memchr::memrchr(b'.', name);
                 let range = match target {
@@ -1306,7 +1344,7 @@ impl<'s, 'x> Subject<'s, 'x> {
                 let path: &[u8] = match src {
                     Src::Path => &self.scratch.path,
                     Src::Other => &self.scratch.other_path,
-                    _ => &self.scratch.accented_path,
+                    _ => accented_path(&self.scratch.accented),
                 };
                 let range = match target {
                     Target::FullPath => 0..path.len(),
@@ -1325,15 +1363,21 @@ impl<'s, 'x> Subject<'s, 'x> {
                 (src, range)
             }
         };
-        let scratch = &mut *self.scratch;
+        let Scratch {
+            path,
+            other_path,
+            accented,
+            text_cps,
+            ..
+        } = &mut *self.scratch;
         let bytes: &[u8] = match src {
             Src::Name(name) => &name[range],
-            Src::AccentedName => &scratch.accented_name[range],
-            Src::Path => &scratch.path[range],
-            Src::Other => &scratch.other_path[range],
-            Src::AccentedPath => &scratch.accented_path[range],
+            Src::AccentedName => &accented_name(accented)[range],
+            Src::Path => &path[range],
+            Src::Other => &other_path[range],
+            Src::AccentedPath => &accented_path(accented)[range],
         };
-        Some((bytes, &mut scratch.text_cps))
+        Some((bytes, text_cps))
     }
 
     fn path_code_points(&mut self, form: Form) -> Option<&[u32]> {
@@ -1345,11 +1389,11 @@ impl<'s, 'x> Subject<'s, 'x> {
         let (state, path, cps) = match src {
             Src::Path => (&mut self.path, &scratch.path, &mut scratch.path_cps),
             Src::Other => (&mut self.other, &scratch.other_path, &mut scratch.other_cps),
-            _ => (
-                &mut self.accented,
-                &scratch.accented_path,
-                &mut scratch.accented_cps,
-            ),
+            _ => {
+                // `fetch_path` filled the accented path.
+                let accented = &mut **scratch.accented.get_or_insert_with(Box::default);
+                (&mut self.accented, &accented.path, &mut accented.cps)
+            }
         };
         if *state == Fetched::Read {
             decode_into(path, cps);

@@ -47,12 +47,16 @@ use unicode_normalization::char::{decompose_canonical, decompose_compatible};
 
 /// Folds `bytes` (WTF-8) into `out` (WTF-8), ignoring case and accents: the
 /// default way goz compares text.
-#[inline]
 pub fn fold_into(bytes: &[u8], out: &mut Vec<u8>) {
     // ASCII fast path: no decomposition or combining marks are possible
-    // below U+0080, so fold byte-wise with no decode.
+    // below U+0080, so fold byte-wise with no decode. Written out here, as
+    // it was before accents were folded, so the per-candidate extension
+    // folding on the query hot path compiles as it did.
     if bytes.is_ascii() {
-        ascii_lower_into(bytes, out);
+        out.reserve(bytes.len());
+        for &b in bytes {
+            out.push(b.to_ascii_lowercase());
+        }
         return;
     }
     fold_non_ascii(bytes, out, Marks::Drop);
@@ -60,21 +64,15 @@ pub fn fold_into(bytes: &[u8], out: &mut Vec<u8>) {
 
 /// Folds `bytes` (WTF-8) into `out` (WTF-8), ignoring case but keeping
 /// accents: `diacritics:`.
-#[inline]
 pub fn fold_exact_into(bytes: &[u8], out: &mut Vec<u8>) {
     if bytes.is_ascii() {
-        ascii_lower_into(bytes, out);
+        out.reserve(bytes.len());
+        for &b in bytes {
+            out.push(b.to_ascii_lowercase());
+        }
         return;
     }
     fold_non_ascii(bytes, out, Marks::Keep);
-}
-
-#[inline]
-fn ascii_lower_into(bytes: &[u8], out: &mut Vec<u8>) {
-    out.reserve(bytes.len());
-    for &b in bytes {
-        out.push(b.to_ascii_lowercase());
-    }
 }
 
 /// What the non-ASCII path does with accents.
