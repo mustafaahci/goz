@@ -52,14 +52,22 @@ pub(crate) fn sync(volume: &VolumeState) {
     if guard.folder_sizes() == want {
         return;
     }
-    if want {
+    let generation = if want {
         let plan = guard.plan_folder_sizes();
         let mut index = RwLockUpgradableReadGuard::upgrade(guard);
         let summed = index.install_folder_sizes(plan);
         debug_assert!(summed, "the index changed under an upgradable read");
+        index.note_folder_sizes_changed();
+        index.generation()
     } else {
-        RwLockUpgradableReadGuard::upgrade(guard).clear_folder_sizes();
-    }
+        let mut index = RwLockUpgradableReadGuard::upgrade(guard);
+        index.clear_folder_sizes();
+        index.note_folder_sizes_changed();
+        index.generation()
+    };
+    // Every folder's size changed: watchers are told (see
+    // `VolumeIndex::note_folder_sizes_changed`).
+    volume.publish(generation);
 }
 
 /// Sums a freshly built index's folders if the setting wants them, before
@@ -74,5 +82,5 @@ pub(crate) fn on_build(index: &mut VolumeIndex, metadata_pending: bool) {
 /// holds its folders' totals (none still building, none with sizes left
 /// unread). `Hello.features` lists `"folder_sizes"` while this holds.
 pub(crate) fn settled(volumes: &VolumeSet) -> bool {
-    wanted() && volumes.iter().all(|v| v.index.read().folder_sizes())
+    wanted() && !volumes.is_empty() && volumes.iter().all(|v| v.index.read().folder_sizes())
 }

@@ -112,7 +112,11 @@ pub fn sort_column(key: SortKey) -> Option<Column> {
         SortKey::DateAccessed => Some(Column::DateAccessed),
         SortKey::Attributes => Some(Column::Attributes),
         SortKey::DateRecentlyChanged => Some(Column::RecentChange),
-        SortKey::Name | SortKey::Path | SortKey::Size | SortKey::DateModified => None,
+        SortKey::Name
+        | SortKey::Path
+        | SortKey::Size
+        | SortKey::DateModified
+        | SortKey::Extension => None,
     }
 }
 

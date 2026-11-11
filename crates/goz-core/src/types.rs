@@ -50,12 +50,21 @@ pub const NIL: EntryIdx = u32::MAX;
 
 /// Result sort key. `Path` is es's `-sort-path`: case-insensitive
 /// `(parent_path, name)`, NOT a naive full-path compare.
+///
+/// A key added after v0.6.0 is listed in `Hello.features` as `sort:<key>`
+/// (`sort:extension`): a daemon predating it refuses the request as
+/// malformed, so a client asks only for a key the daemon lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortKey {
     Name,
     Path,
     Size,
     DateModified,
+    /// Everything's extension order: folders first, by name (a folder has
+    /// no extension), then the files with no extension, then the files by
+    /// extension, case-insensitively, and by name within one extension.
+    /// Descending is the exact reverse, as in Everything.
+    Extension,
     /// Wave 9 keys: sent only to a daemon whose `Hello.features` lists
     /// `sort:date_created` (and so on); an older daemon cannot read them. A
     /// key whose column is not indexed sorts by reading each match's value
@@ -83,7 +92,9 @@ impl SortSpec {
     /// ascending, size/dates descending.
     pub fn default_for(key: SortKey) -> Self {
         let dir = match key {
-            SortKey::Name | SortKey::Path | SortKey::Attributes => SortDir::Asc,
+            SortKey::Name | SortKey::Path | SortKey::Extension | SortKey::Attributes => {
+                SortDir::Asc
+            }
             SortKey::Size
             | SortKey::DateModified
             | SortKey::DateCreated

@@ -292,8 +292,10 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                 // index), is no longer inline: `apply_batch` reports it and
                 // `compact_index` does the copying off the exclusive lock.
                 reserve_room(state, Room::for_records(&walk.records));
+                // The batch moves the generation, which the guard publishes
+                // to watchers as it drops.
                 let outcome = {
-                    let mut index = state.index.write();
+                    let mut index = state.write_index();
                     index.apply_batch(&walk.records)
                 };
                 for anomaly in &outcome.anomalies {
@@ -603,9 +605,15 @@ fn compact_index(state: &VolumeState) {
 
     let install_started = Instant::now();
     let mut index = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
+    let before = index.generation();
     let old = index.apply_compaction(plan);
+    // Corrected folder totals move the generation: watchers are told.
+    let moved = (index.generation() != before).then(|| index.generation());
     drop(index);
     let blocked = install_started.elapsed();
+    if let Some(generation) = moved {
+        state.publish(generation);
+    }
     // A folder total the live updates got wrong, corrected here, is drift
     // worth a line: a healthy index has none.
     if old.folder_fixes() > 0 {
@@ -728,8 +736,11 @@ fn reconcile_links(
                 .map(|wide| 3 * wide.len()),
         ),
     );
-    let mut index = state.index.write();
+    let mut index = state.write_index();
     dropped += apply_link_walks(&mut index, &walked);
+    if !walked.is_empty() {
+        index.note_changed();
+    }
     if dropped > 0 {
         // Not silent: a reconcile we could not perform means names on this
         // volume may be stale until the next rescan, and `--status` says so.
@@ -858,10 +869,13 @@ fn enrich_stats(
     if stats.is_empty() {
         return;
     }
-    let mut index = state.index.write();
+    let mut index = state.write_index();
     for (frn, stat) in stats {
         index.set_stat_info(frn, &stat);
     }
+    // Sizes and dates change what a query matches and how it sorts, so
+    // watchers are told, as for a journal batch.
+    index.note_changed();
 }
 
 /// Rescan with a storm guard: rebuilds the index, capping consecutive attempts
@@ -1090,9 +1104,11 @@ fn install(
     built: bootstrap::BuiltIndex,
     journal: JournalSetup,
 ) -> Option<JournalInfo> {
-    {
+    let generation = {
         let mut index = state.index.write();
+        let before = index.generation();
         *index = built.index;
+        index.continue_generation(before);
         *state.metadata_pending.write() = built.metadata_pending;
         *state.journal_max_bytes.write() = journal.cursor().map(|c| c.maximum_size);
         state.indexed.store(true, Ordering::Release);
@@ -1103,11 +1119,16 @@ fn install(
         // would index out of bounds in VolumeIndex::path_of during scope
         // validation.
         *state.scope_cache.lock() = None;
-    }
+        index.generation()
+    };
     *state.phase.write() = journal.built_phase();
     // The build summed its folders as the setting stood; one changed since
-    // is applied now.
+    // is applied now, before watchers are told, so the generation they see
+    // is the last.
     crate::folder_sizes::sync(state);
+    // Told after the phase, so a watcher that asks again at once finds the
+    // volume complete.
+    state.publish(generation.max(state.index.read().generation()));
     journal.cursor()
 }
 
@@ -1241,9 +1262,13 @@ mod tests {
         assert!(JOURNAL_WAIT_MAX <= Duration::from_secs(15 * 60));
     }
 
+    /// An index as `bootstrap::build_index` returns one: its folders summed
+    /// when every size was read.
     fn built(metadata_pending: bool) -> BuiltIndex {
+        let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        crate::folder_sizes::on_build(&mut index, metadata_pending);
         BuiltIndex {
-            index: VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse()),
+            index,
             layout_secs: 0.0,
             enum_secs: None,
             metadata_pending,
@@ -1263,6 +1288,7 @@ mod tests {
                 rel: b"windows".to_vec(),
                 entry: 1,
             })),
+            published_generation: std::sync::atomic::AtomicU64::new(0),
             column_build: parking_lot::Mutex::new(Default::default()),
         }
     }
@@ -1502,6 +1528,48 @@ mod tests {
         install(&state, built(true), JournalSetup::Refused);
         assert!(*state.metadata_pending.read());
         assert_eq!(*state.journal_max_bytes.read(), None);
+    }
+
+    /// A rebuilt index keeps the volume's generation rising and tells
+    /// watchers of it; so do the enricher's sizes and dates and folder-size
+    /// deltas, written through the publishing guard, and a write that
+    /// changes nothing tells no one.
+    #[test]
+    fn every_change_moves_the_generation_and_is_published() {
+        let state = volume(VolumePhase::Rescanning);
+        let mut seen = crate::volume_state::subscribe_changes();
+        seen.mark_unchanged();
+        install(&state, built(false), JournalSetup::Active(journal()));
+        assert_eq!(state.published(), 1);
+        assert!(seen.has_changed().unwrap());
+        {
+            let mut index = state.write_index();
+            index.note_changed();
+        }
+        assert_eq!(state.published(), 2);
+        state.write_index().note_folder_sizes_changed();
+        assert_eq!(state.published(), 3);
+        drop(state.write_index());
+        assert_eq!(state.published(), 3);
+        install(&state, built(false), JournalSetup::Active(journal()));
+        assert_eq!(state.published(), 4, "a rebuild never goes back");
+        assert_eq!(state.index.read().generation(), 4);
+    }
+
+    /// Folder sizes summed on a live volume (the switch turned on, or a
+    /// build that left them for later) move its generation and tell its
+    /// watchers; a sync with nothing to change tells no one.
+    #[test]
+    fn folder_sizes_summed_live_are_published() {
+        let state = volume(VolumePhase::Live);
+        *state.metadata_pending.write() = false;
+        let before = state.index.read().generation();
+        assert!(!state.index.read().folder_sizes());
+        crate::folder_sizes::sync(&state);
+        assert!(state.index.read().folder_sizes());
+        assert_eq!(state.published(), before + 1);
+        crate::folder_sizes::sync(&state);
+        assert_eq!(state.published(), before + 1);
     }
 
     /// A rescan the volume refuses a new journal for leaves a Snapshot, as

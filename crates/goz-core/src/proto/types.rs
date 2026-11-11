@@ -64,6 +64,23 @@ pub enum Request {
     /// is an elevated administrator; anyone else gets an `Error` "needs
     /// administrator". Answered with the options as they now are.
     SetConfig(ConfigChange),
+    /// Watch volumes for changes, on a connection of its own: the daemon
+    /// replies [`Response::Watching`], then sends [`Response::Changed`]
+    /// after the changes it applies to a watched volume, at most one frame
+    /// per `max(min_interval_ms, 100)` ms, until the client closes the pipe.
+    /// The connection carries nothing else: a request sent on it ends the
+    /// watch. Understood when `Hello.features` lists `"watch"`; a daemon
+    /// predating it answers that the request is malformed.
+    Watch {
+        /// The volumes to watch, by mount (`C:\`, `C:`, a folder mount)
+        /// or volume GUID path, case-insensitively; `None` for every
+        /// volume, those found later included. A name that matches no
+        /// volume yet is watched for when one appears.
+        volumes: Option<Vec<String>>,
+        /// The least time between two `Changed` frames, in milliseconds;
+        /// the daemon never sends them closer than 100 ms.
+        min_interval_ms: u32,
+    },
 }
 
 /// The names `Response::Hello`'s `features` lists: what the daemon supports
@@ -307,8 +324,9 @@ pub enum Response {
         server: String,
         /// Whether the index is ready to serve queries.
         ready: bool,
-        /// What the daemon supports right now (see [`feature`]); empty from
-        /// a daemon predating the field.
+        /// What the daemon supports right now beyond protocol 1 as v0.6.0
+        /// spoke it (see [`feature`]), so a client asks only for what is
+        /// understood. Empty from a daemon predating the field.
         #[serde(default)]
         features: Vec<String>,
     },
@@ -319,6 +337,18 @@ pub enum Response {
     /// Reply to [`Request::GetConfig`] and [`Request::SetConfig`]: the
     /// options as they are.
     Config(IndexConfig),
+    /// Reply to [`Request::Watch`]: the watch is on.
+    Watching,
+    /// Volumes a [`Request::Watch`] watches changed since the last frame:
+    /// a journal batch was applied, sizes or dates were read, a folder's
+    /// size changed, the index was rebuilt, or the volume was found or went
+    /// away. Results drawn from them may be stale; asking again is current.
+    Changed {
+        /// Each changed volume and its generation now (see
+        /// [`VolumeStatus::generation`]); a volume that went away is listed
+        /// with the generation it had.
+        volumes: Vec<VolumeGen>,
+    },
     /// The request failed.
     Error {
         /// Machine-readable failure class.
@@ -326,6 +356,15 @@ pub enum Response {
         /// Human-readable detail for the user/log.
         message: String,
     },
+}
+
+/// A volume and its index generation, in [`Response::Changed`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeGen {
+    /// The volume's first mount (`C:\`), or its GUID path when it has
+    /// none: the prefix its results' paths start with.
+    pub mount: String,
+    pub generation: u64,
 }
 
 /// One page of matches for a [`QueryRequest`].
@@ -621,6 +660,8 @@ mod tests {
             server: "gozd 0.1.0".into(),
             ready: false,
             features: vec![
+                feature::WATCH.into(),
+                feature::SORT_EXTENSION.into(),
                 feature::FOLDER_SIZES.into(),
                 feature::COLUMNS.into(),
                 feature::CONFIG.into(),
@@ -644,6 +685,7 @@ mod tests {
         assert_eq!(
             [
                 feature::WATCH,
+                feature::SORT_EXTENSION,
                 feature::SORT_DATE_CREATED,
                 feature::SORT_DATE_ACCESSED,
                 feature::SORT_ATTRIBUTES,
@@ -658,6 +700,7 @@ mod tests {
             ],
             [
                 "watch",
+                "sort:extension",
                 "sort:date_created",
                 "sort:date_accessed",
                 "sort:attributes",
@@ -741,6 +784,45 @@ mod tests {
         q.want_attrib = true;
         q.sort.key = SortKey::DateRecentlyChanged;
         rt_request(&Request::Query(q));
+    }
+
+    /// A Hello from a daemon predating `features` reads as one with none,
+    /// and a new Hello reads in a client that ignores the field.
+    #[test]
+    fn hello_features_are_optional() {
+        let resp: Response =
+            serde_json::from_str(r#"{"t":"Hello","proto":1,"server":"gozd 0.6.0","ready":true}"#)
+                .expect("an older hello");
+        assert!(matches!(resp, Response::Hello { features, .. } if features.is_empty()));
+        let json = serde_json::to_string(&Response::Hello {
+            proto: 1,
+            server: "gozd".into(),
+            ready: true,
+            features: vec!["watch".into()],
+        })
+        .unwrap();
+        assert!(json.ends_with(r#""features":["watch"]}"#), "{json}");
+    }
+
+    #[test]
+    fn watch_round_trips() {
+        rt_request(&Request::Watch {
+            volumes: Some(vec![r"C:".into(), "d:".into()]),
+            min_interval_ms: 250,
+        });
+        rt_request(&Request::Watch {
+            volumes: None,
+            min_interval_ms: 0,
+        });
+        rt_response(&Response::Watching);
+        rt_response(&Response::Changed {
+            volumes: vec![VolumeGen {
+                mount: r"C:".into(),
+                generation: 7,
+            }],
+        });
+        let json = serde_json::to_string(&Response::Watching).unwrap();
+        assert_eq!(json, r#"{"t":"Watching"}"#);
     }
 
     #[test]

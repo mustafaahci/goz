@@ -10,6 +10,7 @@
 
 pub mod budget;
 mod cexpr;
+pub mod content;
 pub mod dates;
 pub mod disk;
 #[cfg(test)]
@@ -35,11 +36,16 @@ mod value;
 pub use crate::fold;
 
 pub use budget::{Budget, Stopped};
+pub use content::{
+    ContentEncoding, ContentEnv, ContentQuery, ContentTerm, MAX_CONTENT_TERMS, TextFilter,
+    sort_items,
+};
 pub use dates::{DateFilter, DateOrder, LocalClock};
 pub use disk::{BasicInfo, DiskProps, disk_columns, sort_column};
 pub use engine::{
-    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, column_key, mtime_key,
-    resolve_scope, run_query, run_query_refs, run_query_refs_disk, size_key,
+    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, column_key, extension_key,
+    mtime_key, resolve_scope, run_query, run_query_refs, run_query_refs_disk, size_key,
+    sort_extension,
 };
 pub use expr::{Anchors, Expr, FolderPath, Leaf, LenOf, PropTest, Skip, Target};
 pub use parse::{

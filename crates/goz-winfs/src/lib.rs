@@ -24,6 +24,8 @@ mod cancel_io;
 #[cfg(windows)]
 mod clock;
 #[cfg(windows)]
+mod console;
+#[cfg(windows)]
 mod device_notify;
 #[cfg(windows)]
 mod elevation;
@@ -66,6 +68,9 @@ pub use admin::{
 pub use cancel_io::{ThreadIoHandle, cancel_synchronous_io, current_thread_io_handle};
 #[cfg(windows)]
 pub use clock::awake_time;
+
+#[cfg(windows)]
+pub use console::{ansi_to_string, ctrl_c_flag, persistent_handler, pipe_client_process_id};
 #[cfg(windows)]
 pub use device_notify::{DeviceEvent, DeviceNotification};
 #[cfg(windows)]

@@ -119,7 +119,7 @@ const INTRO: &str = "goz prints the full path of every indexed file and folder t
      leading ?, as in ?case:, applies to every later term. Case and accents are \
      ignored unless case: or diacritics: says otherwise, so cafe finds the \
      accented name too. Search text goz cannot search as written, such as an \
-     unbalanced <, a function it lacks, such as content:, or a regular \
+     unbalanced <, a function it lacks, such as attrib:, or a regular \
      expression the regex crate refuses, exits 4.";
 
 const QUICK_FOOTER: &str = "Run goz --help for every switch, the search syntax and the exit codes.";
@@ -289,6 +289,16 @@ const SEARCH_TEXT: &[(&str, &str)] = &[
     (
         "matchpath:",
         "Match all search text against full paths, as -p does",
+    ),
+    (
+        "content:TEXT",
+        "Files whose content holds TEXT, read by goz itself under your \
+         account, as Everything reads them: plain text by its byte order \
+         mark, as UTF-16, UTF-8 or ANSI; other files as bytes in each. The \
+         modifiers apply; * ? ; are text. utf8content:, utf16content:, \
+         utf16becontent:, ansicontent: read one encoding. Every candidate is \
+         read, so add other terms. At most 3 in a search; progress on \
+         stderr; Ctrl+C stops",
     ),
 ];
 
@@ -666,6 +676,17 @@ mod tests {
                 let form = form.replace("TEXT", "x");
                 // dm: resolves against a clock; a fixed one in 2022 will do.
                 let clock = crate::query::dates::tests::FixedClock::utc(133_000_000_000_000_000);
+                // A content form is the client's: it splits, and the query
+                // it sends gozd parses.
+                if form.contains("content:") {
+                    let split = crate::query::ContentQuery::new(&form, false)
+                        .unwrap_or_else(|e| panic!("{form}: {e}"));
+                    assert_eq!(split.terms().len(), 1, "{form}");
+                    for q in split.queries() {
+                        parse_query_at(q, false, &clock).unwrap_or_else(|e| panic!("{q}: {e}"));
+                    }
+                    continue;
+                }
                 let parsed =
                     parse_query_at(&form, false, &clock).unwrap_or_else(|e| panic!("{form}: {e}"));
                 assert!(

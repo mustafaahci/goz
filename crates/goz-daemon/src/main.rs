@@ -34,6 +34,8 @@ mod supervisor;
 mod tail;
 #[cfg(windows)]
 mod volume_state;
+#[cfg(windows)]
+mod watch;
 
 use clap::{Parser, Subcommand};
 

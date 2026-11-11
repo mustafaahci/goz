@@ -14,6 +14,9 @@ pub mod binary;
 pub mod frame;
 pub mod types;
 
+#[cfg(test)]
+mod compat_tests;
+
 pub use binary::{
     ItemColumns, RESP_TAG_JSON, RESP_TAG_RESULTS, decode_results_payload, encode_results_payload,
     patch_results_header, push_item, push_item_with, push_results_header,
@@ -25,5 +28,6 @@ pub use frame::{
 pub use types::{
     CONFIG_KEYS, ColumnStatus, ConfigChange, DaemonStatus, IndexConfig, MAX_CLIENT_FRAME,
     MAX_SERVER_FRAME, MemPair, PAGE_ROWS, PIPE_NAME, PROTO_VERSION, ProtoError, QueryRequest,
-    QueryResults, Request, Response, ResultItem, SERVICE_NAME, VolumeMemory, VolumeStatus, feature,
+    QueryResults, Request, Response, ResultItem, SERVICE_NAME, VolumeGen, VolumeMemory,
+    VolumeStatus, feature,
 };

@@ -6,12 +6,29 @@
 //! `Send` but not `Sync`): it is moved into the tail thread, so `VolumeState`
 //! stays `Sync` and can be shared across the tokio runtime via `Arc`.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use goz_core::index::{Columns, FrnMap, NTFS_ROOT_FRN, VolumeIndex};
 use goz_core::types::{EntryIdx, VolumePhase};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
+use tokio::sync::watch;
+
+/// Counts the changes published by every volume, and the volumes found and
+/// removed: what a `Watch` waits on. One for the process, so a volume needs
+/// no handle on the watchers to tell them; a watcher looks up which of its
+/// volumes moved (see [`VolumeState::published`]).
+static CHANGES: LazyLock<watch::Sender<u64>> = LazyLock::new(|| watch::channel(0).0);
+
+/// A receiver that wakes after each change published from now on.
+pub(crate) fn subscribe_changes() -> watch::Receiver<u64> {
+    CHANGES.subscribe()
+}
+
+fn announce_change() {
+    CHANGES.send_modify(|n| *n = n.wrapping_add(1));
+}
 
 /// The last-resolved `-path` scope for this volume: its volume-relative folded
 /// path and the entry it maps to. Repeated searches in one folder (every
@@ -46,6 +63,9 @@ pub(crate) struct VolumeState {
     pub indexed: AtomicBool,
     /// Memoized `-path` scope resolution (case-insensitive queries only).
     pub scope_cache: Mutex<Option<ScopeCache>>,
+    /// The index generation as of the last change published to watchers,
+    /// read without the index lock.
+    pub published_generation: AtomicU64,
     /// How the background build of optional columns switched on while the
     /// volume is live stands, for `--status`.
     pub column_build: Mutex<ColumnBuild>,
@@ -74,14 +94,72 @@ impl VolumeState {
             journal_max_bytes: RwLock::new(None),
             indexed: AtomicBool::new(false),
             scope_cache: Mutex::new(None),
+            published_generation: AtomicU64::new(0),
             column_build: Mutex::new(ColumnBuild::default()),
         }
+    }
+
+    /// The index under its write lock. A change that moves the generation
+    /// (a journal batch, the enricher's sizes and dates, a reconcile, a
+    /// rebuild, folder-size deltas: see `VolumeIndex::note_changed`) is
+    /// published to watchers when the guard drops, so no writer can forget
+    /// to tell them.
+    pub(crate) fn write_index(&self) -> IndexWrite<'_> {
+        let guard = self.index.write();
+        let before = guard.generation();
+        IndexWrite {
+            state: self,
+            guard,
+            before,
+        }
+    }
+
+    /// The generation last published (see [`Self::write_index`]).
+    pub(crate) fn published(&self) -> u64 {
+        self.published_generation.load(Ordering::Acquire)
+    }
+
+    /// Tells watchers this volume is now at `generation`.
+    pub(crate) fn publish(&self, generation: u64) {
+        self.published_generation
+            .store(generation, Ordering::Release);
+        announce_change();
     }
 
     /// The display prefix for paths on this volume (its first mount, e.g.
     /// `C:\`, or the GUID path if it has no drive letter).
     pub(crate) fn mount_prefix(&self) -> &str {
         self.mounts.first().unwrap_or(&self.guid).as_str()
+    }
+}
+
+/// A volume's index under its write lock, which tells watchers of a change
+/// as it drops (see [`VolumeState::write_index`]).
+pub(crate) struct IndexWrite<'a> {
+    state: &'a VolumeState,
+    guard: RwLockWriteGuard<'a, VolumeIndex>,
+    before: u64,
+}
+
+impl Deref for IndexWrite<'_> {
+    type Target = VolumeIndex;
+    fn deref(&self) -> &VolumeIndex {
+        &self.guard
+    }
+}
+
+impl DerefMut for IndexWrite<'_> {
+    fn deref_mut(&mut self) -> &mut VolumeIndex {
+        &mut self.guard
+    }
+}
+
+impl Drop for IndexWrite<'_> {
+    fn drop(&mut self) {
+        let now = self.guard.generation();
+        if now != self.before {
+            self.state.publish(now);
+        }
     }
 }
 
@@ -110,17 +188,23 @@ impl VolumeRegistry {
 
     /// Indexes `volume` from the next snapshot on.
     pub(crate) fn add(&self, volume: Arc<VolumeState>) {
-        let mut set = self.0.write();
-        let mut volumes = Vec::clone(&set);
-        volumes.push(volume);
-        *set = Arc::new(volumes);
+        {
+            let mut set = self.0.write();
+            let mut volumes = Vec::clone(&set);
+            volumes.push(volume);
+            *set = Arc::new(volumes);
+        }
+        announce_change();
     }
 
     /// Leaves the volume `guid` out of the next snapshot on.
     pub(crate) fn remove(&self, guid: &str) {
-        let mut set = self.0.write();
-        let volumes = set.iter().filter(|v| v.guid != guid).cloned().collect();
-        *set = Arc::new(volumes);
+        {
+            let mut set = self.0.write();
+            let volumes = set.iter().filter(|v| v.guid != guid).cloned().collect();
+            *set = Arc::new(volumes);
+        }
+        announce_change();
     }
 }
 

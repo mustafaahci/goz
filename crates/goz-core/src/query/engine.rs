@@ -2214,7 +2214,8 @@ fn with_name_ranks(index: &VolumeIndex, candidates: &mut [Candidate]) {
     }
 }
 
-/// The key a name, size or date sort orders entry `idx` by. A path sort's
+/// The key a name, size, date, extension or column sort orders entry `idx`
+/// by. A path sort's
 /// keys need every candidate's folder ranked first, which [`path_keys`]
 /// does, so a path sort is never asked here.
 fn entry_key(index: &VolumeIndex, sort: SortSpec, idx: EntryIdx, disk: Option<&DiskProps>) -> u64 {
@@ -2225,6 +2226,7 @@ fn entry_key(index: &VolumeIndex, sort: SortSpec, idx: EntryIdx, disk: Option<&D
         SortKey::Name => index.name_rank_key(index.name_id(idx)),
         SortKey::Size => size_key(index.entry(idx).size(), sort.dir),
         SortKey::DateModified => mtime_key(index.entry(idx).mtime(), sort.dir),
+        SortKey::Extension => extension_key(index.folded_name(idx), index.entry(idx).is_dir()),
         SortKey::Path => 0,
         SortKey::DateCreated
         | SortKey::DateAccessed
@@ -2256,6 +2258,45 @@ pub fn column_key(
     }
 }
 
+/// The extension an extension sort orders an entry by: what follows the
+/// last `.` of its folded name, or nothing for a name with no dot and for a
+/// folder, which has no extension, as `ext:` reads them (`.hidden` has
+/// `hidden`, `two..dots` has `dots`).
+pub fn sort_extension(folded_name: &[u8], is_dir: bool) -> &[u8] {
+    if is_dir {
+        return &[];
+    }
+    match folded_name.iter().rposition(|&b| b == b'.') {
+        Some(dot) => &folded_name[dot + 1..],
+        None => &[],
+    }
+}
+
+/// The key an extension sort orders an entry by, as Everything 1.5 orders
+/// them with its default "folders first" for an ascending sort: folders
+/// first, then the files with no extension, then the files by extension
+/// (see [`sort_extension`]). The top byte is that group, and the rest the
+/// extension's first seven bytes, so most comparisons end here; two keys
+/// that tie compare their whole extensions next (the engine's comparator),
+/// then their names. A folded name holds no NUL, so a shorter extension
+/// sorts before a longer one it starts. A descending sort is the exact
+/// reverse, folders last, as in Everything. The engine and the daemon's
+/// merge of several volumes key by this one function.
+pub fn extension_key(folded_name: &[u8], is_dir: bool) -> u64 {
+    let ext = sort_extension(folded_name, is_dir);
+    let group: u64 = if is_dir {
+        0
+    } else if ext.is_empty() {
+        1
+    } else {
+        2
+    };
+    let mut prefix = [0u8; 8];
+    let n = ext.len().min(7);
+    prefix[1..=n].copy_from_slice(&ext[..n]);
+    (group << 56) | u64::from_be_bytes(prefix)
+}
+
 /// The key a size sort in direction `dir` orders an entry of `size` by. A
 /// folder sorts by its total while goz sums folder sizes. An entry with no
 /// size, a file not read yet or a folder while folder sizes are off, comes
@@ -2279,7 +2320,7 @@ pub fn mtime_key(mtime: Option<i64>, dir: SortDir) -> u64 {
 /// `known`, below `u64::MAX`, as a key that orders like it, or for no value
 /// the key that sorts last in `dir`: the largest ascending, and the smallest
 /// descending, since [`cmp_candidate`] reverses a descending comparison.
-fn unknown_last(known: Option<u64>, dir: SortDir) -> u64 {
+pub(crate) fn unknown_last(known: Option<u64>, dir: SortDir) -> u64 {
     match (known, dir) {
         (Some(k), SortDir::Asc) => k,
         (Some(k), SortDir::Desc) => k + 1,
@@ -3054,10 +3095,21 @@ fn cmp_candidate(
     // holds what `entry_key` or `path_keys` gave for this sort. The idx tiebreak makes the
     // order total, so an unstable sort is deterministic.
     let by_name = || index.folded_name(a.idx).cmp(index.folded_name(b.idx));
-    let _ = sort.key; // every key orders the same way: `key` was filled for it
+    // Every key orders the same way, `key` having been filled for it, but
+    // for an extension's eighth byte on, which only two extensions that
+    // tie on their first seven reach.
+    let by_extension = || {
+        if sort.key != SortKey::Extension {
+            return core::cmp::Ordering::Equal;
+        }
+        let ext =
+            |c: &Candidate| sort_extension(index.folded_name(c.idx), index.entry(c.idx).is_dir());
+        ext(a).cmp(ext(b))
+    };
     let base = a
         .key
         .cmp(&b.key)
+        .then_with(by_extension)
         .then_with(by_name)
         .then_with(|| a.idx.cmp(&b.idx));
     if sort.dir == SortDir::Desc {
@@ -5764,11 +5816,12 @@ mod tests {
         "!<a|zz>|e3",
     ];
 
-    const SORT_KEYS: [SortKey; 4] = [
+    const SORT_KEYS: [SortKey; 5] = [
         SortKey::Name,
         SortKey::Size,
         SortKey::DateModified,
         SortKey::Path,
+        SortKey::Extension,
     ];
 
     proptest! {
@@ -6824,6 +6877,22 @@ mod tests {
                         | SortKey::Attributes
                         | SortKey::DateRecentlyChanged => {
                             (column_key(idx, e, sort, None), Vec::new(), fold_name(e))
+                        }
+                        // Folders, then no extension, then by extension.
+                        SortKey::Extension => {
+                            let name = fold_name(e);
+                            let ext = match name.iter().rposition(|&b| b == b'.') {
+                                _ if entry.is_dir() => None,
+                                Some(dot) => Some(name[dot + 1..].to_vec()),
+                                None => None,
+                            };
+                            let group = match (&ext, entry.is_dir()) {
+                                (_, true) => 0,
+                                (None, false) => 1,
+                                (Some(x), false) if x.is_empty() => 1,
+                                _ => 2,
+                            };
+                            (group, ext.unwrap_or_default(), name)
                         }
                     };
                     (key, e)

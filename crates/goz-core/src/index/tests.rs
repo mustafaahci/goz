@@ -1929,6 +1929,63 @@ fn room_made_before_a_batch_leaves_it_nothing_to_grow() {
     assert_whole(&idx);
 }
 
+/// The optional columns grow as the entry columns do, while they are on:
+/// a build sized from the record count reserves them, a plan made off the
+/// write lock grows them so the batch grows nothing under it, and a column
+/// that is off gets no room, holds no memory and is not in the breakdown.
+#[test]
+fn optional_columns_take_room_only_while_on() {
+    use crate::index::Column;
+    let part = |idx: &VolumeIndex, name: &str| {
+        idx.memory_parts()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, m)| m)
+    };
+    let mut idx = new_index();
+    idx.set_column(Column::DateCreated, true);
+    idx.set_column(Column::Attributes, true);
+    idx.reserve_for_records(4_000);
+    assert!(part(&idx, "ctime").unwrap().allocated >= 4_000 * 8);
+    assert!(part(&idx, "attrib").unwrap().allocated >= 4_000 * 2);
+    assert_eq!(part(&idx, "atime"), None, "off: not listed");
+    assert_eq!(idx.column_memory(Column::DateAccessed).allocated, 0);
+
+    let recs: Vec<_> = (0..5_000u64)
+        .map(|i| create(frn(1_000 + i), root_frn(), &format!("file {i}"), i % 7 == 0))
+        .collect();
+    idx.apply_batch(&recs);
+    idx.optimize_storage();
+    let batch: Vec<_> = (0..3_000u64)
+        .map(|i| create(frn(9_000 + i), frn(1_000), &format!("new {i}"), false))
+        .collect();
+    let need = Room::for_records(&batch);
+    let ctime = part(&idx, "ctime").unwrap();
+    // Switching a column moves the epoch: a plan made before is dropped.
+    let stale = idx.plan_room(need).expect("the batch outgrows the room");
+    idx.set_column(Column::DateAccessed, true);
+    idx.set_column(Column::DateAccessed, false);
+    drop(idx.install_room(stale));
+    assert_eq!(
+        part(&idx, "ctime").unwrap(),
+        ctime,
+        "a stale plan installs nothing"
+    );
+
+    drop(idx.install_room(idx.plan_room(need).expect("room to make")));
+    let made = idx.memory();
+    assert!(part(&idx, "ctime").unwrap().allocated > ctime.allocated);
+    assert_eq!(idx.column_memory(Column::DateAccessed).allocated, 0);
+    idx.apply_batch(&batch);
+    assert_eq!(
+        idx.memory().entries.allocated,
+        made.entries.allocated,
+        "nothing grew under the lock"
+    );
+    assert_eq!(idx.column_memory(Column::DateAccessed).allocated, 0);
+    assert_whole(&idx);
+}
+
 /// A build sized from the volume's record count reserves one slot a record
 /// in every column and a dense FRN map, and past that grows by a sixteenth,
 /// not by doubling.

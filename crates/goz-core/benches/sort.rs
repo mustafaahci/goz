@@ -388,6 +388,7 @@ fn bench_sorts(c: &mut Criterion) {
         ("name e file:", &files, SortKey::Name, SortDir::Asc),
         ("size e", &broad, SortKey::Size, SortDir::Desc),
         ("date e", &broad, SortKey::DateModified, SortDir::Desc),
+        ("ext e", &broad, SortKey::Extension, SortDir::Asc),
     ] {
         for limit in [Some(100), None] {
             let id = format!(

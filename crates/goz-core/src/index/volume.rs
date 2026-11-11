@@ -481,6 +481,30 @@ impl VolumeIndex {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Marks a change no journal batch made, so the generation moves and
+    /// whoever watches it (the daemon's `Watch`) learns of it: the live
+    /// enricher's sizes and dates, a hard-link reconcile.
+    pub fn note_changed(&mut self) {
+        self.generation += 1;
+    }
+
+    /// The hook for folder-size changes made apart from a journal batch, a
+    /// stat or a link reconcile (which move the generation themselves):
+    /// folder sizes summed or cleared on a live index (the daemon calls it),
+    /// and the totals a compaction corrects (called here).
+    /// The generation moves as it does for any other change, so a watcher of
+    /// the volume is told.
+    pub fn note_folder_sizes_changed(&mut self) {
+        self.note_changed();
+    }
+
+    /// Carries the generation of the index this one replaces past `before`,
+    /// so a rebuilt volume's generation keeps rising and a client that
+    /// compares it sees the change.
+    pub fn continue_generation(&mut self, before: u64) {
+        self.generation = self.generation.max(before) + 1;
+    }
     pub fn stats(&self) -> &IndexStats {
         &self.stats
     }
@@ -1636,6 +1660,9 @@ impl VolumeIndex {
         if self.folder_sizes {
             for &(dir, total) in &plan.folder_fixes {
                 self.entries.set_size(dir, total);
+            }
+            if !plan.folder_fixes.is_empty() {
+                self.note_folder_sizes_changed();
             }
             if self.cycle_suspects.is_empty() {
                 self.folder_sizes_stale = false;

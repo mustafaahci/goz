@@ -55,6 +55,16 @@ fn after(text: &[u8], p: usize) -> Option<u32> {
     CodePoints::new(text.get(p..)?).next()
 }
 
+/// Which ends of a text are no ends of the whole: a window of a file's
+/// content that more of it comes before or after (see the `content`
+/// module). An anchor never holds at an open end, nor a word boundary; a
+/// match there is found in the window beyond, which repeats it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Open {
+    pub(super) start: bool,
+    pub(super) end: bool,
+}
+
 /// A needle and where its match must stand.
 pub(super) struct TextMatcher<'a> {
     finder: memmem::Finder<'a>,
@@ -88,30 +98,45 @@ impl<'a> TextMatcher<'a> {
     /// Everything. `false` once `budget` is found spent, as the query is then
     /// refused whatever this answers.
     pub(super) fn matches(&self, hay: &[u8], cps: &mut CodePointBuf, budget: &Budget) -> bool {
+        self.matches_within(hay, cps, budget, Open::default())
+    }
+
+    /// [`Self::matches`] on a window of a longer text, whose `open` ends
+    /// are none of the text's.
+    pub(super) fn matches_within(
+        &self,
+        hay: &[u8],
+        cps: &mut CodePointBuf,
+        budget: &Budget,
+        open: Open,
+    ) -> bool {
         if self.needle_cps.is_empty() {
             return !hay.is_empty();
         }
         if self.skip.is_none() {
-            return self.anchored(hay);
+            return self.anchored(hay, open);
         }
         decode_into(hay, cps);
-        self.skipping(cps, budget)
+        self.skipping(cps, budget, open)
     }
 
     /// The match without skips: each occurrence of the needle in turn,
     /// overlapping ones too, until one stands where the anchors say.
-    fn anchored(&self, hay: &[u8]) -> bool {
+    fn anchored(&self, hay: &[u8], open: Open) -> bool {
         let needle = self.finder.needle();
         let n = needle.len();
         if n > hay.len() {
             return false;
         }
         let a = self.anchors;
+        if (a.start && open.start) || (a.end && open.end) {
+            return false;
+        }
         let stands = |p: usize| {
             (!a.start || p == 0)
                 && (!a.end || p + n == hay.len())
-                && (!a.word_start || before(hay, p).is_none_or(|c| !is_word(c)))
-                && (!a.word_end || after(hay, p + n).is_none_or(|c| !is_word(c)))
+                && (!a.word_start || before(hay, p).map_or(!open.start, |c| !is_word(c)))
+                && (!a.word_end || after(hay, p + n).map_or(!open.end, |c| !is_word(c)))
         };
         if a.start {
             return hay.starts_with(needle) && stands(0);
@@ -139,12 +164,15 @@ impl<'a> TextMatcher<'a> {
     /// later by an equal one, which may then be passed over in its turn. The
     /// target's characters before the start and after the end are passed
     /// over too, for `startwith:` and `endwith:`.
-    fn skipping(&self, hay: &[u32], budget: &Budget) -> bool {
+    fn skipping(&self, hay: &[u32], budget: &Budget, open: Open) -> bool {
         let mut steps = 0usize;
         let needle = &self.needle_cps;
         let skippable =
             |c: u32| (self.skip.punct && is_punct(c)) || (self.skip.space && is_space(c));
         let a = self.anchors;
+        if (a.start && open.start) || (a.end && open.end) {
+            return false;
+        }
         // A start anchor allows only starts before the first character that
         // cannot be passed over.
         let last_start = if a.start {
@@ -153,7 +181,10 @@ impl<'a> TextMatcher<'a> {
             hay.len()
         };
         for s in 0..hay.len().min(last_start + 1) {
-            if hay[s] != needle[0] || (a.word_start && s > 0 && is_word(hay[s - 1])) {
+            if hay[s] != needle[0]
+                || (a.word_start && s > 0 && is_word(hay[s - 1]))
+                || (a.word_start && s == 0 && open.start)
+            {
                 continue;
             }
             let (mut k, mut p) = (0, s);
@@ -179,6 +210,9 @@ impl<'a> TextMatcher<'a> {
                 continue;
             }
             if a.word_end && p < hay.len() && is_word(hay[p]) {
+                continue;
+            }
+            if a.word_end && p == hay.len() && open.end {
                 continue;
             }
             return true;
