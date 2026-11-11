@@ -46,8 +46,8 @@
 //! the files of Everything's own filters. `case:` and `matchpath:` with no
 //! text switch the whole query. An unknown `func:` is refused: as text it
 //! could match nothing, since no name contains `:`; so are Everything's
-//! functions that need what goz does not index (`child-size:`, which
-//! compares folder sizes), and its `$name:` substitutions.
+//! functions goz does not answer yet (`child-size:`, which compares child
+//! folders' sizes), and its `$name:` substitutions.
 //!
 //! The parser builds an [`Expr`]; the lowering in the `expr` module then
 //! moves the top-level terms the buckets of [`ParsedQuery`] hold into them,
@@ -166,8 +166,8 @@ pub enum QueryError {
          with Everything's aliases and no- forms), and matchpath:"
     )]
     UnknownFunction(String),
-    /// A function Everything defines that needs what goz's index does not
-    /// hold (`child-size:`, which compares folder sizes), or a `$name:`
+    /// A function Everything defines that goz does not answer yet
+    /// (`child-size:`, which compares child folders' sizes), or a `$name:`
     /// substitution: what was written, and why goz cannot answer it
     /// exactly.
     #[error("{what} is not supported: {why}")]
@@ -1060,8 +1060,8 @@ fn child_prop_kind(func: Func) -> Option<Option<Kind>> {
 /// the entry has such a value, and not the one written, as Everything reads
 /// it, where `extlen:!3` keeps no folder, since a folder has no extension
 /// (L8:90), while `!extlen:3`, the NOT of the whole term, keeps them all.
-/// goz knows no folder's size, so `size:!1kb` keeps files alone, and no
-/// unknown date passes `dm:!today`. Every entry has a name, a full path, a
+/// A folder has a size while goz sums folder sizes, so `size:!1kb` keeps
+/// it then, and no unknown size or date passes (`dm:!today`). Every entry has a name, a full path, a
 /// location and folders above it, so their lengths and its parent count
 /// need nothing more; only a folder has children to count.
 fn not_value(func: Func, e: Expr) -> Expr {

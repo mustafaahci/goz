@@ -1,7 +1,11 @@
 //! Full-scale memory simulation: replay a real `goz -export-csv` path dump
 //! into a fresh `VolumeIndex` and print the per-component memory breakdown
 //! plus process private bytes. This measures exactly what the daemon will
-//! hold for that volume set without needing to restart the service.
+//! hold for that volume set without needing to restart the service. Then
+//! live churn as the tail applies it (journal batches of creates until every
+//! column has grown), timing how long each batch holds the write lock and
+//! which batches grew what, a compaction at full scale, and every buffer's
+//! bytes; the memory lines are also printed as `goz --status` prints them.
 //!
 //! Usage: `cargo run --release -p goz-daemon --example memsim -- <all.csv>`
 //!
@@ -74,6 +78,184 @@ fn thread_cpu_ms() -> (f64, f64) {
         return (0.0, 0.0);
     }
     (u as f64 / 1e4, k as f64 / 1e4)
+}
+
+/// The memory line `goz --status` prints for a volume.
+#[cfg(windows)]
+fn status_line(label: &str, m: &goz_core::index::IndexMemory) {
+    let t = m.total();
+    eprintln!(
+        "{label}: mem MB used/alloc: total {:.1}/{:.1}  entries {:.1}/{:.1}  names {:.1}/{:.1}  folded {:.1}/{:.1}  frn[{}] {:.1}/{:.1}  ntables {:.1}/{:.1}  dirs {:.1}/{:.1}",
+        mb(t.used),
+        mb(t.allocated),
+        mb(m.entries.used),
+        mb(m.entries.allocated),
+        mb(m.arena_raw.used),
+        mb(m.arena_raw.allocated),
+        mb(m.arena_folded.used),
+        mb(m.arena_folded.allocated),
+        m.frn_map_kind,
+        mb(m.frn_map.used),
+        mb(m.frn_map.allocated),
+        mb(m.name_tables.used),
+        mb(m.name_tables.allocated),
+        mb(m.dir_children.used),
+        mb(m.dir_children.allocated),
+    );
+}
+
+/// Live churn after publish, as the tail applies it: journal batches of 256
+/// creates (new names, new record numbers, under existing folders) until
+/// every column has grown past its publish headroom once. Times each batch
+/// as the write lock would hold it and reports the slowest, the batches
+/// that grew a component, and the memory after.
+#[cfg(windows)]
+fn churn(idx: &mut VolumeIndex, dump: &dyn Fn(&str, &goz_core::index::IndexMemory)) {
+    const BATCH: usize = 256;
+    let start = idx.memory();
+    // Enough creates to pass the entry columns' headroom (a 64th) twice.
+    let target = idx.len() / 32 + 4096;
+    let dirs: Vec<u64> = (1000_u64..)
+        .take(idx.allocated())
+        .filter(|&r| {
+            idx.head_of(Frn(r | (1u64 << 48)))
+                .is_some_and(|e| idx.entry(e).is_dir())
+        })
+        .step_by(7)
+        .take(4096)
+        .collect();
+    let mut next_rec = 1000_u64 + idx.allocated() as u64 + 10;
+    let mut worst = std::time::Duration::ZERO;
+    let mut grown: Vec<(usize, f64, &'static str)> = Vec::new();
+    let mut total = std::time::Duration::ZERO;
+    let mut batches = 0usize;
+    let mut made = 0usize;
+    while made < target {
+        let recs: Vec<ParsedUsnRecord> = (0..BATCH)
+            .map(|k| {
+                let r = next_rec + k as u64;
+                ParsedUsnRecord {
+                    major_version: 3,
+                    frn: Frn(r | (1u64 << 48)),
+                    parent_frn: Frn(dirs[(r as usize) % dirs.len()] | (1u64 << 48)),
+                    usn: 0,
+                    timestamp_ft: 0,
+                    reason: USN_REASON_FILE_CREATE,
+                    attributes: 0,
+                    name: format!("memsim churn {r}.tmp").into_bytes(),
+                    name_lossy: false,
+                }
+            })
+            .collect();
+        next_rec += BATCH as u64;
+        made += BATCH;
+        let before = idx.memory();
+        let waiting = idx.name_order_stats().1;
+        let lock = grow_and_apply(idx, &recs);
+        if lock.as_secs_f64() > 0.010 {
+            let merged = idx.name_order_stats().1 < waiting;
+            eprintln!(
+                "churn: batch {} held the write lock {:.2} ms{}",
+                batches + 1,
+                lock.as_secs_f64() * 1e3,
+                if merged {
+                    " (it merged the waiting names into the name order)"
+                } else {
+                    ""
+                }
+            );
+        }
+        total += lock;
+        batches += 1;
+        worst = worst.max(lock);
+        let after = idx.memory();
+        for (what, a, b) in [
+            ("entries", before.entries, after.entries),
+            ("names", before.arena_raw, after.arena_raw),
+            ("folded", before.arena_folded, after.arena_folded),
+            ("frn", before.frn_map, after.frn_map),
+            ("ntables", before.name_tables, after.name_tables),
+            ("dirs", before.dir_children, after.dir_children),
+        ] {
+            if b.allocated > a.allocated {
+                grown.push((batches, lock.as_secs_f64() * 1e3, what));
+            }
+        }
+    }
+    eprintln!(
+        "churn: {made} creates in {batches} batches of {BATCH}; lock held {:.1} ms in all, slowest batch {:.2} ms, mean {:.3} ms",
+        total.as_secs_f64() * 1e3,
+        worst.as_secs_f64() * 1e3,
+        total.as_secs_f64() * 1e3 / batches as f64
+    );
+    for (b, ms, what) in &grown {
+        eprintln!("churn: batch {b} grew {what}: write lock {ms:.2} ms");
+    }
+    purge();
+    let end = idx.memory();
+    dump("before churn ", &start);
+    dump("after churn  ", &end);
+    status_line("status after churn", &end);
+    eprintln!(
+        "process private after churn: {:.1} MB; SUMMARY_CHURN creates={made} slowest_ms={:.2} index_used_mb={:.1} index_alloc_mb={:.1}",
+        private_mb(),
+        worst.as_secs_f64() * 1e3,
+        mb(end.total().used),
+        mb(end.total().allocated)
+    );
+}
+
+/// Applies one batch as the tail does, returning how long the write lock
+/// would be held.
+#[cfg(windows)]
+fn grow_and_apply(idx: &mut VolumeIndex, recs: &[ParsedUsnRecord]) -> std::time::Duration {
+    // The tail first grows what the batch would grow, under an upgradable
+    // read that queries share: only the install and the apply hold the
+    // write lock, and the old buffers are freed after it.
+    let t = std::time::Instant::now();
+    let plan = idx.plan_room(goz_core::index::Room::for_records(recs));
+    let planned = t.elapsed();
+    if planned.as_secs_f64() > 0.005 {
+        eprintln!(
+            "churn: room grown off the lock in {:.1} ms",
+            planned.as_secs_f64() * 1e3
+        );
+    }
+    let t = std::time::Instant::now();
+    let old = plan.map(|p| idx.install_room(p));
+    let outcome = idx.apply_batch(recs);
+    let mut lock = t.elapsed();
+    drop(old);
+    // Then, when enough names wait, their merge into the name order, again
+    // planned off the lock.
+    if outcome.wants_merge
+        && let Some(plan) = idx.plan_name_merge()
+    {
+        let t = std::time::Instant::now();
+        let old = idx.install_name_merge(plan);
+        lock = lock.max(t.elapsed());
+        drop(old);
+    }
+    lock
+}
+
+/// A compaction at full scale, whatever the garbage: the plan runs off the
+/// lock, the install under it.
+#[cfg(windows)]
+fn compaction(idx: &mut VolumeIndex) {
+    let t = std::time::Instant::now();
+    let plan = idx.plan_compaction_now(true);
+    let planned = t.elapsed();
+    let t = std::time::Instant::now();
+    let old = idx.apply_compaction(plan);
+    let lock = t.elapsed();
+    let fixes = old.folder_fixes();
+    drop(old);
+    eprintln!(
+        "compaction: planned off the lock in {:.1} ms, write lock {:.2} ms, {fixes} folder totals corrected",
+        planned.as_secs_f64() * 1e3,
+        lock.as_secs_f64() * 1e3
+    );
 }
 
 /// One entry to insert: parent record, name, is_dir.
@@ -164,6 +346,8 @@ fn main() {
     let cpu0 = thread_cpu_ms();
     let t1 = std::time::Instant::now();
     let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+    // As the build sizes from the MFT's record count: here a record a row.
+    idx.reserve_for_records(1000 + rows.len() as u64);
     let mut r = ParsedUsnRecord {
         major_version: 3,
         frn: Frn(0),
@@ -197,6 +381,11 @@ fn main() {
     let t_opt = std::time::Instant::now();
     idx.optimize_storage();
     let optimize_time = t_opt.elapsed();
+    // And the folder totals, one walk of the tree (no sizes here: every
+    // total is 0, but the walk is the walk).
+    let t_sum = std::time::Instant::now();
+    idx.set_folder_sizes(true);
+    eprintln!("folder sizes summed in {:?}", t_sum.elapsed());
     let cpu2 = thread_cpu_ms();
     let after = idx.memory();
     eprintln!(
@@ -247,14 +436,13 @@ fn main() {
         mb(t.allocated),
     );
 
-    // Where does the residue live? mimalloc's own accounting.
-    unsafe extern "C" fn out(msg: *const core::ffi::c_char, _arg: *mut core::ffi::c_void) {
-        // SAFETY: mimalloc passes a NUL-terminated string.
-        let c = unsafe { core::ffi::CStr::from_ptr(msg) };
-        eprint!("{}", c.to_string_lossy());
+    status_line("status after publish", &after);
+    churn(&mut idx, &dump);
+    compaction(&mut idx);
+    eprintln!("every buffer, MB used/allocated:");
+    for (what, m) in idx.memory_parts() {
+        eprintln!("  {what:<20} {:>8.1} {:>8.1}", mb(m.used), mb(m.allocated));
     }
-    // SAFETY: prints stats via the callback; no retained pointers.
-    unsafe { libmimalloc_sys::mi_stats_print_out(Some(out), core::ptr::null_mut()) };
 
     // Sanity: a couple of queries against the built index.
     let parsed = goz_core::query::parse_query("index.js").expect("parse");

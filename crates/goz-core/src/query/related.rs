@@ -357,8 +357,9 @@ fn prop_holds(term: &CNode<'_>, index: &VolumeIndex, e: EntryIdx) -> bool {
         CNode::Or(items) => items.iter().any(|t| prop_holds(t, index, e)),
         CNode::Not(inner) => !prop_holds(inner, index, e),
         CNode::Size(range) => size_matches(*range, entry.size()),
-        // A folder's size is unknown to goz, but no `size:` names it, as
-        // the search's own `size:unknown` does not.
+        // A folder's size is known while goz sums folder sizes, and no
+        // `size:unknown` names it when it is not, as the search's own does
+        // not.
         CNode::SizeUnknown => !entry.is_dir() && entry.size().is_none(),
         CNode::Date(date) => date.matches(entry.mtime()),
         _ => false,

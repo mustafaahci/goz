@@ -215,8 +215,8 @@ pub enum Leaf {
     },
     /// The size is known and in range.
     Size(SizeRange),
-    /// The size is unknown: a folder's (goz does not sum them), or a file's
-    /// not read yet.
+    /// The size is unknown: a file's not read yet, or a folder's while goz
+    /// sums no folder sizes (they are off, or a build left sizes unread).
     SizeUnknown,
     /// The date modified passes.
     Date(DateFilter),

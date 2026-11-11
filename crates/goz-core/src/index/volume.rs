@@ -15,15 +15,24 @@
 //!   folder's children move there until their own records re-parent them.
 //! - Slot reuse can never alias. The FRN map is keyed by record number and
 //!   every hit is re-checked against the full FRN (sequence included).
+//! - Folder totals stay exact. While folder sizes are on, every folder's size
+//!   slot holds the total of the files below it: each change carries its
+//!   difference up the parent links, O(depth), a folder move included, and
+//!   every compaction sums them all again.
+//! - No growth under the write lock. A buffer that must grow is copied while
+//!   queries keep reading ([`VolumeIndex::plan_room`]), and so are a
+//!   compaction and a merge of the name order; the write lock only swaps.
 
 use super::store::{
-    ComponentBytes, EntryFlags, EntryTable, FrnMap, MTIME_UNKNOWN, NameId, NamePair, NameStore,
-    SIZE_UNKNOWN,
+    CompactedNames, ComponentBytes, EntryFlags, EntryRoom, EntryTable, FrnMap, FrnRoom,
+    MTIME_UNKNOWN, NameId, NameMerge, NamePair, NameRoom, NameStore, SIZE_UNKNOWN,
 };
 use crate::layout::LayoutFile;
 use crate::types::{EntryIdx, Frn, NIL};
 use crate::usn::record::FILE_ATTRIBUTE_DIRECTORY;
 use crate::usn::{ParsedUsnRecord, UsnOp, ops_for};
+use hashbrown::HashTable;
+#[cfg(test)]
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -43,15 +52,26 @@ const LOST_FOUND_FRN: Frn = Frn(u64::MAX);
 /// but bounded; real NTFS trees are far shallower.
 pub(crate) const MAX_PATH_HOPS: usize = 4096;
 
-/// The `dir_children` key hash of a folded name. One fixed function for
-/// insert, remove, and lookup: the three must agree or the scope index
-/// silently loses directories.
-fn dir_key_hash(folded: &[u8]) -> u64 {
+/// The `dir_children` hash of a folder's key, its parent and folded name.
+/// One fixed function for insert, remove, lookup and the table's rehash:
+/// they must agree or the scope index silently loses folders.
+fn dir_key_hash(parent: EntryIdx, folded: &[u8]) -> u64 {
     use core::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
+    parent.hash(&mut h);
     folded.hash(&mut h);
     h.finish()
 }
+
+/// [`dir_key_hash`] of folder `d`, from its parent and name as the columns
+/// hold them now: what the scope index rehashes by.
+fn dir_hash_of(entries: &EntryTable, names: &NameStore, d: EntryIdx) -> u64 {
+    dir_key_hash(entries.parent(d), names.folded_bytes_of(entries.name_id(d)))
+}
+
+/// The most MFT records [`VolumeIndex::reserve_for_records`] sizes for: an
+/// [`EntryIdx`] is 32 bits, and a number past this is no real volume's.
+const MAX_RESERVED_RECORDS: usize = 1 << 30;
 
 /// A name plus whether it required WTF-8 (contained unpaired surrogates).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,9 +89,117 @@ impl WtfName {
 /// A compaction built off the exclusive lock, ready to install.
 ///
 /// Opaque: only [`VolumeIndex::plan_compaction`] makes one and only
-/// [`VolumeIndex::apply_compaction`] consumes it, so a plan can never be applied
-/// to an index it was not built from.
-pub struct CompactPlan(crate::index::store::CompactedNames);
+/// [`VolumeIndex::apply_compaction`] consumes it, and a plan built before the
+/// index last changed is dropped unused, so a plan can never be applied to an
+/// index it was not built from. After the install it holds the old buffers,
+/// for the caller to free once the write lock is released.
+pub struct CompactPlan {
+    /// [`VolumeIndex::epoch`] when planned.
+    epoch: u64,
+    /// The compacted names, when the arenas were worth compacting.
+    names: Option<CompactedNames>,
+    /// The name-id column rewritten through the names' remap.
+    name_ids: Vec<NameId>,
+    /// Folders whose stored total is not their files' sum, with the sum:
+    /// none on a healthy index (see [`VolumeIndex::folder_sizes`]).
+    folder_fixes: Vec<(EntryIdx, u64)>,
+}
+
+impl CompactPlan {
+    /// How many folder totals the compaction corrects: drift the live
+    /// updates let in, which a healthy index never has.
+    pub fn folder_fixes(&self) -> usize {
+        self.folder_fixes.len()
+    }
+}
+
+/// The waiting names merged into the name order off the write lock (see
+/// [`VolumeIndex::plan_name_merge`]). After the install it holds the old
+/// order, for the caller to free once the lock is released.
+pub struct NameMergePlan {
+    epoch: u64,
+    merge: NameMerge,
+}
+
+/// Folder totals summed off the write lock (see
+/// [`VolumeIndex::plan_folder_sizes`]).
+pub struct FolderSizePlan {
+    epoch: u64,
+    fixes: Vec<(EntryIdx, u64)>,
+}
+
+/// The most one change can add to an index, so that the buffers it would
+/// grow are grown before it, off the write lock (see
+/// [`VolumeIndex::plan_room`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Room {
+    /// Entries.
+    pub entries: usize,
+    /// Distinct names.
+    pub names: usize,
+    /// Bytes of original-case names, separators included.
+    pub raw_bytes: usize,
+    /// Bytes of folded names, separators included.
+    pub folded_bytes: usize,
+    /// Folders the scope index takes.
+    pub folders: usize,
+    /// FRN map records.
+    pub records: usize,
+    /// The highest MFT record number.
+    pub max_record: u64,
+}
+
+impl Room {
+    /// The most a journal batch of `records` can add: each record its own
+    /// entry and a placeholder for a parent not seen yet, their names, and a
+    /// folder. A folded name is bounded at three times its bytes, which
+    /// holds for every name but ones of compatibility characters that
+    /// decompose further, whose growth the apply then makes under the lock.
+    pub fn for_records(records: &[ParsedUsnRecord]) -> Room {
+        let mut room = Room::default();
+        for r in records {
+            let len = r.name.len();
+            room.entries += 2;
+            room.names += 2;
+            room.raw_bytes += len + 1 + PLACEHOLDER_NAME.len() + 1;
+            room.folded_bytes += 3 * len + 1 + PLACEHOLDER_NAME.len() + 1;
+            room.folders += 1;
+            room.records += 2;
+            room.max_record = room
+                .max_record
+                .max(r.frn.record_number())
+                .max(r.parent_frn.record_number());
+        }
+        room
+    }
+
+    /// The most a reconcile of hard links can add: an entry, a name and its
+    /// bytes per link, `link_bytes` being each link name's length in bytes.
+    pub fn for_links(link_bytes: impl IntoIterator<Item = usize>) -> Room {
+        let mut room = Room::default();
+        for len in link_bytes {
+            room.entries += 1;
+            room.names += 1;
+            room.raw_bytes += len + 1;
+            room.folded_bytes += 3 * len + 1;
+            room.records += 1;
+        }
+        room
+    }
+}
+
+/// Grown copies of the buffers a change would grow (see
+/// [`VolumeIndex::plan_room`]), built off the write lock. After the install
+/// it holds the old buffers, for the caller to free once the lock is
+/// released.
+pub struct RoomPlan {
+    epoch: u64,
+    entries: Option<EntryRoom>,
+    names: Option<NameRoom>,
+    frn: Option<FrnRoom>,
+    /// The scope index's length when planned, and the grown table.
+    dirs: Option<(usize, HashTable<EntryIdx>)>,
+}
 
 /// One resolved hard link: the containing directory's entry plus the link
 /// name. Passed to [`VolumeIndex::reconcile_links`] by the daemon after it
@@ -145,8 +273,7 @@ pub struct IndexMemory {
     pub frn_map: ComponentBytes,
     /// Per-unique-name tables (pairs, refcounts, chain heads, intern table).
     pub name_tables: ComponentBytes,
-    /// The `(parent, folded name) → dir` scope index (bucket estimate + exact
-    /// key-heap bytes).
+    /// The `(parent, folded name) → folder` scope index (bucket estimate).
     pub dir_children: ComponentBytes,
     /// "dense" / "sparse" (which `FrnMap` backing is in use).
     pub frn_map_kind: &'static str,
@@ -182,6 +309,10 @@ pub struct ApplyOutcome {
     /// should [`VolumeIndex::plan_compaction`] off the write lock and then
     /// [`VolumeIndex::apply_compaction`].
     pub wants_compact: bool,
+    /// Enough names wait outside the name order to merge them in. The
+    /// caller should [`VolumeIndex::plan_name_merge`] off the write lock and
+    /// then [`VolumeIndex::install_name_merge`].
+    pub wants_merge: bool,
 }
 
 enum UpsertResult {
@@ -202,25 +333,37 @@ pub struct VolumeIndex {
     stats: IndexStats,
     /// Entries structurally mutated since the last [`Self::take_write_count`].
     dirty: u64,
-    /// Persistent `(parent entry, hash of folded name) → entry` index over
-    /// real DIRECTORIES only, maintained on every mutation. Turns `-path`
-    /// scope resolution into an O(depth) walk instead of an O(all-entries)
-    /// scan. Keyed by the folded name's hash rather than owned name bytes:
-    /// the bytes live once in the interned name store, and duplicating them
-    /// here cost ~13 MB of key heap on a large volume. Lookups verify the
-    /// candidate's actual folded name, so a hash collision can never resolve
-    /// a scope to the wrong directory. Directories are ~10x rarer than files,
-    /// so this stays small; placeholders and root/lost+found are excluded
-    /// (they are never a scope component).
-    /// Values are a 1-inline SmallVec: a genuine 64-bit hash collision
-    /// between two sibling directories is astronomically rare, but when it
-    /// happens both live here and `child_dir` disambiguates by comparing the
-    /// actual folded names.
-    dir_children: FxHashMap<(EntryIdx, u64), SmallVec<[EntryIdx; 1]>>,
+    /// Persistent `(parent entry, folded name) → folder` index over real
+    /// FOLDERS only, maintained on every mutation. Turns `-path` scope
+    /// resolution into an O(depth) walk instead of an O(all-entries) scan.
+    /// The table holds only the folder's slot, 4 bytes and a control byte a
+    /// bucket: the key is hashed from the folder's own parent and name in
+    /// the columns ([`dir_hash_of`]), so it is never stored. It was a map
+    /// keyed by `(parent, name hash)` holding a one-slot SmallVec, 41 bytes a
+    /// bucket: 43 MB on a 5.1M-entry volume, where this takes 5. Lookups
+    /// compare the candidate's parent and folded name, so a hash collision
+    /// costs a compare, never a wrong folder, and siblings that differ by
+    /// case alone sit side by side. A folder leaves the table before its
+    /// parent or name changes and comes back after, since the table rehashes
+    /// from the columns. Placeholders and root/lost+found are excluded (they
+    /// are never a scope component).
+    dir_children: HashTable<EntryIdx>,
     /// The entries whose record closed a parent cycle, until
     /// [`Self::prune_cycle_suspects`] finds the cycle gone. Empty on a
     /// healthy index.
     cycle_suspects: Vec<EntryIdx>,
+    /// Bumped by every change, so a plan built off the write lock
+    /// ([`Self::plan_room`], [`Self::plan_compaction`],
+    /// [`Self::plan_folder_sizes`]) is installed only into the index it was
+    /// built from.
+    epoch: u64,
+    /// Whether each folder's size slot holds the total of the files below
+    /// it (see [`Self::folder_sizes`]); unknown otherwise.
+    folder_sizes: bool,
+    /// A parent cycle let the live totals drift: walking up from inside a
+    /// cycle never reaches the root. Once no cycle is left, the next
+    /// compaction sums them again.
+    folder_sizes_stale: bool,
 }
 
 impl VolumeIndex {
@@ -267,8 +410,11 @@ impl VolumeIndex {
             generation: 0,
             stats: IndexStats::default(),
             dirty: 0,
-            dir_children: FxHashMap::default(),
+            dir_children: HashTable::new(),
             cycle_suspects: Vec::new(),
+            epoch: 0,
+            folder_sizes: false,
+            folder_sizes_stale: false,
         };
         this.link_same_name(root, root_name);
         this.link_same_name(lost_found, lf_name);
@@ -335,6 +481,7 @@ impl VolumeIndex {
     /// Ingests one `FSCTL_ENUM_USN_DATA` record (bootstrap): the file exists
     /// with this name/parent. Idempotent.
     pub fn insert_enum(&mut self, rec: &ParsedUsnRecord) {
+        self.epoch += 1;
         self.upsert_link(
             rec.frn,
             rec.parent_frn,
@@ -347,6 +494,7 @@ impl VolumeIndex {
     /// Applies FILE_LAYOUT enrichment: sets size/mtime and reconciles the
     /// file's hard-link names (dropping 8.3 DOS-only aliases).
     pub fn enrich(&mut self, file: &LayoutFile) {
+        self.epoch += 1;
         let is_dir = file.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
 
         // Enrichment is ADD-ONLY: it never tombstones or replaces an existing
@@ -387,12 +535,12 @@ impl VolumeIndex {
 
         // Set size/mtime on EVERY link of the file, not just the head: a query
         // may return any of a hard-linked file's names, and they all describe
-        // the same bytes. (Directories keep unknown size.)
+        // the same bytes. (A folder's size is its files' total, never read.)
         if let Some(chain_head) = self.head_of(file.frn) {
             let mut cur = chain_head;
             while cur != NIL {
                 if !is_dir && let Some(sz) = file.size {
-                    self.entries.set_size(cur, sz);
+                    self.set_file_size(cur, sz);
                 }
                 if let Some(mt) = file.mtime_ft {
                     self.entries.set_mtime(cur, mt);
@@ -436,6 +584,7 @@ impl VolumeIndex {
     /// daemon must service. Bumps the generation once and compacts the arena
     /// if it has accumulated too much garbage.
     pub fn apply_batch(&mut self, records: &[ParsedUsnRecord]) -> ApplyOutcome {
+        self.epoch += 1;
         let mut outcome = ApplyOutcome::default();
         for rec in records {
             let ops: SmallVec<[UsnOp; 3]> = ops_for(rec);
@@ -467,11 +616,14 @@ impl VolumeIndex {
             }
         }
         // Names interned since the last merge join the name order once enough
-        // have gathered (see `NameStore::wants_merge`): O(names), a few
-        // milliseconds per million, and far rarer than a batch.
-        if self.names.wants_merge() {
+        // have gathered (see `NameStore::wants_merge`). The merge is O(names),
+        // 25 ms on 1.6M names, so the caller makes it off the write lock
+        // (`wants_merge`); only a backlog eight times that, which a caller
+        // that never merges leaves, is merged here.
+        if self.names.wants_merge_now() {
             self.names.merge_unranked();
         }
+        outcome.wants_merge = self.names.wants_merge();
         // A stat of an entry the batch removed would be a blocking open for
         // nothing, and deleting a tree asks for one per folder in it.
         outcome
@@ -482,7 +634,7 @@ impl VolumeIndex {
         // Compaction is NOT performed here: it is reported so the caller can do
         // the expensive part off the write lock. Doing it inline made a single
         // journal batch block every query for ~184 ms.
-        outcome.wants_compact = self.names.should_compact();
+        outcome.wants_compact = self.names.should_compact() || self.folder_sizes_want_resum();
         outcome
     }
 
@@ -496,6 +648,7 @@ impl VolumeIndex {
     /// Reconciles the hard-link set of `frn` to exactly `actual` (the daemon's
     /// `FindFirstFileNameW` result). An empty `actual` deletes the file.
     pub fn reconcile_links(&mut self, frn: Frn, actual: &[LinkTarget]) {
+        self.epoch += 1;
         if actual.is_empty() {
             self.delete_frn(frn);
             return;
@@ -510,9 +663,11 @@ impl VolumeIndex {
     /// Live enricher: sets a file's fresh `size`/`mtime` on every entry in its
     /// hard-link chain (a query may return any of its names). USN records carry
     /// neither, so the daemon stats the FRN after a create/data/basic-info
-    /// change and applies it here. Directories keep unknown size (mtime only).
-    /// A no-op if the FRN is unknown (e.g. deleted between apply and stat).
+    /// change and applies it here. A folder takes the date only: its size is
+    /// its files' total. A no-op if the FRN is unknown (e.g. deleted between
+    /// apply and stat).
     pub fn set_stat(&mut self, frn: Frn, size: u64, mtime: i64) {
+        self.epoch += 1;
         let Some(head) = self.head_of(frn) else {
             return;
         };
@@ -520,7 +675,7 @@ impl VolumeIndex {
         let mut cur = head;
         while cur != NIL {
             if !is_dir {
-                self.entries.set_size(cur, size);
+                self.set_file_size(cur, size);
             }
             self.entries.set_mtime(cur, mtime);
             cur = self.entries.next_link(cur);
@@ -613,13 +768,12 @@ impl VolumeIndex {
         parent: EntryIdx,
         folded_name: &'a [u8],
     ) -> impl Iterator<Item = EntryIdx> + 'a {
-        let key = (parent, dir_key_hash(folded_name));
         self.dir_children
-            .get(&key)
-            .into_iter()
-            .flatten()
+            .iter_hash(dir_key_hash(parent, folded_name))
             .copied()
-            .filter(move |&d| self.folded_name(d) == folded_name)
+            .filter(move |&d| {
+                self.entries.parent(d) == parent && self.folded_name(d) == folded_name
+            })
     }
 
     /// Read access to a live entry's fields (for the query engine / tests).
@@ -648,7 +802,18 @@ impl VolumeIndex {
     /// cycle guards of [`Self::path_of`] and the walks must survive.
     #[cfg(test)]
     pub fn force_parent(&mut self, idx: EntryIdx, parent: EntryIdx) {
+        self.epoch += 1;
+        self.dir_index_remove(idx);
         self.entries.set_parent(idx, parent);
+        self.dir_index_insert(idx);
+    }
+
+    /// Forces an entry's size slot, past the folder totals. Test-only: it
+    /// leaves the drift a missed update would, for a compaction to correct.
+    #[cfg(test)]
+    pub fn force_size(&mut self, idx: EntryIdx, size: u64) {
+        self.epoch += 1;
+        self.entries.set_size(idx, size);
     }
 
     /// The invariant every mutation must preserve: the incrementally-maintained
@@ -656,34 +821,27 @@ impl VolumeIndex {
     /// The model-op-tape proptest asserts this after every applied op.
     #[cfg(test)]
     pub fn dir_index_matches_rebuild(&self) -> bool {
-        let mut fresh: FxHashMap<(EntryIdx, u64), SmallVec<[EntryIdx; 1]>> = FxHashMap::default();
-        for idx in self.entries.iter_live() {
-            let flags = self.entries.flags(idx);
-            if !flags.contains(EntryFlags::DIR)
-                || flags.contains(EntryFlags::PLACEHOLDER)
-                || idx == self.root
-                || idx == self.lost_found
-            {
-                continue;
-            }
-            let key = (
-                self.entries.parent(idx),
-                dir_key_hash(self.folded_name(idx)),
-            );
-            fresh.entry(key).or_default().push(idx);
-        }
-        if fresh.len() != self.dir_children.len() {
-            return false;
-        }
-        fresh.iter().all(|(k, want)| {
-            self.dir_children.get(k).is_some_and(|got| {
-                let mut a: Vec<_> = want.to_vec();
-                let mut b: Vec<_> = got.to_vec();
-                a.sort_unstable();
-                b.sort_unstable();
-                a == b
+        let mut want: Vec<EntryIdx> = self
+            .entries
+            .iter_live()
+            .filter(|&idx| {
+                let flags = self.entries.flags(idx);
+                flags.contains(EntryFlags::DIR)
+                    && !flags.contains(EntryFlags::PLACEHOLDER)
+                    && idx != self.root
+                    && idx != self.lost_found
             })
-        })
+            .collect();
+        let mut got: Vec<EntryIdx> = self.dir_children.iter().copied().collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        // Each folder once, and each found where its key now hashes.
+        want == got
+            && want.iter().all(|&d| {
+                self.dir_children
+                    .find(dir_hash_of(&self.entries, &self.names, d), |&x| x == d)
+                    .is_some()
+            })
     }
 
     /// Collects the reconstructed path of every real entry as a lossy `String`
@@ -775,6 +933,7 @@ impl VolumeIndex {
             self.entries.set_parent(cur, self.lost_found);
             self.link_child(cur);
             self.dir_index_insert(cur);
+            self.carry(self.lost_found, self.weight(cur), 0);
             self.dirty += 1;
             cur = next;
         }
@@ -785,6 +944,9 @@ impl VolumeIndex {
     /// moves its children under lost+found, releases its name and frees its
     /// slot. The one removal path, so the order cannot drift between callers.
     fn remove_entry(&mut self, idx: EntryIdx) {
+        // The whole subtree leaves the folders above; the children it still
+        // holds come back under lost+found (`orphan_children`).
+        self.carry(self.entries.parent(idx), 0, self.weight(idx));
         self.dir_index_remove(idx); // while the name and parent are readable
         self.unlink_same_name(idx);
         self.unlink_child(idx);
@@ -826,13 +988,15 @@ impl VolumeIndex {
         {
             return;
         }
-        let key = (
-            self.entries.parent(idx),
-            dir_key_hash(self.folded_name(idx)),
-        );
-        let slot = self.dir_children.entry(key).or_default();
-        if !slot.contains(&idx) {
-            slot.push(idx);
+        let Self {
+            dir_children,
+            entries,
+            names,
+            ..
+        } = self;
+        let hash = dir_hash_of(entries, names, idx);
+        if dir_children.find(hash, |&d| d == idx).is_none() {
+            dir_children.insert_unique(hash, idx, |&d| dir_hash_of(entries, names, d));
         }
     }
 
@@ -844,15 +1008,9 @@ impl VolumeIndex {
         if !self.entries.flags(idx).contains(EntryFlags::DIR) {
             return;
         }
-        let key = (
-            self.entries.parent(idx),
-            dir_key_hash(self.folded_name(idx)),
-        );
-        if let Some(slot) = self.dir_children.get_mut(&key) {
-            slot.retain(|&mut d| d != idx);
-            if slot.is_empty() {
-                self.dir_children.remove(&key);
-            }
+        let hash = dir_hash_of(&self.entries, &self.names, idx);
+        if let Ok(found) = self.dir_children.find_entry(hash, |&d| d == idx) {
+            found.remove();
         }
     }
 
@@ -889,9 +1047,16 @@ impl VolumeIndex {
         let flags = EntryFlags::EMPTY
             .with(EntryFlags::DIR, is_dir)
             .with(EntryFlags::NON_UNICODE_NAME, name_lossy);
+        // A new file adds nothing to its folders until its size is read; a
+        // new folder holds nothing yet.
+        let size = if is_dir {
+            self.new_folder_size()
+        } else {
+            SIZE_UNKNOWN
+        };
         let idx = self
             .entries
-            .alloc(frn, parent_idx, id, flags, SIZE_UNKNOWN, MTIME_UNKNOWN, NIL);
+            .alloc(frn, parent_idx, id, flags, size, MTIME_UNKNOWN, NIL);
         self.link_same_name(idx, id);
         self.link_child(idx);
         self.by_frn.set(record, idx);
@@ -908,6 +1073,10 @@ impl VolumeIndex {
         name_lossy: bool,
         is_dir: bool,
     ) {
+        // What the entry adds to the folders above it, and where it sat: a
+        // move takes it off the old folders and onto the new ones.
+        let (old_parent, old_weight) = (self.entries.parent(idx), self.weight(idx));
+        let was_dir = self.entries.flags(idx).contains(EntryFlags::DIR);
         // Drop the OLD (parent, name) dir key before the fields are overwritten;
         // re-index under the NEW ones afterward. This covers rename, a
         // placeholder being filled in, and dir↔file transitions uniformly.
@@ -926,8 +1095,12 @@ impl VolumeIndex {
         // since the moves still to be replayed may belong to other entries
         // and heal it only that way; the entry is noted so queries check
         // presentability until then (see `prune_cycle_suspects`).
-        if self.is_at_or_below(parent_idx, idx) && !self.cycle_suspects.contains(&idx) {
-            self.cycle_suspects.push(idx);
+        if self.is_at_or_below(parent_idx, idx) {
+            if !self.cycle_suspects.contains(&idx) {
+                self.cycle_suspects.push(idx);
+            }
+            // The totals walked up from inside a cycle never reach the root.
+            self.folder_sizes_stale = true;
         }
         // Unlink from the OLD parent's child chain while `parent` still
         // points there, then relink under the new parent.
@@ -941,6 +1114,23 @@ impl VolumeIndex {
             .with(EntryFlags::NON_UNICODE_NAME, name_lossy)
             .with(EntryFlags::PLACEHOLDER, false);
         self.entries.set_flags(idx, flags);
+        if was_dir != is_dir {
+            // A file's size is not a folder's total, nor the reverse: a new
+            // folder sums what it holds, a new file waits for its stat.
+            let size = if is_dir && self.folder_sizes {
+                self.children(idx)
+                    .map(|c| self.weight(c))
+                    .fold(0, u64::wrapping_add)
+            } else {
+                SIZE_UNKNOWN
+            };
+            self.entries.set_size(idx, size);
+        }
+        let new_weight = self.weight(idx);
+        if old_parent != parent_idx || old_weight != new_weight {
+            self.carry(old_parent, 0, old_weight);
+            self.carry(parent_idx, new_weight, 0);
+        }
         self.dir_index_insert(idx);
         self.dirty += 1;
     }
@@ -1025,7 +1215,7 @@ impl VolumeIndex {
             self.lost_found,
             id,
             EntryFlags::DIR.with(EntryFlags::PLACEHOLDER, true),
-            SIZE_UNKNOWN,
+            self.new_folder_size(),
             MTIME_UNKNOWN,
             NIL,
         );
@@ -1162,10 +1352,13 @@ impl VolumeIndex {
                 let flags = EntryFlags::EMPTY
                     .with(EntryFlags::DIR, is_dir)
                     .with(EntryFlags::NON_UNICODE_NAME, target.name.lossy);
+                let size = if is_dir { self.new_folder_size() } else { size };
                 let idx = self.entries.alloc(frn, parent, id, flags, size, mtime, NIL);
                 self.link_same_name(idx, id);
                 self.link_child(idx);
                 self.dir_index_insert(idx);
+                // A new name of a sized file adds that size to its folders.
+                self.carry(parent, self.weight(idx), 0);
                 kept.push(idx);
                 self.dirty += 1;
             }
@@ -1187,46 +1380,385 @@ impl VolumeIndex {
     }
 
     /// Builds a compaction WITHOUT mutating the index, or `None` if the arenas
-    /// are not dirty enough to be worth it.
+    /// are not dirty enough to be worth it and no folder total needs summing
+    /// again.
     ///
     /// Takes `&self` on purpose. This is the expensive half (it copies every
-    /// live name into fresh arenas, hundreds of MB on a large volume) and it
-    /// used to run inline inside `apply_batch`, under the write lock, blocking
-    /// every query for as long as it took. Callers plan here, off the exclusive
-    /// lock, then [`Self::apply_compaction`] the result.
+    /// live name into fresh arenas, hundreds of MB on a large volume, builds
+    /// their intern table, order and ranks, and rewrites the name-id column)
+    /// and it used to run inline inside `apply_batch`, under the write lock,
+    /// blocking every query for as long as it took. Callers plan here, off
+    /// the exclusive lock, then [`Self::apply_compaction`] the result.
     ///
-    /// The plan is only valid while the index has not changed. That is not a
-    /// hazard in practice because a volume has exactly one writer (its tail
-    /// thread), which is also the only caller: hold an upgradable read across
-    /// both calls and no write can interleave.
+    /// While folder sizes are on, every compaction also sums each folder's
+    /// files again and corrects the totals that drifted, so a missed update
+    /// heals at the next compaction; a parent cycle the live updates could not
+    /// follow asks for one once it is gone.
+    ///
+    /// The plan is only valid while the index has not changed, and an
+    /// out-of-date plan is dropped unused. A volume has exactly one writer
+    /// (its tail thread), which is also the only caller: hold an upgradable
+    /// read across both calls and no write can interleave.
     pub fn plan_compaction(&self) -> Option<CompactPlan> {
-        if !self.names.should_compact() {
+        let compact_names = self.names.should_compact();
+        if !compact_names && !self.folder_sizes_want_resum() {
             return None;
         }
-        Some(CompactPlan(self.names.plan_compact()))
+        Some(self.plan_compaction_now(compact_names))
+    }
+
+    /// [`Self::plan_compaction`] whatever the garbage, for measuring a
+    /// compaction at full scale (the `memsim` example) and for tests.
+    #[doc(hidden)]
+    pub fn plan_compaction_now(&self, compact_names: bool) -> CompactPlan {
+        let (names, name_ids) = if compact_names {
+            let mut c = self.names.plan_compact();
+            let old = self.entries.name_ids();
+            let mut ids = Vec::with_capacity(old.capacity());
+            for (idx, &id) in old.iter().enumerate() {
+                if self.entries.is_tombstone(idx as EntryIdx) {
+                    ids.push(NIL);
+                    continue;
+                }
+                let new_id = c.remap[id as usize];
+                debug_assert_ne!(new_id, NIL, "live entry referenced a dead name id");
+                ids.push(new_id);
+                if self
+                    .entries
+                    .flags(idx as EntryIdx)
+                    .contains(EntryFlags::DIR)
+                {
+                    c.mark_folder(new_id);
+                }
+            }
+            (Some(c), ids)
+        } else {
+            (None, Vec::new())
+        };
+        let folder_fixes = if self.folder_sizes {
+            self.folder_sum_fixes()
+        } else {
+            Vec::new()
+        };
+        CompactPlan {
+            epoch: self.epoch,
+            names,
+            name_ids,
+            folder_fixes,
+        }
     }
 
     /// Installs a [`CompactPlan`]: swaps in the compacted name storage and
-    /// rewrites every live entry's name id through the remap. Dead ids cannot
-    /// be referenced by construction (an id only dies when its refcount hits
-    /// zero, and each live entry holds a reference), so the remap lookup
-    /// always yields a live new id.
+    /// the rewritten name-id column, and writes the corrected folder totals.
+    /// Returns the plan holding the old buffers, to free once the lock is
+    /// released. A plan built before the index last changed is returned
+    /// unused.
     ///
-    /// This is the half that must hold the exclusive lock: column writes plus
-    /// one intern-table rebuild, no byte-buffer copying. The same pass marks
-    /// the names folders bear, which the compacted store left clear.
-    pub fn apply_compaction(&mut self, plan: CompactPlan) {
-        let remap = self.names.install_compacted(plan.0);
+    /// This is the half that must hold the exclusive lock: swaps and the
+    /// few corrected totals, no copying, hashing or sorting.
+    pub fn apply_compaction(&mut self, mut plan: CompactPlan) -> CompactPlan {
+        if plan.epoch != self.epoch {
+            return plan;
+        }
+        self.epoch += 1;
+        if let Some(names) = &mut plan.names {
+            self.names.install_compacted(names);
+            self.entries.swap_name_ids(&mut plan.name_ids);
+        }
+        if self.folder_sizes {
+            for &(dir, total) in &plan.folder_fixes {
+                self.entries.set_size(dir, total);
+            }
+            if self.cycle_suspects.is_empty() {
+                self.folder_sizes_stale = false;
+            }
+        }
+        plan
+    }
+
+    // -- room ---------------------------------------------------------------
+
+    /// Grown copies of every buffer that what `room` describes would grow,
+    /// or `None` when they all have the room. Built off the write lock, under
+    /// a read that excludes other writers (the tail's upgradable read):
+    /// growing a buffer copies all of it and faults its new pages in, and in
+    /// place under the write lock that held every query 28.5 ms when the
+    /// entry columns of a 5.1M-entry volume grew. [`Self::install_room`] then
+    /// only swaps buffers.
+    pub fn plan_room(&self, room: Room) -> Option<RoomPlan> {
+        let entries = self.entries.plan_room(room.entries);
+        let names = self
+            .names
+            .plan_room(room.names, room.raw_bytes, room.folded_bytes);
+        let frn = self.by_frn.plan_room(room.records, room.max_record);
+        let dirs =
+            (self.dir_children.capacity() - self.dir_children.len() < room.folders).then(|| {
+                let (entries, names) = (&self.entries, &self.names);
+                let mut table = HashTable::with_capacity(
+                    (self.dir_children.capacity() * 2).max(self.dir_children.len() + room.folders),
+                );
+                for &d in self.dir_children.iter() {
+                    table.insert_unique(dir_hash_of(entries, names, d), d, |&x| {
+                        dir_hash_of(entries, names, x)
+                    });
+                }
+                (self.dir_children.len(), table)
+            });
+        if entries.is_none() && names.is_none() && frn.is_none() && dirs.is_none() {
+            return None;
+        }
+        Some(RoomPlan {
+            epoch: self.epoch,
+            entries,
+            names,
+            frn,
+            dirs,
+        })
+    }
+
+    /// Installs a [`RoomPlan`]: swaps only. Returns the plan holding the old
+    /// buffers, to free once the lock is released; a plan built before the
+    /// index last changed is returned unused.
+    pub fn install_room(&mut self, mut plan: RoomPlan) -> RoomPlan {
+        if plan.epoch != self.epoch {
+            return plan;
+        }
+        if let Some(room) = &mut plan.entries {
+            self.entries.install_room(room);
+        }
+        if let Some(room) = &mut plan.names {
+            self.names.install_room(room);
+        }
+        if let Some(room) = &mut plan.frn {
+            self.by_frn.install_room(room);
+        }
+        if let Some((len, table)) = &mut plan.dirs
+            && *len == self.dir_children.len()
+        {
+            core::mem::swap(table, &mut self.dir_children);
+        }
+        plan
+    }
+
+    /// Sizes the index for a volume of `records` MFT records before its
+    /// build (`FSCTL_GET_NTFS_VOLUME_DATA`): the entry columns get room for
+    /// one entry a record and settle, so past it they grow by a sixteenth
+    /// instead of doubling, and an FRN map that holds only the root becomes
+    /// dense over the records. A build used to pass through columns twice
+    /// what they hold and a hash map of every record (143 MB for 5.1M
+    /// entries) before publish trimmed them. Hard links add entries past
+    /// the records and free records leave some room unused; publish trims
+    /// what is left over. A record count no volume has is ignored.
+    pub fn reserve_for_records(&mut self, records: u64) {
+        let Ok(records) = usize::try_from(records) else {
+            return;
+        };
+        if records == 0 || records > MAX_RESERVED_RECORDS {
+            return;
+        }
+        self.epoch += 1;
+        self.entries.reserve(records);
+        if let FrnMap::Sparse(m) = &self.by_frn
+            && m.len() <= 2
+        {
+            let mut dense = FrnMap::dense(records);
+            for (&record, &idx) in m {
+                dense.set(record, idx);
+            }
+            self.by_frn = dense;
+        }
+    }
+
+    // -- folder sizes -------------------------------------------------------
+
+    /// Whether folder sizes are summed (Everything's `index_folder_size`): a
+    /// folder's size is then the total of every file below it, at any depth,
+    /// kept current as files are created, resized, removed and moved, and
+    /// as folders move. A file adds its size once per name, so a hard link
+    /// adds it in each folder that holds one of its names, as Everything
+    /// counts it; a file whose size is not read yet adds nothing until it
+    /// is. A junction or other reparse point is a folder with nothing in it
+    /// on NTFS, so it adds nothing; a sparse file or a cloud placeholder adds
+    /// its size, not what it takes on disk. Off, every folder's size is
+    /// unknown.
+    pub fn folder_sizes(&self) -> bool {
+        self.folder_sizes
+    }
+
+    /// Turns folder sizes on, summing every folder now, or off. The daemon
+    /// sums a live index off the write lock instead
+    /// ([`Self::plan_folder_sizes`]).
+    pub fn set_folder_sizes(&mut self, on: bool) {
+        if on {
+            let plan = self.plan_folder_sizes();
+            self.install_folder_sizes(plan);
+        } else {
+            self.clear_folder_sizes();
+        }
+    }
+
+    /// Sums every folder's files, without changing the index: one walk of
+    /// the child chains, post-order, about as long as the build's own
+    /// passes take per entry. Install with [`Self::install_folder_sizes`].
+    pub fn plan_folder_sizes(&self) -> FolderSizePlan {
+        FolderSizePlan {
+            epoch: self.epoch,
+            fixes: self.folder_sum_fixes(),
+        }
+    }
+
+    /// Writes the totals [`Self::plan_folder_sizes`] summed and keeps them
+    /// current from then on. `false`, and nothing changed, when the index
+    /// changed since the plan.
+    pub fn install_folder_sizes(&mut self, plan: FolderSizePlan) -> bool {
+        if plan.epoch != self.epoch {
+            return false;
+        }
+        self.epoch += 1;
+        for (dir, total) in plan.fixes {
+            self.entries.set_size(dir, total);
+        }
+        self.folder_sizes = true;
+        // A cycle's folders are not reached from the root; their totals
+        // are summed again once the cycle is gone.
+        self.folder_sizes_stale = !self.cycle_suspects.is_empty();
+        true
+    }
+
+    /// Turns folder sizes off: every folder's size is unknown again.
+    pub fn clear_folder_sizes(&mut self) {
+        if !self.folder_sizes {
+            return;
+        }
+        self.epoch += 1;
         for idx in 0..self.entries.capacity() as EntryIdx {
-            if self.entries.is_tombstone(idx) {
-                continue;
+            if !self.entries.is_tombstone(idx) && self.entries.flags(idx).contains(EntryFlags::DIR)
+            {
+                self.entries.set_size(idx, SIZE_UNKNOWN);
             }
-            let new_id = remap[self.entries.name_id(idx) as usize];
-            debug_assert_ne!(new_id, NIL, "live entry referenced a dead name id");
-            self.entries.set_name_id(idx, new_id);
-            if self.entries.flags(idx).contains(EntryFlags::DIR) {
-                self.names.mark_folder(new_id);
+        }
+        self.folder_sizes = false;
+        self.folder_sizes_stale = false;
+    }
+
+    /// Whether the next compaction should sum the folders again: a parent
+    /// cycle let the live totals drift, and no cycle is left to drift them.
+    fn folder_sizes_want_resum(&self) -> bool {
+        self.folder_sizes && self.folder_sizes_stale && self.cycle_suspects.is_empty()
+    }
+
+    /// Every folder reached from the root or lost+found by the child chains
+    /// whose stored size is not the total of the files below it, with that
+    /// total. One post-order walk with a stack of open entries, so no
+    /// per-entry buffer: a file adds its size (nothing while unknown) to the
+    /// innermost open entry, and a closed folder adds its total to the one
+    /// around it. A file that a corrupt record made a parent is walked into
+    /// too, so the folders under it get their totals, but what it holds
+    /// counts nowhere above it, as [`Self::carry`] stops at it. Entries deeper
+    /// than [`MAX_PATH_HOPS`], which no path reaches, add nothing.
+    fn folder_sum_fixes(&self) -> Vec<(EntryIdx, u64)> {
+        let mut fixes = Vec::new();
+        let mut open: Vec<(EntryIdx, u64)> = Vec::new();
+        for top in [self.root, self.lost_found] {
+            open.push((top, 0));
+            let mut cur = self.entries.first_child(top);
+            loop {
+                if cur != NIL {
+                    if !self.entries.flags(cur).contains(EntryFlags::DIR)
+                        && let Some(inner) = open.last_mut()
+                    {
+                        inner.1 = inner.1.wrapping_add(self.weight(cur));
+                    }
+                    let down = self.entries.first_child(cur);
+                    if down != NIL && open.len() < MAX_PATH_HOPS {
+                        open.push((cur, 0));
+                        cur = down;
+                    } else if self.entries.flags(cur).contains(EntryFlags::DIR) {
+                        // An empty folder, or one past the depth bound.
+                        let total = if down == NIL {
+                            0
+                        } else {
+                            self.entries.size(cur)
+                        };
+                        if self.entries.size(cur) != total {
+                            fixes.push((cur, total));
+                        }
+                        cur = self.entries.next_child(cur);
+                    } else {
+                        cur = self.entries.next_child(cur);
+                    }
+                    continue;
+                }
+                let Some((closed, total)) = open.pop() else {
+                    break;
+                };
+                let is_dir = self.entries.flags(closed).contains(EntryFlags::DIR);
+                if is_dir && self.entries.size(closed) != total {
+                    fixes.push((closed, total));
+                }
+                match open.last_mut() {
+                    Some(outer) => {
+                        if is_dir {
+                            outer.1 = outer.1.wrapping_add(total);
+                        }
+                        cur = self.entries.next_child(closed);
+                    }
+                    None => break,
+                }
             }
+        }
+        fixes
+    }
+
+    /// How many folders' stored totals differ from their files' sum: 0 on a
+    /// healthy index with folder sizes on.
+    #[cfg(test)]
+    pub fn folder_size_drift(&self) -> usize {
+        self.folder_sum_fixes().len()
+    }
+
+    /// What `idx` adds to the folders above it: a file its size, nothing
+    /// while unknown; a folder its total while folder sizes are on.
+    #[inline]
+    fn weight(&self, idx: EntryIdx) -> u64 {
+        let size = self.entries.size(idx);
+        if size == SIZE_UNKNOWN { 0 } else { size }
+    }
+
+    /// The size slot of a new, empty folder.
+    #[inline]
+    fn new_folder_size(&self) -> u64 {
+        if self.folder_sizes { 0 } else { SIZE_UNKNOWN }
+    }
+
+    /// Sets file entry `idx`'s size and carries the change to its folders.
+    fn set_file_size(&mut self, idx: EntryIdx, size: u64) {
+        let old = self.weight(idx);
+        self.entries.set_size(idx, size);
+        let new = self.weight(idx);
+        self.carry(self.entries.parent(idx), new, old);
+    }
+
+    /// Adds `add` to and takes `sub` off the total of folder `dir` and of
+    /// every folder above it: O(depth). Wrapping, so the halves of a move
+    /// can come in either order. Nothing while folder sizes are off. The
+    /// walk stops at an entry that is no folder, which only a corrupt record
+    /// makes a parent: what sits under a file counts nowhere, as the sum's
+    /// walk never goes into a file ([`Self::folder_sum_fixes`]). Bounded like
+    /// [`Self::path_of`], so a walk from inside a parent cycle ends, with
+    /// that cycle's totals left to the next sum (`folder_sizes_stale`).
+    fn carry(&mut self, mut dir: EntryIdx, add: u64, sub: u64) {
+        if !self.folder_sizes || add == sub {
+            return;
+        }
+        for _ in 0..MAX_PATH_HOPS {
+            if dir == NIL || !self.entries.flags(dir).contains(EntryFlags::DIR) {
+                return;
+            }
+            let total = self.entries.size(dir);
+            self.entries
+                .set_size(dir, total.wrapping_add(add).wrapping_sub(sub));
+            dir = self.entries.parent(dir);
         }
     }
 
@@ -1234,16 +1766,7 @@ impl VolumeIndex {
     /// exact `dir_children` key bytes; everything else is O(1) reads of
     /// len/capacity. Called on `Status`, not on any hot path.
     pub fn memory(&self) -> IndexMemory {
-        let dir_children = {
-            // Spilled SmallVecs (hash collisions) are so rare their heap is
-            // ignored; the bucket estimate mirrors `FrnMap::memory`.
-            let buckets = ((self.dir_children.capacity() as u64 * 8) / 7).next_power_of_two();
-            let per_bucket = (size_of::<((EntryIdx, u64), SmallVec<[EntryIdx; 1]>)>() + 1) as u64;
-            ComponentBytes {
-                used: self.dir_children.len() as u64 * per_bucket,
-                allocated: buckets * per_bucket,
-            }
-        };
+        let dir_children = self.dir_children_mem();
         IndexMemory {
             entries: self.entries.memory(),
             arena_raw: self.names.raw_mem(),
@@ -1255,6 +1778,27 @@ impl VolumeIndex {
         }
     }
 
+    /// The scope index's bytes: a slot and a control byte a bucket, the
+    /// bucket estimate mirroring `FrnMap::memory`.
+    fn dir_children_mem(&self) -> ComponentBytes {
+        let buckets = ((self.dir_children.capacity() as u64 * 8) / 7).next_power_of_two();
+        let per_bucket = (size_of::<EntryIdx>() + 1) as u64;
+        ComponentBytes {
+            used: self.dir_children.len() as u64 * per_bucket,
+            allocated: buckets * per_bucket,
+        }
+    }
+
+    /// Every buffer's bytes, by name: each entry column, each name table,
+    /// the FRN map and the scope index. For the `memsim` example.
+    pub fn memory_parts(&self) -> Vec<(&'static str, ComponentBytes)> {
+        let mut parts = self.entries.columns_mem();
+        parts.extend(self.names.parts_mem());
+        parts.push(("frn map", self.by_frn.memory()));
+        parts.push(("scope index", self.dir_children_mem()));
+        parts
+    }
+
     /// Returns growth slack (Vec doubling, hash-map overshoot) to the
     /// allocator, keeping ~1.6% headroom for post-publish journal churn, and
     /// settles the Vec buffers so that past it they grow by a sixteenth
@@ -1263,9 +1807,16 @@ impl VolumeIndex {
     /// moment is slack that would otherwise be pinned for the daemon's
     /// lifetime.
     pub fn shrink_to_fit(&mut self) {
+        self.epoch += 1;
         self.entries.shrink_with_headroom();
         self.names.shrink_with_headroom();
-        self.dir_children.shrink_to_fit();
+        let Self {
+            dir_children,
+            entries,
+            names,
+            ..
+        } = self;
+        dir_children.shrink_to_fit(|&d| dir_hash_of(entries, names, d));
         self.by_frn.shrink_to_fit();
     }
 
@@ -1277,6 +1828,7 @@ impl VolumeIndex {
     /// return all growth slack. Runs before the index is published; do not
     /// call it per batch.
     pub fn optimize_storage(&mut self) {
+        self.epoch += 1;
         self.by_frn.densify_if_smaller();
         self.names.build_order();
         self.prune_cycle_suspects();
@@ -1365,9 +1917,32 @@ impl VolumeIndex {
         )
     }
 
+    /// The waiting names merged into the name order, built off the write
+    /// lock, or `None` when too few wait (see [`ApplyOutcome::wants_merge`]).
+    pub fn plan_name_merge(&self) -> Option<NameMergePlan> {
+        if !self.names.wants_merge() {
+            return None;
+        }
+        Some(NameMergePlan {
+            epoch: self.epoch,
+            merge: self.names.plan_merge()?,
+        })
+    }
+
+    /// Installs a [`NameMergePlan`]: swaps only. Returns the plan holding the
+    /// old order, to free once the lock is released; a plan built before the
+    /// index last changed is returned unused.
+    pub fn install_name_merge(&mut self, mut plan: NameMergePlan) -> NameMergePlan {
+        if plan.epoch == self.epoch && self.names.install_merge(&mut plan.merge) {
+            self.epoch += 1;
+        }
+        plan
+    }
+
     /// Test-only: folds the waiting names into the order now.
     #[cfg(test)]
     pub fn force_name_merge(&mut self) {
+        self.epoch += 1;
         self.names.merge_unranked();
     }
 
@@ -1658,6 +2233,8 @@ impl EntryView<'_> {
     pub fn is_dir(&self) -> bool {
         self.index.entries.flags(self.idx).contains(EntryFlags::DIR)
     }
+    /// A file's size, or a folder's total while folder sizes are on (see
+    /// [`VolumeIndex::folder_sizes`]); `None` while unknown.
     pub fn size(&self) -> Option<u64> {
         let s = self.index.entries.size(self.idx);
         (s != SIZE_UNKNOWN).then_some(s)

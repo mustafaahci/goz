@@ -219,6 +219,7 @@ mod tests {
             proto: 1,
             server: format!("gozd {n}"),
             ready: true,
+            features: Vec::new(),
         }
     }
 

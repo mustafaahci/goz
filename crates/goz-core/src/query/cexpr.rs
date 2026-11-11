@@ -885,9 +885,9 @@ impl<'a> CNode<'a> {
                 Kind::Folder => s.is_dir(),
             },
             CNode::Size(range) => size_matches(*range, s.size()),
-            // A folder matches no `size:` term, `unknown` included: goz
-            // does not sum folder sizes, and in Everything, which does, a
-            // folder's size is known (L7:446).
+            // A folder matches no `size:unknown`: in Everything, which sums
+            // folder sizes, a folder's size is known (L7:446), and goz's is
+            // whenever goz sums them. Its total matches the other terms.
             CNode::SizeUnknown => s.entry.is_some() && !s.is_dir() && s.size().is_none(),
             CNode::Date(date) => date.matches(s.mtime()),
             CNode::Len { of, range } => {

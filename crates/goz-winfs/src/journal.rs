@@ -7,9 +7,10 @@ use windows_sys::Win32::Foundation::ERROR_HANDLE_EOF;
 
 use crate::error::WinError;
 use crate::ioctl::{
-    CreateUsnJournalData, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL,
-    FSCTL_READ_USN_JOURNAL, MftEnumDataV0, ReadUsnJournalDataV0, UsnJournalDataV0, ioctl_in,
-    ioctl_in_bytes, ioctl_out,
+    CreateUsnJournalData, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA,
+    FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MftEnumDataV0,
+    NtfsVolumeDataBuffer, ReadUsnJournalDataV0, UsnJournalDataV0, ioctl_in, ioctl_in_bytes,
+    ioctl_out,
 };
 use crate::volume::VolumeHandle;
 
@@ -60,6 +61,21 @@ pub fn query_usn_journal(h: &VolumeHandle) -> Result<JournalQuery, WinError> {
             context: "FSCTL_QUERY_USN_JOURNAL",
         }),
     }
+}
+
+/// How many file records the volume's MFT holds (`FSCTL_GET_NTFS_VOLUME_DATA`:
+/// its valid data length over the record size), in use or free. The index
+/// sizes its columns from it before a build.
+pub fn mft_record_count(h: &VolumeHandle) -> Result<u64, WinError> {
+    let mut data = NtfsVolumeDataBuffer::default();
+    ioctl_out(h.as_handle(), FSCTL_GET_NTFS_VOLUME_DATA, &mut data).map_err(|code| WinError {
+        code,
+        context: "FSCTL_GET_NTFS_VOLUME_DATA",
+    })?;
+    Ok(match data.bytes_per_file_record_segment {
+        0 => 0,
+        size => data.mft_valid_data_length.max(0) as u64 / u64::from(size),
+    })
 }
 
 /// `FSCTL_CREATE_USN_JOURNAL`. Creates the journal, or grows an existing one
