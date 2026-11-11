@@ -53,7 +53,7 @@
 //! query is parsed with.
 
 use super::dates::{DateFilter, LocalClock, date_filter};
-use super::expr::{self, Anchors, Expr, FolderPath, Leaf, LenOf, Skip, Target};
+use super::expr::{self, Anchors, CountOf, Expr, FolderPath, Leaf, LenOf, Skip, Target};
 use super::lex::{self, Func, Macro, ModSet, Prefix, Text, Tok, Token};
 use super::pattern::RegexTerm;
 use super::value::{self, Number};
@@ -465,6 +465,13 @@ impl<'t> Parser<'t, '_> {
                 self.prefixed_operand(mods)?,
             )),
             Prefix::Macro(m) => Ok(Expr::and(macro_ext(m), self.prefixed_operand(mods)?)),
+            Prefix::Empty => Ok(Expr::and(
+                Expr::Leaf(Leaf::Count {
+                    of: CountOf::Children,
+                    range: SizeRange { min: 0, max: 0 },
+                }),
+                self.prefixed_operand(mods)?,
+            )),
             Prefix::Func(func) => self.function(func, mods),
         }?;
         self.depth -= 1;
@@ -775,13 +782,23 @@ impl<'t> Parser<'t, '_> {
             | Func::NameLen
             | Func::PathLen
             | Func::LocationLen
-            | Func::ExtLen => {
+            | Func::ExtLen
+            | Func::ParentCount
+            | Func::ChildCount
+            | Func::ChildFileCount
+            | Func::ChildFolderCount => {
                 let (nots, item) = bangs(item);
                 let s = String::from_utf8_lossy(item);
                 let leaf = if func == Func::Size {
                     match value::number(&s, what, true, set.metric == Some(true))? {
                         Number::Range(range) => Expr::Leaf(Leaf::Size(range)),
                         Number::Unknown => Expr::Leaf(Leaf::SizeUnknown),
+                    }
+                } else if let Some(of) = count_of(func) {
+                    match value::number(&s, what, false, false)? {
+                        Number::Range(range) => Expr::Leaf(Leaf::Count { of, range }),
+                        // A count is always known.
+                        Number::Unknown => Expr::False,
                     }
                 } else {
                     let of = match func {
@@ -816,8 +833,9 @@ impl<'t> Parser<'t, '_> {
 /// it, where `extlen:!3` keeps no folder, since a folder has no extension
 /// (L8:90), while `!extlen:3`, the NOT of the whole term, keeps them all.
 /// goz knows no folder's size, so `size:!1kb` keeps files alone, and no
-/// unknown date passes `dm:!today`. Every entry has a name, a full path and
-/// a location, so their lengths need nothing more.
+/// unknown date passes `dm:!today`. Every entry has a name, a full path, a
+/// location and folders above it, so their lengths and its parent count
+/// need nothing more; only a folder has children to count.
 fn not_value(func: Func, e: Expr) -> Expr {
     let any = SizeRange {
         min: 0,
@@ -833,9 +851,28 @@ fn not_value(func: Func, e: Expr) -> Expr {
             of: LenOf::Extension,
             range: any,
         }),
+        // Only a folder has children to count (`child-count:!2` keeps no
+        // file, while `!child-count:2` keeps them all, as in Everything).
+        Func::ChildCount | Func::ChildFileCount | Func::ChildFolderCount => {
+            Expr::Leaf(Leaf::Count {
+                of: count_of(func).unwrap_or(CountOf::Children),
+                range: any,
+            })
+        }
         _ => Expr::True,
     };
     Expr::and(known, e.not())
+}
+
+/// What a count function counts; `None` for any other function.
+fn count_of(func: Func) -> Option<CountOf> {
+    Some(match func {
+        Func::ParentCount => CountOf::Parents,
+        Func::ChildCount => CountOf::Children,
+        Func::ChildFileCount => CountOf::ChildFiles,
+        Func::ChildFolderCount => CountOf::ChildFolders,
+        _ => return None,
+    })
 }
 
 /// `item` without its leading `!`s, and how many there were.
@@ -2097,6 +2134,69 @@ mod tests {
             parse_query("len:1kb"),
             Err(QueryError::Malformed { what: "len:", .. })
         ));
+    }
+
+    /// The count functions and `empty:` (W6, checked against a live
+    /// Everything 1.5): `parent-count:` under its three names, the child
+    /// counts, a value's own `!` keeping folders alone for those, and
+    /// `empty:` as zero children ANDed with what follows it.
+    #[test]
+    fn counts_and_empty() {
+        let count = |of, min, max| {
+            Expr::Leaf(Leaf::Count {
+                of,
+                range: SizeRange { min, max },
+            })
+        };
+        assert_eq!(ex("parent-count:2"), count(CountOf::Parents, 2, 2));
+        assert_eq!(ex("depth:>1"), count(CountOf::Parents, 2, u64::MAX));
+        assert_eq!(ex("parents:1..3"), count(CountOf::Parents, 1, 3));
+        assert_eq!(ex("ParentCount:<=4"), count(CountOf::Parents, 0, 4));
+        assert_eq!(ex("depth:!2"), count(CountOf::Parents, 2, 2).not());
+        assert_eq!(ex("child-count:0"), count(CountOf::Children, 0, 0));
+        assert_eq!(ex("childfilecount:3"), count(CountOf::ChildFiles, 3, 3));
+        assert_eq!(
+            ex("child-folder-count:1;4"),
+            or([
+                count(CountOf::ChildFolders, 1, 1),
+                count(CountOf::ChildFolders, 4, 4)
+            ])
+        );
+        assert_eq!(
+            ex("child-count:!2"),
+            and([
+                count(CountOf::Children, 0, u64::MAX),
+                count(CountOf::Children, 2, 2).not()
+            ])
+        );
+        assert_eq!(ex("!child-count:2"), count(CountOf::Children, 2, 2).not());
+        assert_eq!(ex("empty:"), count(CountOf::Children, 0, 0));
+        let p = q("empty:emp");
+        assert_eq!(p.expr, Some(count(CountOf::Children, 0, 0)));
+        assert_eq!(p.name_terms, vec![b"emp".to_vec()]);
+        assert_eq!(
+            ex("x|empty:emp"),
+            or([
+                name("x"),
+                and([count(CountOf::Children, 0, 0), name("emp")])
+            ])
+        );
+        assert!(matches!(
+            parse_query("depth:1kb"),
+            Err(QueryError::Malformed {
+                what: "parent-count:",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_query("?empty: a"),
+            Err(QueryError::Malformed { what: "empty:", .. })
+        ));
+        // Still refused: the volume's root is never a result.
+        assert_eq!(
+            parse_query("root:"),
+            Err(QueryError::UnknownFunction("root:".to_string()))
+        );
     }
 
     /// `parent:` and `ancestor:` take absolute folders, case-insensitively,

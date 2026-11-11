@@ -231,6 +231,15 @@ pub(super) enum Func {
     Location,
     /// `parent-name:`: the parent folder's name.
     ParentName,
+    /// `parent-count:` (`parents:`, `depth:`): how many folders are above
+    /// the entry.
+    ParentCount,
+    /// `child-count:`: how many files and folders a folder holds.
+    ChildCount,
+    /// `child-file-count:`.
+    ChildFileCount,
+    /// `child-folder-count:`.
+    ChildFolderCount,
 }
 
 impl Func {
@@ -246,6 +255,10 @@ impl Func {
                 | Func::PathLen
                 | Func::LocationLen
                 | Func::ExtLen
+                | Func::ParentCount
+                | Func::ChildCount
+                | Func::ChildFileCount
+                | Func::ChildFolderCount
         )
     }
 
@@ -282,6 +295,10 @@ impl Func {
             Func::FullPath => "full-path:",
             Func::Location => "location:",
             Func::ParentName => "parent-name:",
+            Func::ParentCount => "parent-count:",
+            Func::ChildCount => "child-count:",
+            Func::ChildFileCount => "child-file-count:",
+            Func::ChildFolderCount => "child-folder-count:",
         }
     }
 }
@@ -351,6 +368,9 @@ pub(super) enum Prefix {
     Dir,
     /// A filter macro.
     Macro(Macro),
+    /// `empty:`: folders that hold nothing, ANDed with what follows as
+    /// `dir:` is.
+    Empty,
     /// A function, whose value follows.
     Func(Func),
 }
@@ -438,6 +458,11 @@ impl Prefix {
             "fullpath" | "pathandname" | "pathname" => func(F::FullPath),
             "location" | "loc" | "pathpart" | "pp" => func(F::Location),
             "parentname" => func(F::ParentName),
+            "parentcount" | "parents" | "depth" => func(F::ParentCount),
+            "childcount" => func(F::ChildCount),
+            "childfilecount" => func(F::ChildFileCount),
+            "childfoldercount" => func(F::ChildFolderCount),
+            "empty" => Named::Prefix(Prefix::Empty),
             "audio" => macro_(Macro::Audio),
             "zip" => macro_(Macro::Zip),
             "doc" => macro_(Macro::Doc),
@@ -486,6 +511,7 @@ impl Prefix {
             Prefix::File => "file:",
             Prefix::Folder => "folder:",
             Prefix::Dir => "dir:",
+            Prefix::Empty => "empty:",
             Prefix::Macro(m) => match m {
                 Macro::Audio => "audio:",
                 Macro::Zip => "zip:",
@@ -817,7 +843,7 @@ impl Lexer {
             Prefix::File => self.global.kind = Some(Kind::File),
             Prefix::Folder | Prefix::Dir => self.global.kind = Some(Kind::Folder),
             // `head` turns these away.
-            Prefix::Macro(_) | Prefix::Func(_) => {}
+            Prefix::Macro(_) | Prefix::Empty | Prefix::Func(_) => {}
         }
     }
 
@@ -885,7 +911,7 @@ impl Lexer {
             (false, "matchpath") if first && !rest => Head::Directive(Directive::MatchPath),
             (global, name) => match Prefix::named(name) {
                 Some(Named::Prefix(prefix)) if global => match prefix {
-                    Prefix::Macro(_) | Prefix::Func(_) if !rest => {
+                    Prefix::Macro(_) | Prefix::Empty | Prefix::Func(_) if !rest => {
                         return Err(QueryError::Malformed {
                             what: prefix.spelling(),
                             detail: format!(
@@ -894,7 +920,7 @@ impl Lexer {
                             ),
                         });
                     }
-                    Prefix::Macro(_) | Prefix::Func(_) => return Ok(None),
+                    Prefix::Macro(_) | Prefix::Empty | Prefix::Func(_) => return Ok(None),
                     _ if rest => return Ok(None),
                     _ => Head::Global(prefix),
                 },

@@ -111,6 +111,12 @@ pub struct CompiledQuery<'a> {
     /// that literal, which a match must start with. Two byte compares turn
     /// most candidates away before the wildcard decodes the path.
     path_wildcard_ends: Vec<(Option<Vec<u8>>, Vec<u8>)>,
+    /// For each of `path_globs` of literals and a trailing `\**`
+    /// (`module_group_007\`), a `\` and the literals (see
+    /// [`Wildcard::folder_lead`]): the folder of an entry decides such a
+    /// pattern for all of its entries, which [`FolderPaths`] does once per
+    /// folder instead of matching each entry's path.
+    path_glob_leads: Vec<Option<Vec<u8>>>,
     /// The path wildcards of one part and no `**` (`path:*.md`, or `*.pdf`
     /// under `matchpath:`), when the mount prefix ends with a separator:
     /// such a pattern matches the last part of the full path, which is the
@@ -136,7 +142,7 @@ pub struct CompiledQuery<'a> {
     /// Whether `expr_entry` reads full paths.
     expr_paths: bool,
     /// The mount prefix as typed, for a full path a term matching case
-    /// compares in a query that does not (see [`Subject`]).
+    /// compares in a query that does not (see [`FolderPaths`]).
     raw_prefix: Vec<u8>,
     /// The kind every match has: the kind filter's, or files for an `ext:`
     /// filter, since a folder has no extension.
@@ -151,9 +157,10 @@ pub struct CompiledQuery<'a> {
     /// beyond [`name_matches`].
     name_proj: Option<CNode<'a>>,
     /// Whether the scan, when no needle drives it, finds the names first
-    /// (see [`match_scan_names`]): the query has an expression whose terms
-    /// test the entry, and something to test of the name. A query with no
-    /// expression, which is every query v0.6.0 read, scans as it did.
+    /// (see [`match_scan_names`]): the query has something to test of the
+    /// name. Then only the entries of the names that pass are read, not
+    /// every entry of the volume: `ext:mp3;wav dm:2024`, whose list gives
+    /// no needle, reads the date of the audio files alone.
     names_first: bool,
 }
 
@@ -238,6 +245,13 @@ impl<'a> CompiledQuery<'a> {
             .iter()
             .map(|w| (anchored_lead(w), w.trailing_literal()))
             .collect();
+        let path_glob_leads = path_globs
+            .iter()
+            .map(|w| {
+                w.folder_lead()
+                    .map(|lead| [b"\\".as_slice(), &lead].concat())
+            })
+            .collect();
         // The expression, with the path terms this volume's prefix decides
         // folded to constants: one that folds to `False` leaves the volume
         // nothing to read, as a path term of another drive does.
@@ -302,13 +316,12 @@ impl<'a> CompiledQuery<'a> {
             }
         }
 
-        let names_first = expr_entry.is_some()
-            && (name_proj.is_some()
-                || expr_name.is_some()
-                || parsed.filters.ext.is_some()
-                || !parsed.name_terms.is_empty()
-                || !parsed.wildcards.is_empty()
-                || !name_parts.is_empty());
+        let names_first = name_proj.is_some()
+            || expr_name.is_some()
+            || parsed.filters.ext.is_some()
+            || !parsed.name_terms.is_empty()
+            || !parsed.wildcards.is_empty()
+            || !name_parts.is_empty();
         Self {
             name_proj,
             names_first,
@@ -344,6 +357,7 @@ impl<'a> CompiledQuery<'a> {
             volume_admits,
             path_globs,
             path_wildcard_ends,
+            path_glob_leads,
             path_piece,
             expr_paths: expr_entry.as_ref().is_some_and(CNode::tests_paths),
             name_extra: !name_parts.is_empty() || expr_name.is_some(),
@@ -744,22 +758,20 @@ fn entry_expr_matches(
     index: &VolumeIndex,
     idx: EntryIdx,
     match_case: bool,
-    raw_prefix: &[u8],
     budget: &Budget,
     folders: &mut Option<FolderPaths>,
     scratch: &mut Scratch,
 ) -> bool {
-    let mut full_path = |out: &mut Vec<u8>| {
+    let mut full_path = |out: &mut Vec<u8>, stored: bool| {
         folders
             .as_mut()
-            .and_then(|f| f.with_full_path(index, idx, |p| out.extend_from_slice(p)))
+            .and_then(|f| f.with_full_path_as(index, idx, stored, |p| out.extend_from_slice(p)))
             .is_some()
     };
     e.eval(&mut Subject::entry(
         index,
         idx,
         match_case,
-        raw_prefix,
         budget,
         scratch,
         &mut full_path,
@@ -1600,9 +1612,14 @@ fn scan_with(
         return Vec::new();
     }
     // Built only when a full path has something left to decide.
-    let mut folders = compiled
-        .tests_paths()
-        .then(|| FolderPaths::new(index, &compiled.prefix, !parsed.match_case));
+    let mut folders = compiled.tests_paths().then(|| {
+        FolderPaths::new(
+            index,
+            &compiled.prefix,
+            !parsed.match_case,
+            &compiled.raw_prefix,
+        )
+    });
     let mut scope_memo: FxHashMap<EntryIdx, bool> = FxHashMap::default();
     // Each parent directory's reconstructed path, or None when it has none (its
     // ancestry ends in lost+found, or hit the hop cap), for the presentability
@@ -1759,7 +1776,7 @@ fn scan_with(
         // Every match is at or below a name holding the piece, and the walk
         // visited each of those entries once.
     } else if compiled.names_first {
-        // An expression with terms on the entry: the names come first.
+        // Something to test of the name: the names come first.
         candidates.clear();
         scan_names_first(
             index,
@@ -1842,12 +1859,13 @@ fn scan_children(
     }
 }
 
-/// The candidates of a query whose expression has terms on the entry (see
-/// [`CompiledQuery::names_first`]): the names that pass the name's tests and
-/// the projection come first, from a pass across cores, and only their
-/// entries are evaluated, their names settled. When they bear more than a
-/// share of the volume, every entry is read in order instead, those of a
-/// name the pass turned away skipped. Out of line, as [`scan_children`].
+/// The candidates of a query with something to test of the name and no
+/// needle to scan for (see [`CompiledQuery::names_first`]): the names that
+/// pass the name's tests and the projection come first, from a pass across
+/// cores, and only their entries are evaluated, their names settled. When
+/// they bear more than a share of the volume, every entry is read in order
+/// instead, those of a name the pass turned away skipped. Out of line, as
+/// [`scan_children`].
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn scan_names_first(
@@ -2123,7 +2141,6 @@ fn evaluate(
             index,
             idx,
             parsed.match_case,
-            &compiled.raw_prefix,
             compiled.budget,
             folders,
             scratch,
@@ -2232,7 +2249,19 @@ struct FolderPaths {
     path: Vec<u8>,
     /// What each path term needs of a name in the folder `needs_for`.
     needs: Vec<Need>,
+    /// For each path wildcard, whether every entry of the folder `needs_for`
+    /// matches it, or `None` when its folder does not decide it (see
+    /// `CompiledQuery::path_glob_leads`).
+    verdicts: Vec<Option<bool>>,
     needs_for: Option<EntryIdx>,
+    /// The mount prefix as typed: the prefix of the paths as stored.
+    stored_prefix: Vec<u8>,
+    /// When the paths here are folded, the paths as stored, which a term
+    /// that matches text as stored asks for (`regex:`, `case:`, `len:`),
+    /// each built from its folder's as these are, instead of walked up to
+    /// the root for every entry. Made when first asked for; the two then
+    /// share the caps one had.
+    stored: Option<Box<FolderPaths>>,
 }
 
 /// What a path term needs of a candidate's name for its full path to hold the
@@ -2257,8 +2286,8 @@ enum Need {
 
 impl FolderPaths {
     /// `prefix` is the mount prefix folded iff `fold`, as the query's path
-    /// terms are.
-    fn new(index: &VolumeIndex, prefix: &[u8], fold: bool) -> Self {
+    /// terms are; `stored_prefix` is the mount prefix as typed.
+    fn new(index: &VolumeIndex, prefix: &[u8], fold: bool, stored_prefix: &[u8]) -> Self {
         let mut this = Self {
             root: index.root(),
             fold,
@@ -2270,10 +2299,45 @@ impl FolderPaths {
             current: None,
             path: prefix.to_vec(),
             needs: Vec::new(),
+            verdicts: Vec::new(),
             needs_for: None,
+            stored_prefix: stored_prefix.to_vec(),
+            stored: None,
         };
         this.restart();
         this
+    }
+
+    /// [`Self::with_full_path`] of the path as stored when `stored`, else
+    /// as the query compares it.
+    fn with_full_path_as<R>(
+        &mut self,
+        index: &VolumeIndex,
+        idx: EntryIdx,
+        stored: bool,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        if !stored || !self.fold {
+            return self.with_full_path(index, idx, f);
+        }
+        if self.stored.is_none() {
+            // Half the caps each, so that the two hold what one did.
+            self.max_bytes /= 2;
+            self.max_folders /= 2;
+            if self.arena.capacity() > self.max_bytes || self.known.len() > self.max_folders {
+                self.restart();
+                self.arena.shrink_to(self.max_bytes);
+                self.known.shrink_to(self.max_folders);
+            }
+            let mut paths =
+                FolderPaths::new(index, &self.stored_prefix, false, &self.stored_prefix);
+            paths.max_bytes = self.max_bytes;
+            paths.max_folders = self.max_folders;
+            self.stored = Some(Box::new(paths));
+        }
+        self.stored
+            .as_deref_mut()
+            .and_then(|paths| paths.with_full_path(index, idx, f))
     }
 
     /// Forgets every folder but the root, whose path is the prefix alone.
@@ -2330,7 +2394,20 @@ impl FolderPaths {
                 }
             }
         }
-        if !whole && compiled.path_globs.is_empty() {
+        // The path wildcards the folder decides (bit `i` for the `i`th),
+        // unless a separator in the name makes the whole path decide.
+        let mut decided = 0u64;
+        if !whole {
+            for (i, verdict) in self.verdicts.iter().enumerate() {
+                match verdict {
+                    Some(false) => return false,
+                    Some(true) if i < 64 => decided |= 1 << i,
+                    _ => {}
+                }
+            }
+        }
+        let open_globs = compiled.path_globs.len() - decided.count_ones() as usize;
+        if !whole && open_globs == 0 {
             return true;
         }
         self.with_full_path(index, idx, |full| {
@@ -2339,16 +2416,16 @@ impl FolderPaths {
                     lead.as_deref().is_none_or(|lead| full.starts_with(lead))
                         && full.ends_with(trail)
                 })
-                && (compiled.path_globs.is_empty()
+                && (open_globs == 0
                     // Decoding and matching a path of megabytes, which no
                     // real path is, checks the budget first, as each term's
                     // search of such a path does in `decide_needs`.
                     || !(full.len() > CACHED_PATH_MAX && compiled.budget.check()) && {
                         decode_into(full, cp_buf);
-                        compiled
-                            .path_globs
-                            .iter()
-                            .all(|w| w.matches_decoded(cp_buf, compiled.budget))
+                        compiled.path_globs.iter().enumerate().all(|(i, w)| {
+                            (i < 64 && decided & (1 << i) != 0)
+                                || w.matches_decoded(cp_buf, compiled.budget)
+                        })
                     })
         })
         .unwrap_or(false)
@@ -2384,6 +2461,26 @@ impl FolderPaths {
                     Some(_) => Need::Never,
                     None => Need::Within,
                 }
+            });
+        }
+        // A wildcard of literals and a trailing `\**` matches where a part
+        // starts with its literals, which end with a separator. A name holds
+        // none, so they lie before the name: at the start of the path, or
+        // after a separator of the folder's part. Literals holding the
+        // drive's `:` must start the path (see `anchored_lead`).
+        self.verdicts.clear();
+        for sep_lead in &compiled.path_glob_leads {
+            self.verdicts.push(match sep_lead {
+                Some(_) if !open => None,
+                Some(_) if before_name.len() > CACHED_PATH_MAX && compiled.budget.check() => {
+                    Some(false)
+                }
+                Some(sep_lead) => Some(
+                    before_name.starts_with(&sep_lead[1..])
+                        || (!sep_lead.contains(&b':')
+                            && memmem::find(before_name, sep_lead).is_some()),
+                ),
+                None => None,
             });
         }
         self.path.truncate(folder_end);
@@ -2999,7 +3096,7 @@ mod tests {
         let spent = cancelled_by(&cancel);
         let needs = |budget: &Budget, folder: Frn| {
             let compiled = CompiledQuery::new(&idx, &parsed, r"C:\", budget);
-            let mut folders = FolderPaths::new(&idx, &compiled.prefix, true);
+            let mut folders = FolderPaths::new(&idx, &compiled.prefix, true, &compiled.raw_prefix);
             folders.load(&idx, idx.head_of(folder).unwrap());
             folders.decide_needs(&compiled);
             folders.needs.clone()
@@ -4029,9 +4126,9 @@ mod tests {
                 };
                 assert_eq!(walked(root), walked(None), "{q:?}");
                 let admits = |e, scope| {
-                    let mut folders = compiled
-                        .tests_paths()
-                        .then(|| FolderPaths::new(idx, &compiled.prefix, true));
+                    let mut folders = compiled.tests_paths().then(|| {
+                        FolderPaths::new(idx, &compiled.prefix, true, &compiled.raw_prefix)
+                    });
                     evaluate(
                         idx,
                         &parsed,
@@ -4590,7 +4687,7 @@ mod tests {
                     prefix.as_bytes().to_vec()
                 };
                 for order in [entries.clone(), entries.iter().rev().copied().collect()] {
-                    let mut paths = FolderPaths::new(&idx, &mount, fold);
+                    let mut paths = FolderPaths::new(&idx, &mount, fold, prefix.as_bytes());
                     paths.max_bytes = 200;
                     paths.max_folders = 6;
                     for &e in &order {
@@ -4618,7 +4715,7 @@ mod tests {
             idx.insert_enum(&enum_rec(frn(100 + i), root, &format!("{i:036}"), true));
             idx.insert_enum(&enum_rec(frn(1000 + i), frn(100 + i), "f.txt", false));
         }
-        let mut paths = FolderPaths::new(&idx, br"c:\", true);
+        let mut paths = FolderPaths::new(&idx, br"c:\", true, br"c:\");
         paths.max_bytes = 1000;
         for i in 0..60 {
             let file = idx.head_of(frn(1000 + i)).unwrap();
@@ -4659,7 +4756,7 @@ mod tests {
             parent = f;
         }
         idx.apply_batch(&recs);
-        let mut paths = FolderPaths::new(&idx, br"C:\", false);
+        let mut paths = FolderPaths::new(&idx, br"C:\", false, br"C:\");
         let mut with_path = 0;
         for e in idx
             .live_entries()
@@ -4881,7 +4978,7 @@ mod tests {
             orphans in prop::collection::vec("[aAbBçÇ]{1,3}", 0..3),
             pick in any::<prop::sample::Index>(),
             cuts in prop::collection::vec(any::<prop::sample::Index>(), 6),
-            shape in 0u8..6,
+            shape in 0u8..9,
             flip in any::<u64>(),
             match_case in any::<bool>(),
             mount in 0usize..3,
@@ -4910,6 +5007,11 @@ mod tests {
             let wildcard = |(i, j): (usize, usize)| {
                 format!("path:{}*{}", flip_case(&full[..i], flip), flip_case(&full[j..], flip >> 5))
             };
+            // Literals and a last `**`, which a folder decides when they end
+            // with a separator.
+            let lead = |(i, j): (usize, usize), tail: &str| {
+                format!("path:{}{tail}", flip_case(&full[i..j], flip >> 3))
+            };
             let (m, n) = span(4, 5, name.len());
             let name_term = flip_case(&name[m..n], flip >> 11);
             let mut terms = match shape {
@@ -4918,7 +5020,10 @@ mod tests {
                 2 => vec![path_term(span(0, 1, full.len())), path_term(span(2, 3, full.len()))],
                 3 => vec![wildcard(span(0, 1, full.len()))],
                 4 => vec![wildcard(span(0, 1, full.len())), name_term],
-                _ => vec![path_term(span(0, 1, full.len())), wildcard(span(2, 3, full.len()))],
+                5 => vec![path_term(span(0, 1, full.len())), wildcard(span(2, 3, full.len()))],
+                6 => vec![lead(span(0, 1, full.len()), r"\**")],
+                7 => vec![lead(span(0, 1, full.len()), "**"), name_term],
+                _ => vec![lead(span(0, 1, full.len()), r"\**"), path_term(span(2, 3, full.len()))],
             };
             // The wildcards as typed, for the reference to match on its own.
             let patterns: Vec<String> = terms
@@ -4979,10 +5084,10 @@ mod tests {
             prop_assert_eq!(got, want, "query {:?} under {}", query, prefix);
         }
 
-        /// A query whose expression tests the entry finds the same entries
-        /// when the scan finds the names first, across cores, as when it
-        /// reads every entry: the names passed on, or every entry with the
-        /// rest skipped once they bear too much of the volume.
+        /// A query that tests the name and has no needle finds the same
+        /// entries when the scan finds the names first, across cores, as
+        /// when it reads every entry: the names passed on, or every entry
+        /// with the rest skipped once they bear too much of the volume.
         #[test]
         fn names_first_finds_what_every_entry_does(
             nodes in prop::collection::vec(
@@ -4998,6 +5103,10 @@ mod tests {
                 "*?* <exe:|folder:>", "nopunc:ab <ext:txt;a|folder:>",
                 "case:A|case:b <size:>2|ext:exe>", "!b <ext:|ext:exe>", "zip:|doc:|exe:",
                 "nows:ab <file:|ext:a>", "a <file:|ext:exe> case:",
+                // No expression, as v0.6.0 read them: an `ext:` list, a
+                // wildcard with no literal, or a case-sensitive term.
+                "ext:txt;a size:>3", "ext:exe;txt", "*?* size:<5 file:",
+                "A size:>2 case:", "b case: ext:txt;exe", "ext:a;exe folder:",
             ]),
         ) {
             let (mut idx, _) = random_tree(&nodes, &[], padded);
@@ -5518,9 +5627,23 @@ mod tests {
             Extension,
         }
 
+        /// A count function: `parent-count:` under one of its three
+        /// spellings, or a folder's children.
+        #[derive(Clone, Copy, Debug)]
+        enum CountFn {
+            Parents(u8),
+            Children,
+            ChildFiles,
+            ChildFolders,
+        }
+
         /// One term.
         #[derive(Clone, Debug)]
         enum L {
+            /// A count function, its value as written, its range, and a `!`.
+            Count(CountFn, String, SizeRange, bool),
+            /// `empty:` alone.
+            EmptyFolder,
             /// Search text: a wildcard when it holds `*` or `?`.
             Text(String),
             Part(Part, String),
@@ -5571,7 +5694,7 @@ mod tests {
 
         fn spec() -> impl Strategy<Value = Spec> {
             let leaf = (
-                0u8..17,
+                0u8..19,
                 any::<Index>(),
                 any::<Index>(),
                 any::<Index>(),
@@ -5822,6 +5945,25 @@ mod tests {
                         }
                         10 => L::Drive(if n % 2 == 0 { 'C' } else { 'd' }),
                         11 => L::Lone,
+                        17 => {
+                            let f = [
+                                CountFn::Parents((n % 3) as u8),
+                                CountFn::Children,
+                                CountFn::ChildFiles,
+                                CountFn::ChildFolders,
+                            ][((n >> 2) % 4) as usize];
+                            let k = (n >> 8) % 5;
+                            let m = k + (n >> 16) % 4;
+                            let r = |min, max| SizeRange { min, max };
+                            let (text, range) = match (n >> 24) % 4 {
+                                0 => (format!("{k}"), r(k, k)),
+                                1 => (format!(">{k}"), r(k + 1, u64::MAX)),
+                                2 => (format!("<={m}"), r(0, m)),
+                                _ => (format!("{k}..{m}"), r(k, m)),
+                            };
+                            L::Count(f, text, range, (n >> 30) % 4 == 0)
+                        }
+                        18 => L::EmptyFolder,
                         12 | 13 if v.absolute && !v.folders.is_empty() => {
                             let folded = pick.get(&v.folders).clone();
                             let mut text = flip_case(&chars(&folded), *flip);
@@ -5920,6 +6062,18 @@ mod tests {
                     };
                     format!("{f}{}{text}", bang(*neg))
                 }
+                L::Count(f, text, _, neg) => {
+                    let f = match f {
+                        CountFn::Parents(0) => "parent-count:",
+                        CountFn::Parents(1) => "depth:",
+                        CountFn::Parents(_) => "parents:",
+                        CountFn::Children => "child-count:",
+                        CountFn::ChildFiles => "childfilecount:",
+                        CountFn::ChildFolders => "child-folder-count:",
+                    };
+                    format!("{f}{}{text}", bang(*neg))
+                }
+                L::EmptyFolder => "empty:".into(),
                 L::Date(text, _, neg) => format!("dm:{}{text}", bang(*neg)),
                 L::Drive(d) => format!("{d}:"),
                 L::Lone => "\\".into(),
@@ -6002,6 +6156,10 @@ mod tests {
             parent: String,
             ancestors: Vec<String>,
             prefix: String,
+            /// The folders above, up to the root and with it.
+            parents: u64,
+            /// A folder's files and folders.
+            children: Option<(u64, u64)>,
         }
 
         /// The modifiers a term has, the outermost set first.
@@ -6286,6 +6444,21 @@ mod tests {
                     };
                     len.is_some_and(|l| range.contains(l) != *neg)
                 }
+                L::Count(f, _, range, neg) => {
+                    let n = match f {
+                        CountFn::Parents(_) => Some(e.parents),
+                        CountFn::Children => e.children.map(|(files, folders)| files + folders),
+                        CountFn::ChildFiles => e.children.map(|(files, _)| files),
+                        CountFn::ChildFolders => e.children.map(|(_, folders)| folders),
+                    };
+                    n.is_some_and(|n| range.contains(n) != *neg)
+                }
+                // `empty:` alone: folders with no children, and an empty
+                // term, which under `whole:` matches nothing.
+                L::EmptyFolder => {
+                    !(ctx.whole == Some(true) || (ctx.start == Some(true) && ctx.end == Some(true)))
+                        && e.children == Some((0, 0))
+                }
                 L::Date(_, range, neg) => e
                     .mtime
                     .is_some_and(|t| t >= 0 && range.contains(t as u64) != *neg),
@@ -6459,6 +6632,25 @@ mod tests {
                         }
                         cur = idx.entry(cur).parent();
                     }
+                    // The entry has a path, so its walk ends at the root.
+                    let mut parents = 0u64;
+                    let mut cur = entry.parent();
+                    while cur != NIL {
+                        parents += 1;
+                        if cur == idx.root() {
+                            break;
+                        }
+                        cur = idx.entry(cur).parent();
+                    }
+                    let children = entry.is_dir().then(|| {
+                        let of = |dirs: bool| {
+                            idx.live_entries()
+                                .filter(|&c| !idx.is_synthetic(c) && idx.entry(c).parent() == e)
+                                .filter(|&c| idx.entry(c).is_dir() == dirs)
+                                .count() as u64
+                        };
+                        (of(false), of(true))
+                    });
                     let seen = Seen {
                         name: String::from_utf8(entry.name().to_vec()).unwrap(),
                         full,
@@ -6468,6 +6660,8 @@ mod tests {
                         parent: ancestors.first().cloned().unwrap_or_default(),
                         ancestors,
                         prefix: prefix.to_string(),
+                        parents,
+                        children,
                     };
                     if eval(&q, &seen, case, Ctx::default()) {
                         found.push(e);
@@ -6497,6 +6691,164 @@ mod tests {
 
     /// Folders `café` and `cafe`, a decomposed `café` in each and the
     /// rest of Everything's accent pairs (DESIGN.md §10.1).
+    /// The tree `w` of the live Everything fixture, at the root: what its
+    /// folder index held below its root.
+    fn count_index() -> VolumeIndex {
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        let tree: &[(u64, u64, &str, bool)] = &[
+            (100, 0, "w", true),
+            (101, 100, "mywindows", true),
+            (102, 101, "c.exe", false),
+            (103, 100, "windows", true),
+            (104, 103, "cmd.exe", false),
+            (105, 103, "emptydir", true),
+            (106, 103, "notepad.exe", false),
+            (107, 103, "sub", true),
+            (108, 107, "deep", true),
+            (109, 108, "a.exe", false),
+            (110, 103, "system32", true),
+            (111, 110, "cmd.exe", false),
+            (112, 110, "drivers", true),
+            (113, 112, "x.sys", false),
+            (114, 100, "windows.old", true),
+            (115, 114, "d.exe", false),
+            (116, 100, "windows2", true),
+            (117, 116, "b.exe", false),
+        ];
+        for &(rec, parent, name, is_dir) in tree {
+            let parent = if parent == 0 {
+                NTFS_ROOT_FRN
+            } else {
+                frn(parent)
+            };
+            idx.insert_enum(&enum_rec(frn(rec), parent, name, is_dir));
+        }
+        idx
+    }
+
+    /// `parent-count:` (`depth:`, `parents:`), `empty:` and the child counts
+    /// answer as a live Everything 1.5.0.1424b did over the same tree (W6):
+    /// the root counts as a parent, and only folders have children, so a
+    /// value's own `!` keeps folders alone while a NOT of the term keeps
+    /// the files too.
+    #[test]
+    fn counts_answer_as_everything_does() {
+        let idx = count_index();
+        let check = |query: &str, want: &[&str]| {
+            let mut got = run(&idx, query);
+            got.sort();
+            let mut want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{query}");
+        };
+        check("parents:1", &["w"]);
+        check(
+            r"parent-count:2 \w\",
+            &[
+                r"w\mywindows",
+                r"w\windows",
+                r"w\windows.old",
+                r"w\windows2",
+            ],
+        );
+        check(
+            r"depth:3 \w\",
+            &[
+                r"w\windows\emptydir",
+                r"w\windows\sub",
+                r"w\windows\system32",
+                r"w\windows2\b.exe",
+                r"w\mywindows\c.exe",
+                r"w\windows\cmd.exe",
+                r"w\windows.old\d.exe",
+                r"w\windows\notepad.exe",
+            ],
+        );
+        check(
+            r"parent-count:>3 \w\",
+            &[
+                r"w\windows\sub\deep",
+                r"w\windows\system32\drivers",
+                r"w\windows\sub\deep\a.exe",
+                r"w\windows\system32\cmd.exe",
+                r"w\windows\system32\drivers\x.sys",
+            ],
+        );
+        check(
+            r"parentcount:2..3 \windows\",
+            &[
+                r"w\windows\emptydir",
+                r"w\windows\sub",
+                r"w\windows\system32",
+                r"w\windows\cmd.exe",
+                r"w\windows\notepad.exe",
+            ],
+        );
+        check(r"empty: \w\", &[r"w\windows\emptydir"]);
+        check("empty:emp", &[r"w\windows\emptydir"]);
+        check(
+            r"!empty: \windows\",
+            &[
+                r"w\windows\sub\deep",
+                r"w\windows\system32\drivers",
+                r"w\windows\sub",
+                r"w\windows\system32",
+                r"w\windows\sub\deep\a.exe",
+                r"w\windows\cmd.exe",
+                r"w\windows\system32\cmd.exe",
+                r"w\windows\notepad.exe",
+                r"w\windows\system32\drivers\x.sys",
+            ],
+        );
+        check(r"child-count:0 \w\", &[r"w\windows\emptydir"]);
+        let ones = [
+            r"w\windows\sub\deep",
+            r"w\windows\system32\drivers",
+            r"w\mywindows",
+            r"w\windows\sub",
+            r"w\windows.old",
+            r"w\windows2",
+        ];
+        check(r"child-count:1 \w\", &ones);
+        check(r"childcount:2 \w\", &[r"w\windows\system32"]);
+        check(r"child-count:>2 \w\", &[r"w\windows"]);
+        check(
+            r"child-file-count:1 \w\",
+            &[
+                r"w\windows\sub\deep",
+                r"w\windows\system32\drivers",
+                r"w\mywindows",
+                r"w\windows\system32",
+                r"w\windows.old",
+                r"w\windows2",
+            ],
+        );
+        check(
+            r"child-folder-count:1 \w\",
+            &[r"w\windows\sub", r"w\windows\system32"],
+        );
+        check(
+            r"child-file-count:0 \w\",
+            &[r"w\windows\emptydir", r"w\windows\sub"],
+        );
+        let mut not_two: Vec<&str> = ones.to_vec();
+        not_two.extend([r"w\windows\emptydir", r"w\windows"]);
+        check(r"child-count:!2 \w\", &not_two);
+        let mut all_but: Vec<&str> = not_two.clone();
+        all_but.extend([
+            r"w\windows\sub\deep\a.exe",
+            r"w\windows2\b.exe",
+            r"w\mywindows\c.exe",
+            r"w\windows\cmd.exe",
+            r"w\windows\system32\cmd.exe",
+            r"w\windows.old\d.exe",
+            r"w\windows\notepad.exe",
+            r"w\windows\system32\drivers\x.sys",
+        ]);
+        check(r"!child-count:2 \w\", &all_but);
+        check(r"file: child-count:0 \w\", &[]);
+    }
+
     fn accent_index() -> VolumeIndex {
         let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
         let root = NTFS_ROOT_FRN;

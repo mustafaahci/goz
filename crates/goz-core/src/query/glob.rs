@@ -22,7 +22,9 @@
 //! `**` cannot be: a `*` that meets a `\` must hand the text back to an
 //! earlier `**`, which the name matcher's single backtrack point cannot do,
 //! so it runs a bit-parallel automaton over the pattern instead, whose cost
-//! is linear in the text whatever the pattern.
+//! is linear in the text whatever the pattern. Literals and one last `**`,
+//! what a trailing `\` makes (`windows\`), need neither: their literals are
+//! compared at each part boundary.
 
 use super::budget::Budget;
 use crate::wtf8::encode_code_point;
@@ -92,6 +94,12 @@ enum Shape {
     /// A sub-path pattern with `**`, boxed: its masks would make every
     /// wildcard several times larger.
     Nfa(Box<Nfa>),
+    /// A sub-path pattern of literals and one last `**`, as a trailing `\`
+    /// makes (`module_group_007\` is `module_group_007\**`): a match is a
+    /// part boundary where the literals start, the `**` taking the rest, so
+    /// the literals are compared at each boundary instead of running the
+    /// automaton over the whole path.
+    Lead(Vec<u32>),
 }
 
 impl Wildcard {
@@ -150,7 +158,19 @@ impl Wildcard {
             });
         }
         flush(&mut stars, &mut toks);
-        let shape = if toks.contains(&Tok::RunAll) {
+        let lead = match toks.split_last() {
+            Some((Tok::RunAll, lits)) if !lits.is_empty() => lits
+                .iter()
+                .map(|t| match t {
+                    Tok::Lit(cp) => Some(*cp),
+                    _ => None,
+                })
+                .collect::<Option<Vec<u32>>>(),
+            _ => None,
+        };
+        let shape = if let Some(lead) = lead {
+            Shape::Lead(lead)
+        } else if toks.contains(&Tok::RunAll) {
             Shape::Nfa(Box::new(Nfa::new(&toks)))
         } else {
             Shape::Parts(toks.split(|t| *t == Tok::Lit(SEP)).map(Glob::new).collect())
@@ -191,6 +211,26 @@ impl Wildcard {
             Shape::Name(glob) => glob.matches_decoded(text, budget),
             Shape::Parts(parts) => parts_match(parts, text, budget),
             Shape::Nfa(nfa) => nfa.matches(text, budget),
+            Shape::Lead(lead) => lead_matches(lead, text, budget),
+        }
+    }
+
+    /// For a pattern of literals and a trailing `\**` (`module_group_007\`),
+    /// the literals, `\` last, as WTF-8 bytes (folded iff the query is
+    /// case-insensitive). A full path then matches iff it starts with them
+    /// or holds them right after a `\`; ending with a separator, they lie
+    /// before the last part, so the folder of an entry decides the match
+    /// for all of its entries alike.
+    pub(crate) fn folder_lead(&self) -> Option<Vec<u8>> {
+        match &self.shape {
+            Shape::Lead(lead) if lead.last() == Some(&SEP) => {
+                let mut bytes = Vec::with_capacity(lead.len());
+                for &cp in lead {
+                    encode_code_point(cp, &mut bytes);
+                }
+                Some(bytes)
+            }
+            _ => None,
         }
     }
 
@@ -324,6 +364,35 @@ fn parts_match(parts: &[Glob], text: &[u32], budget: &Budget) -> bool {
         end = start.saturating_sub(1);
     }
     true
+}
+
+/// Whether `text` starts with `lead` or holds it right after a `\`: what a
+/// pattern of literals and a last `**` matches (see [`Shape::Lead`]). Each
+/// part boundary tried compares at most `lead.len()` code points, so a long
+/// lead over a long path checks `budget` as the compares add up, and a
+/// spent one ends the match unmatched, as the automaton's does.
+fn lead_matches(lead: &[u32], text: &[u32], budget: &Budget) -> bool {
+    if text.len() < lead.len() {
+        return false;
+    }
+    if text.len().saturating_mul(lead.len()) >= GLOB_COSTLY_STEPS && budget.check() {
+        return false;
+    }
+    let per_check = (GLOB_STEPS_PER_CHECK / lead.len()).max(1);
+    let (mut start, mut tried) = (0usize, 0usize);
+    loop {
+        if text[start..].starts_with(lead) {
+            return true;
+        }
+        tried += 1;
+        if tried % per_check == 0 && budget.check() {
+            return false;
+        }
+        match text[start..].iter().position(|&c| c == SEP) {
+            Some(sep) => start += sep + 1,
+            None => return false,
+        }
+    }
 }
 
 /// A pattern of `*`, `?` and literals with no separator to respect: a name
@@ -906,6 +975,47 @@ pub(crate) mod tests {
                     w.matches(text.as_bytes()),
                     reference_sub_path(&pat, &text),
                     "{:?} on {:?}", pat, text
+                );
+            }
+
+            /// Literals and a last `**` (`a\b\` is `a\b\**`) are compared at
+            /// each part boundary instead of run as an automaton: they
+            /// answer as the reference and as the automaton do, and the
+            /// folder's lead is the pattern's literals exactly when they end
+            /// with a separator.
+            #[test]
+            fn literals_and_a_last_crossing_wildcard_match_as_the_reference_does(
+                lits in "[abé][ab\\\\é]{0,5}",
+                tail in prop::sample::select(vec!["\\", "\\**", "**", "***"]),
+                text in "[ab\\\\é]{0,14}",
+            ) {
+                let pattern = format!("{lits}{tail}");
+                let w = Wildcard::sub_path(pattern.as_bytes(), false);
+                let lead = match &w.shape {
+                    Shape::Lead(lead) => lead.clone(),
+                    other => panic!("{pattern:?} compiled to {other:?}"),
+                };
+                prop_assert_eq!(
+                    w.matches(text.as_bytes()),
+                    reference_sub_path(&pattern, &text),
+                    "{:?} on {:?}", pattern, text
+                );
+                let toks: Vec<Tok> = lead
+                    .iter()
+                    .map(|&cp| Tok::Lit(cp))
+                    .chain([Tok::RunAll])
+                    .collect();
+                let mut cps = CodePointBuf::new();
+                decode_into(text.as_bytes(), &mut cps);
+                prop_assert_eq!(
+                    w.matches(text.as_bytes()),
+                    Nfa::new(&toks).matches(&cps, &Budget::unlimited())
+                );
+                let source = String::from_utf8(w.pattern().to_vec()).unwrap();
+                let lits = source.trim_end_matches('*');
+                prop_assert_eq!(
+                    w.folder_lead(),
+                    lits.ends_with('\\').then(|| lits.as_bytes().to_vec())
                 );
             }
 

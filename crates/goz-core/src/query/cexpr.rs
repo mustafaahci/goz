@@ -20,8 +20,8 @@
 
 use super::budget::Budget;
 use super::dates::DateFilter;
-use super::engine::{CACHED_PATH_MAX, anchored_lead, size_matches, term_admits};
-use super::expr::{Expr, FolderPath, Leaf, LenOf, Target};
+use super::engine::{CACHED_PATH_MAX, anchored_lead, kind_matches, size_matches, term_admits};
+use super::expr::{CountOf, Expr, FolderPath, Leaf, LenOf, Target};
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, SizeRange, Wildcard};
 use super::pattern::RegexTerm;
@@ -112,6 +112,11 @@ pub(super) enum CNode<'a> {
     Date(DateFilter),
     Len {
         of: LenOf,
+        range: SizeRange,
+    },
+    /// A count of the folders above the entry, or of a folder's children.
+    Count {
+        of: CountOf,
         range: SizeRange,
     },
     /// The entry's folder is one of these.
@@ -349,6 +354,10 @@ fn compile_leaf<'a>(leaf: &'a Leaf, volume: &Volume) -> CNode<'a> {
             of: *of,
             range: *range,
         },
+        Leaf::Count { of, range } => CNode::Count {
+            of: *of,
+            range: *range,
+        },
         Leaf::Parent(paths) => match volume.folders(paths, false) {
             Ok(dirs) if !dirs.is_empty() => CNode::Parent(dirs),
             _ => CNode::False,
@@ -550,7 +559,7 @@ impl<'a> CNode<'a> {
             {
                 4
             }
-            CNode::Ext(_) | CNode::Ancestor(_) => 5,
+            CNode::Ext(_) | CNode::Ancestor(_) | CNode::Count { .. } => 5,
             CNode::Regex { target, .. } if target.by_name() => 6,
             CNode::Path { .. }
             | CNode::Text { .. }
@@ -753,6 +762,10 @@ impl<'a> CNode<'a> {
                 };
                 len.is_some_and(|len| range.contains(len))
             }
+            CNode::Count { of, range } => s.entry.is_some_and(|e| {
+                count(s.index, e, *of, *range, &mut s.scratch.parents_of)
+                    .is_some_and(|n| range.contains(n))
+            }),
             CNode::Parent(dirs) => s
                 .entry
                 .is_some_and(|e| dirs.binary_search(&s.index.entry(e).parent()).is_ok()),
@@ -793,6 +806,64 @@ impl<'a> CNode<'a> {
             }
         }
     }
+}
+
+/// The count `of` of entry `e`, or `None` when it has none: a file's
+/// children, or the folders above an entry with no path. A child count
+/// stops past `range`'s top, which is all its test needs, so `empty:` reads
+/// one child at most. `memo` keeps the last folder whose parents were
+/// counted, as a scan visits a folder's entries in a row.
+fn count(
+    index: &VolumeIndex,
+    e: EntryIdx,
+    of: CountOf,
+    range: SizeRange,
+    memo: &mut Option<(EntryIdx, Option<u64>)>,
+) -> Option<u64> {
+    let entry = index.entry(e);
+    let kind = match of {
+        CountOf::Parents => {
+            let folder = entry.parent();
+            if let Some((known, above)) = *memo
+                && known == folder
+            {
+                return above.map(|n| n + 1);
+            }
+            let above = folders_above(index, folder);
+            *memo = Some((folder, above));
+            return above.map(|n| n + 1);
+        }
+        _ if !entry.is_dir() => return None,
+        CountOf::Children => None,
+        CountOf::ChildFiles => Some(Kind::File),
+        CountOf::ChildFolders => Some(Kind::Folder),
+    };
+    let cap = usize::try_from(range.max.saturating_add(1)).unwrap_or(usize::MAX);
+    let n = index
+        .children(e)
+        .filter(|&c| !index.is_synthetic(c))
+        .filter(|&c| kind.is_none_or(|k| kind_matches(Some(k), index.entry(c).is_dir())))
+        .take(cap)
+        .count();
+    Some(n as u64)
+}
+
+/// How many folders are above `folder` up to the volume's root, the root
+/// included and `folder` not, so `0` for the root; `None` when its walk
+/// ends elsewhere (lost+found, a parent missing) or runs past
+/// [`MAX_PATH_HOPS`], as in a cycle: then it has no path.
+fn folders_above(index: &VolumeIndex, folder: EntryIdx) -> Option<u64> {
+    let mut cur = folder;
+    for above in 0..MAX_PATH_HOPS as u64 {
+        if cur == index.root() {
+            return Some(above);
+        }
+        if cur == NIL || cur == index.lost_found() {
+            return None;
+        }
+        cur = index.entry(cur).parent();
+    }
+    None
 }
 
 /// Whether a term on `target` needs the full path.
@@ -1033,6 +1104,9 @@ pub(super) struct Scratch {
     pub(super) accented: Option<Box<Accented>>,
     /// The bytes `regex:` terms matched since the budget's last check.
     pub(super) regex_bytes: usize,
+    /// The folder `parent-count:` last counted the folders above, and their
+    /// count (`None`: it has no path): its entries come in a row.
+    pub(super) parents_of: Option<(EntryIdx, Option<u64>)>,
 }
 
 /// The scratch buffers of `diacritics:` terms.
@@ -1063,9 +1137,9 @@ fn accented_path(accented: &Option<Box<Accented>>) -> &[u8] {
     accented.as_deref().map_or(&[], |a| &a.path)
 }
 
-/// Fills its buffer with an entry's full path (as the query compares it)
-/// and says whether it has one.
-pub(super) type PathSource<'x> = &'x mut dyn FnMut(&mut Vec<u8>) -> bool;
+/// Fills its buffer with an entry's full path, as the query compares it or,
+/// when asked (`true`), as stored, and says whether it has one.
+pub(super) type PathSource<'x> = &'x mut dyn FnMut(&mut Vec<u8>, bool) -> bool;
 
 /// What an expression is evaluated against: a distinct name, or an entry,
 /// whose columns and full path are read only when a leaf asks.
@@ -1075,8 +1149,6 @@ pub(super) struct Subject<'s, 'x> {
     /// Whether the query matches case: how the full path `full_path` gives
     /// is folded.
     query_case: bool,
-    /// The mount prefix as typed, for a full path built unfolded.
-    raw_prefix: &'s [u8],
     /// `None` at the name level, where no leaf reads the entry.
     entry: Option<EntryIdx>,
     budget: &'s Budget<'s>,
@@ -1130,7 +1202,6 @@ impl<'s, 'x> Subject<'s, 'x> {
             index,
             id,
             query_case,
-            raw_prefix: &[],
             entry: None,
             budget,
             scratch,
@@ -1143,19 +1214,17 @@ impl<'s, 'x> Subject<'s, 'x> {
         }
     }
 
-    /// Entry `idx` on the volume mounted at `raw_prefix`, whose full path,
-    /// folded as the query folds paths, `full_path` gives.
+    /// Entry `idx`, whose full path, folded as the query folds paths or as
+    /// stored, `full_path` gives.
     pub(super) fn entry(
         index: &'s VolumeIndex,
         idx: EntryIdx,
         query_case: bool,
-        raw_prefix: &'s [u8],
         budget: &'s Budget<'s>,
         scratch: &'x mut Scratch,
         full_path: PathSource<'x>,
     ) -> Self {
         let mut s = Subject::name_level(index, index.name_id(idx), query_case, budget, scratch);
-        s.raw_prefix = raw_prefix;
         s.entry = Some(idx);
         s.full_path = Some(full_path);
         s
@@ -1237,7 +1306,7 @@ impl<'s, 'x> Subject<'s, 'x> {
             let found = match self.full_path.as_mut() {
                 Some(fill) => {
                     self.scratch.path.clear();
-                    fill(&mut self.scratch.path)
+                    fill(&mut self.scratch.path, false)
                 }
                 None => false,
             };
@@ -1292,19 +1361,13 @@ impl<'s, 'x> Subject<'s, 'x> {
                 fold_into(&self.scratch.path, other);
                 true
             } else {
-                // The query's paths are folded: build this one as stored.
-                // An entry has a path exactly when `path_of` gives one, so
-                // it has one here too.
-                let mut below = Vec::new();
-                let ok = self.entry.is_some_and(|e| {
-                    matches!(
-                        self.index.path_of(e, &mut below),
-                        crate::index::PathStatus::Ok
-                    )
-                });
-                other.extend_from_slice(self.raw_prefix);
-                other.extend_from_slice(&below);
-                ok
+                // The query's paths are folded: the caller gives this one as
+                // stored, built from its folder's as the folded one is. An
+                // entry has a path in either form or in neither.
+                match self.full_path.as_mut() {
+                    Some(fill) => fill(other, true),
+                    None => false,
+                }
             };
             self.other = if found {
                 Fetched::Read

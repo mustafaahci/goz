@@ -99,6 +99,21 @@ pub enum LenOf {
     Extension,
 }
 
+/// What a count function counts, from the links the index keeps: the
+/// parent chain, or a folder's children.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountOf {
+    /// `parent-count:` (`parents:`, `depth:`): the folders above the entry,
+    /// the volume's root included, so an entry of the root counts 1.
+    Parents,
+    /// `child-count:`: a folder's files and folders. `empty:` is 0.
+    Children,
+    /// `child-file-count:`: a folder's files.
+    ChildFiles,
+    /// `child-folder-count:`: a folder's folders.
+    ChildFolders,
+}
+
 /// One term. Text is folded unless the term matches case: with
 /// [`crate::fold::fold`], case and accents ignored, or with
 /// [`crate::fold::fold_exact`] under `diacritics:`, which keeps accents
@@ -147,6 +162,9 @@ pub enum Leaf {
     Date(DateFilter),
     /// A length, in UTF-16 units, is in range.
     Len { of: LenOf, range: SizeRange },
+    /// A count is in range. Only a folder has children, so a file matches
+    /// no child count, as in Everything.
+    Count { of: CountOf, range: SizeRange },
     /// The entry's folder is one of these.
     Parent(Vec<FolderPath>),
     /// One of the entry's folders, up to the root, is one of these.

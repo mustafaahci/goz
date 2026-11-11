@@ -206,6 +206,12 @@ const SEARCH_TEXT: &[(&str, &str)] = &[
         r"Entries right in C:\src; ancestor:C:\src is all below it",
     ),
     (
+        "depth:2, empty:",
+        "Entries with 2 folders above them, as C:\\a\\b (parent-count:); \
+         folders that hold nothing; also child-count:, child-file-count:, \
+         child-folder-count:",
+    ),
+    (
         "path:TEXT",
         "Full paths that contain TEXT; nopath: tests names only",
     ),

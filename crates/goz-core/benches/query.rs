@@ -424,6 +424,17 @@ fn bench_query(c: &mut Criterion) {
         ),
         ("drive(c: kernel32)", "c: kernel32".into(), true),
         ("lone(\\ module)", r"\ module".into(), true),
+        // A full-path `regex:` in a case-insensitive query: it matches the
+        // path as stored, which the folded paths of the query are not.
+        (
+            r"regex-path(regex:bin_x64_05\\kernel32)",
+            r"regex:bin_x64_05\\kernel32".into(),
+            true,
+        ),
+        // Counts over every entry: the parent chain, a folder's children.
+        ("count(depth:5)", "depth:5".into(), true),
+        ("count(empty:)", "empty:".into(), true),
+        ("count(child-count:>50)", "child-count:>50".into(), true),
     ];
     bench_group(c, "query_2M_mods", &idx, &mods);
     drop(idx);
@@ -453,6 +464,19 @@ fn bench_query(c: &mut Criterion) {
         ("name+year(report dm:2025)", "report dm:2025".into(), false),
         ("size-range(size:1kb..2kb)", "size:1kb..2kb".into(), false),
         ("size(size:>1mb)", "size:>1mb".into(), false),
+        // Filters alone, as v0.6.0 read them: an `ext:` list gives no
+        // needle to scan the names for.
+        (
+            "ext-list+year(ext:dll;exe dm:2024)",
+            "ext:dll;exe dm:2024".into(),
+            false,
+        ),
+        // The same where the list keeps every file of the tree.
+        (
+            "ext-list-broad+year(ext:dll;txt dm:2024)",
+            "ext:dll;txt dm:2024".into(),
+            false,
+        ),
         ("rolling(dm:lastweek)", "dm:lastweek".into(), true),
         ("month(dm:may)", "dm:may".into(), true),
         ("hour(dm:2024-05-01T10)", "dm:2024-05-01T10".into(), true),
