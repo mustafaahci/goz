@@ -14,8 +14,8 @@
 //!
 //! goz's deviations: LF line ends, UTF-8, and the date as local
 //! `YYYY-MM-DDTHH:MM:SS`, es's `-date-format 1`, where es's default is the
-//! locale's short date and time. A folder has no size, since goz indexes
-//! none.
+//! locale's short date and time. A folder's size cell is empty, as in the
+//! other es outputs.
 
 use super::Row;
 use crate::types::EsColumn;

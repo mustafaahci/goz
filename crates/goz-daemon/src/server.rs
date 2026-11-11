@@ -879,7 +879,19 @@ fn hello(volumes: &VolumeSet, proto_min: u16, proto_max: u16) -> Response {
         proto: PROTO_VERSION,
         server: concat!("gozd ", env!("CARGO_PKG_VERSION")).to_string(),
         ready: all_volumes_live(volumes),
+        features: features(volumes),
     }
+}
+
+/// What this daemon supports right now, for `Hello.features`: the one place
+/// the list is built. `"folder_sizes"` while folder sizes are on and every
+/// volume's totals are summed.
+fn features(volumes: &VolumeSet) -> Vec<String> {
+    let mut features = Vec::new();
+    if crate::folder_sizes::settled(volumes) {
+        features.push("folder_sizes".to_string());
+    }
+    features
 }
 
 /// Whether every volume's index is as complete as goz can make it, via
@@ -2610,6 +2622,58 @@ mod tests {
         assert_eq!(
             results(&encode_query_binary(&vols, nowhere))[0].total_size,
             Some(0)
+        );
+    }
+
+    /// With folder sizes on, a folder's row carries its total, `size:`
+    /// matches it, `-get-total-size` still adds the files alone, and
+    /// `Hello.features` lists `folder_sizes` once every volume's totals are
+    /// summed.
+    #[test]
+    fn folder_sizes_reach_the_rows_and_hello_lists_them() {
+        let summed = || {
+            let mut index = sized_index();
+            index.set_folder_sizes(true);
+            index
+        };
+        let features = |vols: &VolumeSet| match handle_request(vols, hello_request(1, 1)) {
+            Response::Hello { features, .. } => features,
+            other => panic!("must negotiate, got {other:?}"),
+        };
+        let vols = set(&[volume(r"C:\", summed(), VolumePhase::Live)]);
+        assert_eq!(features(&vols), ["folder_sizes"]);
+        let rows = |q: &str| -> Vec<(String, Option<u64>)> {
+            results(&encode_query_binary(&vols, query(q)))
+                .into_iter()
+                .flat_map(|page| page.items)
+                .map(|item| (item.path, item.size))
+                .collect()
+        };
+        assert_eq!(
+            rows("system32"),
+            [(r"C:\Windows\System32".to_string(), Some(100))]
+        );
+        assert_eq!(
+            rows("folder: size:>99"),
+            [
+                (r"C:\Windows\System32".to_string(), Some(100)),
+                (r"C:\Windows".to_string(), Some(100)),
+            ]
+        );
+        let pages = results(&encode_query_binary(&vols, total_size_of(query("log"))));
+        assert_eq!(
+            pages[0].total_size,
+            Some(107),
+            "the logs folder adds nothing"
+        );
+
+        let unsummed = set(&[
+            volume(r"C:\", summed(), VolumePhase::Live),
+            volume(r"D:\", sized_index(), VolumePhase::Live),
+        ]);
+        assert!(
+            features(&unsummed).is_empty(),
+            "not while a volume lacks them"
         );
     }
 

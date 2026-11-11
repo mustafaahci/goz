@@ -94,6 +94,12 @@ pub enum Response {
         server: String,
         /// Whether the index is ready to serve queries.
         ready: bool,
+        /// What the daemon supports right now, by name: `"folder_sizes"`
+        /// while folder sizes are indexed and settled, and the other names
+        /// the protocol defines as their features land. Empty from a daemon
+        /// predating the field.
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// One page of query results.
     Results(QueryResults),
@@ -148,7 +154,9 @@ pub struct ResultItem {
     /// exact fidelity reconstruct the `OsString` from this.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub path_u16: Option<Vec<u16>>,
-    /// File size in bytes; `None` = unknown, not requested, or a directory.
+    /// Size in bytes: a file's, or a folder's total while the daemon indexes
+    /// folder sizes (`Hello.features` lists `"folder_sizes"`); `None` =
+    /// unknown or not requested, and a folder's from a daemon without them.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub size: Option<u64>,
     /// Raw FILETIME modification stamp; `None` = unknown or not requested.
@@ -358,6 +366,7 @@ mod tests {
             proto: PROTO_VERSION,
             server: "gozd 0.1.0".into(),
             ready: false,
+            features: vec!["folder_sizes".into()],
         });
     }
 
@@ -550,8 +559,10 @@ mod tests {
             Response::Hello {
                 proto: 1,
                 server: "gozd".into(),
-                ready: true
-            }
+                ready: true,
+                features: Vec::new(),
+            },
+            "a daemon predating the features lists none"
         );
 
         let req: Request = serde_json::from_str(

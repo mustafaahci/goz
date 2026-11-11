@@ -153,7 +153,8 @@ fn efu_row(item: &ResultItem, out: &mut Vec<u8>) {
     out.extend_from_slice(format!(",{attributes}\r\n").as_bytes());
 }
 
-/// The size a cell shows: none for a folder, as goz keeps no folder sizes.
+/// The size a cell shows: none for a folder, whose cell es's output leaves
+/// empty, folder sizes or not.
 fn file_size(item: &ResultItem) -> Option<u64> {
     if item.is_dir { None } else { item.size }
 }

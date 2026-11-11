@@ -2114,9 +2114,10 @@ fn entry_key(index: &VolumeIndex, sort: SortSpec, idx: EntryIdx) -> u64 {
     }
 }
 
-/// The key a size sort in direction `dir` orders an entry of `size` by. An
-/// entry with no size, a folder or a file not read yet, comes after every
-/// entry with one, whichever way the sort runs. The engine and the daemon's
+/// The key a size sort in direction `dir` orders an entry of `size` by. A
+/// folder sorts by its total while goz sums folder sizes. An entry with no
+/// size, a file not read yet or a folder while folder sizes are off, comes
+/// after every entry with one, whichever way the sort runs. The engine and the daemon's
 /// merge of several volumes key by this one function.
 pub fn size_key(size: Option<u64>, dir: SortDir) -> u64 {
     // The index stores an unknown size as `u64::MAX`, so a known one is below.
@@ -8882,5 +8883,232 @@ mod tests {
         assert_eq!(sorted("\u{3131}"), vec!["\u{3131}\u{314F}.txt"]);
         assert_eq!(sorted("??.txt"), vec!["\u{3131}\u{314F}.txt"]);
         assert!(sorted("\u{AC00}").is_empty());
+    }
+
+    /// The M7a tree of the live fixture (`fx\m7a`, w9\m7a\ev\mkfx_m7a.py)
+    /// as the bootstrap reads it from FILE_LAYOUT, records in reverse order
+    /// so children come before their folders: folders and sized files, a
+    /// file with three hard links in two folders, a junction (on NTFS a
+    /// folder with nothing in it), a sparse file of 10,000,000 logical
+    /// bytes, a 50-byte file whose 5,000-byte alternate stream FILE_LAYOUT
+    /// leaves out, an empty folder and an empty file. Folder sizes are
+    /// summed as the build sums them.
+    fn m7a_index() -> VolumeIndex {
+        use crate::layout::{LayoutFile, LayoutName};
+        // (record, [(parent record, name)], folder, size)
+        type Row = (u64, &'static [(u64, &'static str)], bool, u64);
+        let tree: &[Row] = &[
+            (100, &[(0, "m7a")], true, 0),
+            (101, &[(100, "a")], true, 0),
+            (102, &[(101, "f1.bin")], false, 100),
+            (103, &[(101, "f2.bin")], false, 250),
+            (104, &[(101, "sub")], true, 0),
+            (105, &[(104, "f3.bin")], false, 1000),
+            (106, &[(104, "deep")], true, 0),
+            (107, &[(106, "f4.bin")], false, 7),
+            (108, &[(100, "empty")], true, 0),
+            (109, &[(100, "hl")], true, 0),
+            (110, &[(100, "hl2")], true, 0),
+            (
+                111,
+                &[(109, "x.bin"), (109, "y.bin"), (110, "z.bin")],
+                false,
+                300,
+            ),
+            (112, &[(100, "jn")], true, 0),
+            (113, &[(100, "sp")], true, 0),
+            (114, &[(113, "sparse.bin")], false, 10_000_000),
+            (115, &[(100, "ads")], true, 0),
+            (116, &[(115, "main.txt")], false, 50),
+            (117, &[(100, "zero")], true, 0),
+            (118, &[(117, "z0.bin")], false, 0),
+        ];
+        let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+        for &(rec, names, is_dir, size) in tree.iter().rev() {
+            idx.insert_layout(&LayoutFile {
+                frn: frn(rec),
+                attributes: if is_dir {
+                    FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    0x20
+                },
+                size: (!is_dir).then_some(size),
+                mtime_ft: Some(0),
+                names: names
+                    .iter()
+                    .map(|&(parent, name)| LayoutName {
+                        parent_frn: if parent == 0 {
+                            NTFS_ROOT_FRN
+                        } else {
+                            frn(parent)
+                        },
+                        name: name.as_bytes().to_vec(),
+                        name_lossy: false,
+                        dos_only: false,
+                    })
+                    .collect(),
+            });
+        }
+        idx.optimize_storage();
+        idx.set_folder_sizes(true);
+        idx
+    }
+
+    /// Folder sizes as a live Everything 1.5.0.1424b gave them over the
+    /// same tree (w9\m7a\ev\r.txt): a folder's size is every file below it,
+    /// each hard-link name counted where it is, a junction 0, a sparse file
+    /// its logical size, a file its main stream; `size:` matches folders by
+    /// that size, `size:0` and `size:empty` the empty folders and the
+    /// junction too, `size:!0` none of them; and a size sort orders folders
+    /// by it. Everything lists folders apart from files in a sort (before
+    /// them ascending, after them descending), which goz, mixing them in
+    /// every sort, does not; the order within each is the same.
+    #[test]
+    fn folder_sizes_answer_as_everything_does() {
+        use crate::types::{SortDir, SortKey};
+        let idx = m7a_index();
+        let run = |query: &str, sort: SortSpec| {
+            let parsed = parse_query(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            run_query(&idx, FIXTURE_ROOT, &parsed, None, sort, 0, None).hits
+        };
+        let rows = |query: &str| {
+            let mut got: Vec<(String, Option<u64>)> = run(query, SortSpec::default())
+                .iter()
+                .map(|h| (crate::wtf8::to_string_lossy(&h.path), h.size))
+                .collect();
+            got.sort();
+            got
+        };
+        let want = |rows: &[(&str, u64)]| {
+            let mut want: Vec<(String, Option<u64>)> = rows
+                .iter()
+                .map(|&(p, s)| (p.to_string(), Some(s)))
+                .collect();
+            want.sort();
+            want
+        };
+        let folders = [
+            (r"m7a\a", 1357),
+            (r"m7a\ads", 50),
+            (r"m7a\a\sub\deep", 7),
+            (r"m7a\empty", 0),
+            (r"m7a\hl", 600),
+            (r"m7a\hl2", 300),
+            (r"m7a\jn", 0),
+            (r"m7a\sp", 10_000_000),
+            (r"m7a\a\sub", 1007),
+            (r"m7a\zero", 0),
+        ];
+        let files = [
+            (r"m7a\a\f1.bin", 100),
+            (r"m7a\a\f2.bin", 250),
+            (r"m7a\a\sub\f3.bin", 1000),
+            (r"m7a\a\sub\deep\f4.bin", 7),
+            (r"m7a\ads\main.txt", 50),
+            (r"m7a\sp\sparse.bin", 10_000_000),
+            (r"m7a\hl\x.bin", 300),
+            (r"m7a\hl\y.bin", 300),
+            (r"m7a\hl2\z.bin", 300),
+            (r"m7a\zero\z0.bin", 0),
+        ];
+        assert_eq!(rows(r"\m7a\ folder:"), want(&folders));
+        assert_eq!(rows(r"\m7a\"), want(&[&folders[..], &files[..]].concat()));
+        assert_eq!(rows("wfn:m7a"), want(&[("m7a", 10_002_307)]));
+        assert_eq!(
+            rows(r"\m7a\ size:>500"),
+            want(&[
+                (r"m7a\a", 1357),
+                (r"m7a\hl", 600),
+                (r"m7a\sp", 10_000_000),
+                (r"m7a\a\sub", 1007),
+                (r"m7a\a\sub\f3.bin", 1000),
+                (r"m7a\sp\sparse.bin", 10_000_000),
+            ])
+        );
+        let empty = want(&[
+            (r"m7a\empty", 0),
+            (r"m7a\jn", 0),
+            (r"m7a\zero", 0),
+            (r"m7a\zero\z0.bin", 0),
+        ]);
+        assert_eq!(rows(r"\m7a\ size:0"), empty);
+        assert_eq!(rows(r"\m7a\ size:empty"), empty);
+        assert_eq!(rows(r"\m7a\ folder: size:600"), want(&[(r"m7a\hl", 600)]));
+        // Without a path term too, past the pass over the names.
+        assert_eq!(rows("folder: size:600"), want(&[(r"m7a\hl", 600)]));
+        assert_eq!(
+            rows("size:>9mb"),
+            want(&[
+                ("m7a", 10_002_307),
+                (r"m7a\sp", 10_000_000),
+                (r"m7a\sp\sparse.bin", 10_000_000),
+            ])
+        );
+        assert_eq!(
+            rows(r"\m7a\ folder: size:1kb..2kb"),
+            want(&[(r"m7a\a", 1357)])
+        );
+        let not_empty: Vec<_> = folders
+            .iter()
+            .chain(&files)
+            .copied()
+            .filter(|&(_, s)| s != 0)
+            .collect();
+        assert_eq!(rows(r"\m7a\ size:!0"), want(&not_empty));
+
+        // Everything's size sorts, folders and files apart: the sizes in
+        // the order it listed them.
+        let sizes = |query: &str, dir: SortDir| -> Vec<u64> {
+            run(
+                query,
+                SortSpec {
+                    key: SortKey::Size,
+                    dir,
+                },
+            )
+            .iter()
+            .map(|h| h.size.expect("sized"))
+            .collect()
+        };
+        assert_eq!(
+            sizes(r"\m7a\ folder:", SortDir::Desc),
+            [10_000_000, 1357, 1007, 600, 300, 50, 7, 0, 0, 0]
+        );
+        assert_eq!(
+            sizes(r"\m7a\ folder:", SortDir::Asc),
+            [0, 0, 0, 7, 50, 300, 600, 1007, 1357, 10_000_000]
+        );
+        assert_eq!(
+            sizes(r"\m7a\ file:", SortDir::Desc),
+            [10_000_000, 1000, 300, 300, 300, 250, 100, 50, 7, 0]
+        );
+    }
+
+    /// Off, or while a build left sizes unread, a folder has no size: no
+    /// `size:` matches it, and a size sort puts it after every sized entry,
+    /// whichever way it runs, as before folder sizes.
+    #[test]
+    fn folders_without_sizes_match_no_size_and_sort_last() {
+        use crate::types::{SortDir, SortKey};
+        let mut idx = m7a_index();
+        idx.set_folder_sizes(false);
+        let run = |query: &str, dir: SortDir| {
+            let parsed = parse_query(query).expect("parses");
+            let sort = SortSpec {
+                key: SortKey::Size,
+                dir,
+            };
+            run_query(&idx, FIXTURE_ROOT, &parsed, None, sort, 0, None).hits
+        };
+        assert!(run(r"\m7a\ folder: size:>=0", SortDir::Desc).is_empty());
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            let hits = run(r"\m7a\", dir);
+            let first_folder = hits.iter().position(|h| h.is_dir).expect("folders");
+            assert!(
+                hits[first_folder..]
+                    .iter()
+                    .all(|h| h.is_dir && h.size.is_none())
+            );
+        }
     }
 }

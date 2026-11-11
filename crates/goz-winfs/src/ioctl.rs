@@ -48,6 +48,12 @@ pub(crate) const FSCTL_QUERY_FILE_LAYOUT: u32 = ctl_code(
     METHOD_NEITHER,
     FILE_ANY_ACCESS,
 );
+pub(crate) const FSCTL_GET_NTFS_VOLUME_DATA: u32 = ctl_code(
+    FILE_DEVICE_FILE_SYSTEM,
+    25,
+    METHOD_BUFFERED,
+    FILE_ANY_ACCESS,
+);
 
 // --- ioctl structs -------------------------------------------------------
 //
@@ -99,6 +105,27 @@ pub(crate) struct UsnJournalDataV0 {
     pub max_usn: i64,
     pub maximum_size: u64,
     pub allocation_delta: u64,
+}
+
+/// Win32 `NTFS_VOLUME_DATA_BUFFER`, output of `FSCTL_GET_NTFS_VOLUME_DATA`.
+#[repr(C)]
+#[derive(Default)]
+#[allow(dead_code)] // written by the kernel; only the MFT fields are read
+pub(crate) struct NtfsVolumeDataBuffer {
+    pub volume_serial_number: i64,
+    pub number_sectors: i64,
+    pub total_clusters: i64,
+    pub free_clusters: i64,
+    pub total_reserved: i64,
+    pub bytes_per_sector: u32,
+    pub bytes_per_cluster: u32,
+    pub bytes_per_file_record_segment: u32,
+    pub clusters_per_file_record_segment: u32,
+    pub mft_valid_data_length: i64,
+    pub mft_start_lcn: i64,
+    pub mft2_start_lcn: i64,
+    pub mft_zone_start: i64,
+    pub mft_zone_end: i64,
 }
 
 /// Win32 `QUERY_FILE_LAYOUT_INPUT`, input to `FSCTL_QUERY_FILE_LAYOUT`.
@@ -228,6 +255,8 @@ mod tests {
         assert_eq!(FSCTL_CREATE_USN_JOURNAL, 0x0009_00E7);
         assert_eq!(FSCTL_READ_USN_JOURNAL, 0x0009_00BB);
         assert_eq!(FSCTL_QUERY_FILE_LAYOUT, 0x0009_0277);
+        assert_eq!(FSCTL_GET_NTFS_VOLUME_DATA, 0x0009_0064);
+        assert_eq!(size_of::<NtfsVolumeDataBuffer>(), 96);
     }
 
     #[test]

@@ -1659,3 +1659,448 @@ fn a_layout_name_under_its_own_records_previous_tenant_goes_to_lost_found() {
     assert!(path_set(&idx).is_empty(), "{:?}", path_set(&idx));
     assert_whole(&idx);
 }
+
+// -- folder sizes ----------------------------------------------------------
+
+/// The size `f`'s entry reports: a file's, or a folder's total.
+fn size_of_frn(idx: &VolumeIndex, f: Frn) -> Option<u64> {
+    idx.entry(idx.head_of(f).expect("indexed")).size()
+}
+
+/// Every live folder's total, recomputed the slow way: each file of known
+/// size walks its parent links up, adding its size to each folder, until an
+/// entry that is no folder.
+fn naive_folder_sizes(idx: &VolumeIndex) -> HashMap<crate::types::EntryIdx, u64> {
+    let mut sums: HashMap<_, u64> = idx
+        .live_entries()
+        .filter(|&e| idx.entry(e).is_dir())
+        .map(|e| (e, 0))
+        .collect();
+    for e in idx.live_entries() {
+        let v = idx.entry(e);
+        let (false, Some(size)) = (v.is_dir(), v.size()) else {
+            continue;
+        };
+        let mut p = v.parent();
+        for _ in 0..10_000 {
+            if p == crate::types::NIL || !idx.entry(p).is_dir() {
+                break;
+            }
+            let s = sums.get_mut(&p).expect("a live folder");
+            *s = s.wrapping_add(size);
+            p = idx.entry(p).parent();
+        }
+    }
+    sums
+}
+
+/// With folder sizes on, every live folder reports exactly its naive total;
+/// off, every folder's size is unknown.
+fn folder_sizes_exact(idx: &VolumeIndex) -> Result<(), String> {
+    for (dir, want) in naive_folder_sizes(idx) {
+        let got = idx.entry(dir).size();
+        let want = idx.folder_sizes().then_some(want);
+        if got != want {
+            let mut path = Vec::new();
+            idx.path_of(dir, &mut path);
+            return Err(format!(
+                "folder {:?} ({dir}): {got:?}, want {want:?}",
+                String::from_utf8_lossy(&path)
+            ));
+        }
+    }
+    if idx.folder_sizes() && idx.folder_size_drift() != 0 {
+        return Err(format!("{} folders drifted", idx.folder_size_drift()));
+    }
+    Ok(())
+}
+
+#[track_caller]
+fn assert_folder_sizes(idx: &VolumeIndex) {
+    if let Err(e) = folder_sizes_exact(idx) {
+        panic!("{e}");
+    }
+}
+
+/// A folder's size is the total of every file below it, at any depth, and
+/// stays so through each change the journal and the enricher make: a size
+/// read, a file created, resized, renamed, moved or removed, a folder moved
+/// with what it holds, a folder removed before its files (they wait under
+/// lost+found), hard links added and dropped, and a parent seen after its
+/// child (the placeholder takes the child's size along when it is filled
+/// in). Off, every folder's size is unknown.
+#[test]
+fn folder_sizes_sum_the_files_below_and_follow_every_change() {
+    let mut idx = index_from_enum(&[
+        create(frn(100), root_frn(), "a", true),
+        create(frn(101), frn(100), "x.txt", false),
+        create(frn(102), frn(100), "b", true),
+        create(frn(103), frn(102), "y.txt", false),
+        create(frn(104), root_frn(), "c", true),
+    ]);
+    idx.set_stat(frn(101), 10, 0);
+    idx.set_stat(frn(103), 20, 0);
+    assert_eq!(size_of_frn(&idx, frn(100)), None, "off until turned on");
+
+    idx.set_folder_sizes(true);
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(30));
+    assert_eq!(size_of_frn(&idx, frn(102)), Some(20));
+    assert_eq!(size_of_frn(&idx, frn(104)), Some(0), "an empty folder is 0");
+    assert_eq!(idx.entry(idx.root()).size(), Some(30));
+    assert_folder_sizes(&idx);
+
+    idx.set_stat(frn(103), 25, 0);
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(35));
+    assert_folder_sizes(&idx);
+
+    // A new file adds nothing until its size is read.
+    idx.apply_batch(&[create(frn(105), frn(104), "z.txt", false)]);
+    assert_eq!(size_of_frn(&idx, frn(104)), Some(0));
+    idx.set_stat(frn(105), 5, 0);
+    assert_eq!(size_of_frn(&idx, frn(104)), Some(5));
+    assert_folder_sizes(&idx);
+
+    // A folder moves with its total.
+    idx.apply_batch(&[rename(frn(102), frn(104), "b2", true)]);
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(10));
+    assert_eq!(size_of_frn(&idx, frn(104)), Some(30));
+    assert_eq!(idx.entry(idx.root()).size(), Some(40));
+    assert_folder_sizes(&idx);
+
+    // Renamed in place, nothing moves; removed, a file's size leaves.
+    idx.apply_batch(&[rename(frn(103), frn(102), "y2.txt", false)]);
+    idx.apply_batch(&[delete(frn(101))]);
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(0));
+    assert_folder_sizes(&idx);
+
+    // A folder removed before its file: the file waits under lost+found.
+    idx.apply_batch(&[delete(frn(102))]);
+    assert_eq!(size_of_frn(&idx, frn(104)), Some(5));
+    assert_eq!(idx.entry(idx.lost_found()).size(), Some(25));
+    idx.apply_batch(&[delete(frn(103))]);
+    assert_eq!(idx.entry(idx.lost_found()).size(), Some(0));
+    assert_folder_sizes(&idx);
+
+    // A hard link adds its file's size in each folder that holds a name.
+    idx.apply_batch(&[create(frn(110), frn(100), "h.bin", false)]);
+    idx.set_stat(frn(110), 7, 0);
+    let (a, c) = (
+        idx.head_of(frn(100)).unwrap(),
+        idx.head_of(frn(104)).unwrap(),
+    );
+    idx.reconcile_links(
+        frn(110),
+        &[link(a, "h.bin"), link(c, "h2.bin"), link(c, "h3.bin")],
+    );
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(7));
+    assert_eq!(size_of_frn(&idx, frn(104)), Some(5 + 14));
+    idx.set_stat(frn(110), 8, 0);
+    assert_eq!(size_of_frn(&idx, frn(104)), Some(5 + 16));
+    idx.reconcile_links(frn(110), &[link(c, "h2.bin")]);
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(0));
+    assert_eq!(size_of_frn(&idx, frn(104)), Some(5 + 8));
+    assert_folder_sizes(&idx);
+
+    // A child seen before its folder: the placeholder holds its size under
+    // lost+found, and takes it along when the folder's record arrives.
+    idx.apply_batch(&[create(frn(120), frn(130), "q.txt", false)]);
+    idx.set_stat(frn(120), 3, 0);
+    assert_eq!(idx.entry(idx.lost_found()).size(), Some(3));
+    idx.apply_batch(&[create(frn(130), frn(100), "late", true)]);
+    assert_eq!(idx.entry(idx.lost_found()).size(), Some(0));
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(3));
+    assert_folder_sizes(&idx);
+
+    idx.set_folder_sizes(false);
+    assert_eq!(size_of_frn(&idx, frn(100)), None);
+    assert_eq!(idx.entry(idx.root()).size(), None);
+    assert_eq!(
+        size_of_frn(&idx, frn(120)),
+        Some(3),
+        "a file keeps its size"
+    );
+    assert_folder_sizes(&idx);
+}
+
+/// A total that drifted is summed again by the next compaction, which says
+/// how many it corrected; a plan made before the index changed is dropped.
+#[test]
+fn a_compaction_corrects_a_drifted_folder_total() {
+    let mut idx = index_from_enum(&[
+        create(frn(100), root_frn(), "a", true),
+        create(frn(101), frn(100), "x.txt", false),
+    ]);
+    idx.set_stat(frn(101), 10, 0);
+    idx.set_folder_sizes(true);
+    let a = idx.head_of(frn(100)).unwrap();
+    idx.force_size(a, 999); // what a missed update would leave
+    assert_eq!(idx.folder_size_drift(), 1);
+
+    let stale = idx.plan_compaction_now(false);
+    idx.set_stat(frn(101), 11, 0);
+    let stale = idx.apply_compaction(stale);
+    assert_eq!(stale.folder_fixes(), 1);
+    assert_eq!(
+        size_of_frn(&idx, frn(100)),
+        Some(1000),
+        "a stale plan is not applied"
+    );
+
+    let plan = idx.plan_compaction_now(true);
+    assert_eq!(plan.folder_fixes(), 1);
+    idx.apply_compaction(plan);
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(11));
+    assert_folder_sizes(&idx);
+}
+
+/// A record that closes a parent cycle leaves the cycle's totals to drift,
+/// as no walk up from inside it reaches the root; once a record breaks the
+/// cycle, the batch asks for a compaction, and the compaction sums them
+/// again.
+#[test]
+fn folder_totals_are_summed_again_once_a_parent_cycle_is_gone() {
+    let mut idx = index_from_enum(&[
+        create(frn(100), root_frn(), "a", true),
+        create(frn(101), frn(100), "b", true),
+        create(frn(102), frn(101), "x.txt", false),
+    ]);
+    idx.set_stat(frn(102), 10, 0);
+    idx.set_folder_sizes(true);
+
+    let outcome = idx.apply_batch(&[rename(frn(100), frn(101), "a", true)]);
+    assert!(idx.has_parent_cycle());
+    assert!(!outcome.wants_compact, "not while the cycle lasts");
+    idx.set_stat(frn(102), 12, 0);
+
+    let outcome = idx.apply_batch(&[rename(frn(100), root_frn(), "a", true)]);
+    assert!(!idx.has_parent_cycle());
+    assert!(outcome.wants_compact);
+    let plan = idx.plan_compaction().expect("a resum");
+    idx.apply_compaction(plan);
+    assert_eq!(size_of_frn(&idx, frn(100)), Some(12));
+    assert_folder_sizes(&idx);
+    assert!(!idx.apply_batch(&[]).wants_compact);
+}
+
+/// A batch's room is made before it, off the write lock: the plan grows
+/// what the batch would grow, the install only swaps, and the batch then
+/// grows nothing. A plan made before the index changed is not installed.
+#[test]
+fn room_made_before_a_batch_leaves_it_nothing_to_grow() {
+    let mut idx = new_index();
+    let recs: Vec<_> = (0..5_000u64)
+        .map(|i| create(frn(1_000 + i), root_frn(), &format!("file {i}"), i % 7 == 0))
+        .collect();
+    idx.apply_batch(&recs);
+    idx.optimize_storage();
+
+    let batch: Vec<_> = (0..3_000u64)
+        .map(|i| create(frn(9_000 + i), frn(1_000), &format!("new {i}"), i % 5 == 0))
+        .collect();
+    let need = Room::for_records(&batch);
+    let stale = idx
+        .plan_room(need)
+        .expect("the batch outgrows the headroom");
+    idx.apply_batch(&[]);
+    let before = idx.memory();
+    drop(idx.install_room(stale));
+    assert_eq!(idx.memory(), before, "a stale plan installs nothing");
+
+    let plan = idx.plan_room(need).expect("room to make");
+    drop(idx.install_room(plan));
+    let made = idx.memory();
+    assert!(made.entries.allocated > before.entries.allocated);
+    assert!(idx.plan_room(need).is_none(), "the room is there");
+    idx.apply_batch(&batch);
+    let after = idx.memory();
+    for (what, m, a) in [
+        ("entries", made.entries, after.entries),
+        ("folded", made.arena_folded, after.arena_folded),
+        ("frn", made.frn_map, after.frn_map),
+        ("dirs", made.dir_children, after.dir_children),
+    ] {
+        assert_eq!(m.allocated, a.allocated, "{what} grew under the lock");
+    }
+    assert!(idx.dir_index_matches_rebuild());
+    assert_whole(&idx);
+}
+
+/// A build sized from the volume's record count reserves one slot a record
+/// in every column and a dense FRN map, and past that grows by a sixteenth,
+/// not by doubling.
+#[test]
+fn a_build_sized_from_the_record_count_never_doubles() {
+    let mut idx = new_index();
+    idx.reserve_for_records(4_000);
+    assert_eq!(idx.memory().frn_map_kind, "dense");
+    let reserved = idx.memory().entries.allocated;
+    let recs: Vec<_> = (0..4_500u64)
+        .map(|i| create(frn(10 + i), root_frn(), &format!("f{i}"), false))
+        .collect();
+    for r in &recs {
+        idx.insert_enum(r);
+    }
+    let grown = idx.memory().entries.allocated;
+    assert!(grown > reserved);
+    assert!(grown * 10 < reserved * 13, "{reserved} -> {grown}");
+    assert_eq!(idx.len(), 4_502);
+    assert_eq!(path_set(&idx).len(), 4_500);
+}
+
+#[derive(Clone, Debug)]
+enum SizeOp {
+    Create {
+        rec: u8,
+        parent: u8,
+        dir: bool,
+        seq2: bool,
+    },
+    Move {
+        rec: u8,
+        parent: u8,
+    },
+    Delete {
+        rec: u8,
+    },
+    Stat {
+        rec: u8,
+        size: u16,
+    },
+    Links {
+        rec: u8,
+        parents: Vec<u8>,
+    },
+    Compact,
+    Toggle,
+}
+
+const SIZE_RECS: u8 = 24;
+
+fn size_op_strategy() -> impl Strategy<Value = SizeOp> {
+    let rec = 0..SIZE_RECS;
+    let parent = 0..=SIZE_RECS; // SIZE_RECS is the root
+    prop_oneof![
+        4 => (rec.clone(), parent.clone(), any::<bool>(), prop::bool::weighted(0.1))
+            .prop_map(|(rec, parent, dir, seq2)| SizeOp::Create { rec, parent, dir, seq2 }),
+        2 => (rec.clone(), parent.clone()).prop_map(|(rec, parent)| SizeOp::Move { rec, parent }),
+        2 => rec.clone().prop_map(|rec| SizeOp::Delete { rec }),
+        4 => (rec.clone(), any::<u16>()).prop_map(|(rec, size)| SizeOp::Stat { rec, size }),
+        1 => (rec, prop::collection::vec(parent, 1..4))
+            .prop_map(|(rec, parents)| SizeOp::Links { rec, parents }),
+        1 => Just(SizeOp::Compact),
+        1 => Just(SizeOp::Toggle),
+    ]
+}
+
+/// The FRN record `rec` holds in the index now, either tenant.
+fn size_frn(idx: &VolumeIndex, rec: u8) -> Frn {
+    let f2 = frn_seq(1_000 + u64::from(rec), 2);
+    if idx.head_of(f2).is_some() {
+        f2
+    } else {
+        frn(1_000 + u64::from(rec))
+    }
+}
+
+fn size_parent(parent: u8) -> Frn {
+    if parent == SIZE_RECS {
+        root_frn()
+    } else {
+        frn(1_000 + u64::from(parent))
+    }
+}
+
+/// Whether putting `target` under `parent` would close a parent cycle,
+/// which only a corrupt record does (tested apart).
+fn closes_cycle(idx: &VolumeIndex, target: Frn, parent: Frn) -> bool {
+    if target.record_number() == parent.record_number() {
+        return true;
+    }
+    let (Some(t), Some(mut p)) = (idx.head_of(target), idx.head_of(parent)) else {
+        return false;
+    };
+    for _ in 0..10_000 {
+        if p == t {
+            return true;
+        }
+        if p == crate::types::NIL {
+            return false;
+        }
+        p = idx.entry(p).parent();
+    }
+    true
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Every folder's total equals a naive recompute after each change of a
+    /// random tape over a small record space: creates (some re-tenanting a
+    /// record, some under a parent not seen yet), moves and renames of files
+    /// and folders, removals of folders that still hold files, size reads,
+    /// hard links, compactions, and folder sizes turned off and on.
+    #[test]
+    fn folder_sizes_match_a_naive_recompute(ops in prop::collection::vec(size_op_strategy(), 0..80)) {
+        let mut idx = new_index();
+        idx.set_folder_sizes(true);
+        for op in &ops {
+            match op {
+                SizeOp::Create { rec, parent, dir, seq2 } => {
+                    let f = frn_seq(1_000 + u64::from(*rec), if *seq2 { 2 } else { 1 });
+                    let p = size_parent(*parent);
+                    if !closes_cycle(&idx, f, p) {
+                        idx.apply_batch(&[create(f, p, &format!("n{rec}"), *dir)]);
+                    }
+                }
+                SizeOp::Move { rec, parent } => {
+                    let f = size_frn(&idx, *rec);
+                    let p = size_parent(*parent);
+                    if let Some(head) = idx.head_of(f)
+                        && !closes_cycle(&idx, f, p)
+                    {
+                        let is_dir = idx.entry(head).is_dir();
+                        idx.apply_batch(&[rename(f, p, &format!("m{rec}"), is_dir)]);
+                    }
+                }
+                SizeOp::Delete { rec } => {
+                    idx.apply_batch(&[delete(size_frn(&idx, *rec))]);
+                }
+                SizeOp::Stat { rec, size } => {
+                    idx.set_stat(size_frn(&idx, *rec), u64::from(*size), 0);
+                }
+                SizeOp::Links { rec, parents } => {
+                    let f = size_frn(&idx, *rec);
+                    let Some(head) = idx.head_of(f) else { continue };
+                    if idx.entry(head).is_dir() {
+                        continue;
+                    }
+                    let mut seen = HashSet::new();
+                    let targets: Vec<LinkTarget> = parents
+                        .iter()
+                        .filter(|p| seen.insert(**p))
+                        .filter_map(|&p| idx.head_of(size_parent(p)))
+                        .filter(|&p| idx.entry(p).is_dir())
+                        .map(|p| link(p, &format!("l{rec}")))
+                        .collect();
+                    if !targets.is_empty() {
+                        idx.reconcile_links(f, &targets);
+                    }
+                }
+                SizeOp::Compact => {
+                    let plan = idx.plan_compaction_now(true);
+                    prop_assert_eq!(plan.folder_fixes(), 0, "drift found by a compaction");
+                    drop(idx.apply_compaction(plan));
+                }
+                SizeOp::Toggle => {
+                    let on = idx.folder_sizes();
+                    idx.set_folder_sizes(!on);
+                }
+            }
+            if let Err(e) = folder_sizes_exact(&idx) {
+                prop_assert!(false, "after {:?}: {}", op, e);
+            }
+            prop_assert!(idx.dir_index_matches_rebuild(), "dir index drifted after {:?}", op);
+            prop_assert!(idx.child_chains_match_rebuild(), "child chains drifted after {:?}", op);
+        }
+    }
+}

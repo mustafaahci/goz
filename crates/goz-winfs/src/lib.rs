@@ -78,8 +78,8 @@ pub use volume::{VolumeHandle, VolumeInfo, enumerate_volumes, open_volume, volum
 #[cfg(windows)]
 pub use journal::{
     ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE,
-    JournalInfo, JournalQuery, create_usn_journal, enum_usn_data, query_usn_journal,
-    read_usn_journal,
+    JournalInfo, JournalQuery, create_usn_journal, enum_usn_data, mft_record_count,
+    query_usn_journal, read_usn_journal,
 };
 
 #[cfg(windows)]

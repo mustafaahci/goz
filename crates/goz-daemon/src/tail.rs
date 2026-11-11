@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use goz_core::index::{LinkTarget, VolumeIndex, WtfName};
+use goz_core::index::{LinkTarget, Room, VolumeIndex, WtfName};
 use goz_core::query::resolve_scope;
 use goz_core::types::{Frn, VolumePhase};
 use goz_core::usn::record::{
@@ -279,6 +279,7 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                 // the one thing here that used to run long (~184 ms on a large
                 // index), is no longer inline: `apply_batch` reports it and
                 // `compact_index` does the copying off the exclusive lock.
+                reserve_room(state, Room::for_records(&walk.records));
                 let outcome = {
                     let mut index = state.index.write();
                     index.apply_batch(&walk.records)
@@ -300,6 +301,9 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                 // can refresh and which the record itself cannot be trusted for
                 // (it may name a link that is already dead).
                 reconcile_links(state, handle, &outcome.needs_link_reconcile, stop, pulse);
+                if outcome.wants_merge {
+                    merge_names(state);
+                }
                 if outcome.wants_compact {
                     compact_index(state);
                 }
@@ -447,17 +451,60 @@ fn compact_index(state: &VolumeState) {
 
     let install_started = Instant::now();
     let mut index = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
-    index.apply_compaction(plan);
+    let old = index.apply_compaction(plan);
     drop(index);
+    let blocked = install_started.elapsed();
+    // A folder total the live updates got wrong, corrected here, is drift
+    // worth a line: a healthy index has none.
+    if old.folder_fixes() > 0 {
+        tracing::info!(
+            volume = %state.mount_prefix(),
+            folders = old.folder_fixes(),
+            "compaction corrected folder totals"
+        );
+    }
+    drop(old); // the old buffers are freed with no lock held
 
     // A ~184 ms query stall used to be completely invisible. `blocked_ms` is the
     // only part that stops queries; `planned_ms` runs alongside them.
     tracing::debug!(
         volume = %state.mount_prefix(),
         planned_ms = planned.as_millis() as u64,
-        blocked_ms = install_started.elapsed().as_millis() as u64,
+        blocked_ms = blocked.as_millis() as u64,
         "compacted name arenas"
     );
+}
+
+/// Merges the names interned since the last merge into the name order, off
+/// the write lock as [`compact_index`] does: the merge walks every name, 25
+/// ms on 1.6M names, and ran under the write lock every 1,600 new names.
+fn merge_names(state: &VolumeState) {
+    let guard = state.index.upgradable_read();
+    let Some(plan) = guard.plan_name_merge() else {
+        return;
+    };
+    let mut index = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
+    let old = index.install_name_merge(plan);
+    drop(index);
+    drop(old);
+}
+
+/// Grows, before a change, the index buffers it would grow, so its write
+/// lock holds no growth. A grown buffer is a copy of the whole old one into
+/// new pages: in place under the write lock, the entry columns of a
+/// 5.1M-entry volume held every query 28.5 ms. Here the copy runs under an
+/// upgradable read, which queries share and which keeps out every other
+/// writer, so nothing changes between the copy and the swap; the write lock
+/// covers the swap alone, and the old buffers are freed after it.
+fn reserve_room(state: &VolumeState, room: Room) {
+    let guard = state.index.upgradable_read();
+    let Some(plan) = guard.plan_room(room) else {
+        return;
+    };
+    let mut index = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
+    let old = index.install_room(plan);
+    drop(index);
+    drop(old);
 }
 
 /// Reconciles the hard-link set of each FRN in `frns` to what the filesystem
@@ -520,6 +567,15 @@ fn reconcile_links(
     if walked.is_empty() && dropped == 0 {
         return;
     }
+    reserve_room(
+        state,
+        Room::for_links(
+            walked
+                .iter()
+                .flat_map(|(_, links)| links.iter())
+                .map(|wide| 3 * wide.len()),
+        ),
+    );
     let mut index = state.index.write();
     dropped += apply_link_walks(&mut index, &walked);
     if dropped > 0 {
@@ -888,6 +944,9 @@ fn install(
         *state.scope_cache.lock() = None;
     }
     *state.phase.write() = journal.built_phase();
+    // The build summed its folders as the setting stood; one changed since
+    // is applied now.
+    crate::folder_sizes::sync(state);
     journal.cursor()
 }
 

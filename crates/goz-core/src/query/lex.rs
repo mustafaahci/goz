@@ -525,11 +525,11 @@ enum Named {
 }
 
 /// Why `child-size:` and `child-folder-size:` are refused.
-const NO_CHILD_FOLDER_SIZES: &str = "goz's index holds no folder sizes, which Everything \
-                                     compares for a child folder (M7); child-file-size: \
+const NO_CHILD_FOLDER_SIZES: &str = "goz does not yet test a child folder's size from its \
+                                     folder sizes, as Everything does; child-file-size: \
                                      tests the files alone";
 /// Why `parent-size:` is refused.
-const NO_FOLDER_SIZES: &str = "goz's index holds no folder sizes (M7)";
+const NO_FOLDER_SIZES: &str = "goz does not yet test a parent's size from its folder sizes";
 /// Why the date created, accessed, changed and run, run count and
 /// attribute functions of related entries are refused.
 const NO_SUCH_DATA: &str = "goz's index holds no dates created, accessed, recently changed \

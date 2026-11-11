@@ -17,7 +17,8 @@ use goz_core::types::VolumePhase;
 use goz_core::usn::walk_enum_buffer;
 use goz_winfs::{
     JournalInfo, JournalQuery, VolumeHandle, VolumeInfo, WinError, create_usn_journal,
-    enum_usn_data, enumerate_volumes, query_file_layout, query_usn_journal, volume_total_bytes,
+    enum_usn_data, enumerate_volumes, mft_record_count, query_file_layout, query_usn_journal,
+    volume_total_bytes,
 };
 
 /// Floor for the USN journal: large enough that routine churn does not wrap it
@@ -182,6 +183,13 @@ pub(crate) fn build_index(
 ) -> Result<Option<BuiltIndex>> {
     let cancelled = || stop.is_some_and(|s| s.load(Ordering::Relaxed));
     let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+    // Sized from the MFT's record count, the columns are not doubled on the
+    // way and the FRN map is dense from the start. Without the count the
+    // build sizes as it goes, as it always did.
+    match mft_record_count(handle) {
+        Ok(records) => index.reserve_for_records(records),
+        Err(e) => tracing::debug!(error = %e, "MFT record count unread; sizing as the build goes"),
+    }
     let mut buf = vec![0u8; IO_BUFFER_BYTES];
 
     // --- FILE_LAYOUT: names, links, sizes, dates in one MFT read ----------
@@ -243,9 +251,11 @@ pub(crate) fn build_index(
     }
 
     // Every record has been seen: densify the FRN map, build the name
-    // order, return the growth slack. Here rather than in the caller so a
-    // rescan's index gets the same treatment as the first build's.
+    // order, return the growth slack, and sum the folders once every size
+    // is read. Here rather than in the caller so a rescan's index gets the
+    // same treatment as the first build's.
     index.optimize_storage();
+    crate::folder_sizes::on_build(&mut index, !layout_complete);
 
     Ok(Some(BuiltIndex {
         index,

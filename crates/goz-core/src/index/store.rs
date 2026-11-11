@@ -59,16 +59,32 @@ const _: () = assert!(size_of::<EntryIdx>() == 4);
 const _: () = assert!(size_of::<NameId>() == 4);
 
 /// Freshly compacted name storage plus the id remap for every kept name, built
-/// WITHOUT touching the index so the expensive copy runs off the exclusive
-/// lock. Apply with [`NameStore::install_compacted`].
+/// WITHOUT touching the index so the expensive work (the copy, the intern
+/// table, the name order and its ranks) runs off the exclusive lock. Apply
+/// with [`NameStore::install_compacted`], which only swaps buffers; after
+/// that the value holds the old ones, to be freed off the lock.
 pub(crate) struct CompactedNames {
     raw: Vec<u8>,
     folded: Vec<u8>,
     pairs: Vec<NamePair>,
     refcount: Vec<u32>,
     head: Vec<EntryIdx>,
+    by_bytes: hashbrown::HashTable<NameId>,
+    order: Vec<NameId>,
+    unranked: Vec<NameId>,
+    rank_of: Vec<u32>,
+    /// Clear until the caller marks the names folders bear
+    /// ([`Self::mark_folder`]).
+    folder_bearer: Vec<u64>,
     /// `remap[old_id]` = new id, or [`NIL`] for a dropped (refcount-0) name.
-    remap: Vec<NameId>,
+    pub(crate) remap: Vec<NameId>,
+}
+
+impl CompactedNames {
+    /// Notes that a folder bears the new id `id`.
+    pub(crate) fn mark_folder(&mut self, id: NameId) {
+        self.folder_bearer[id as usize / 64] |= 1 << (id % 64);
+    }
 }
 
 /// The interned name store: every distinct name once, in two NUL-separated
@@ -132,6 +148,45 @@ pub(crate) struct NameStore {
     settled: bool,
 }
 
+/// Grown copies of a [`NameStore`]'s buffers (see [`NameStore::plan_room`]);
+/// `None` where a buffer has the room. After an install it holds the old
+/// buffers.
+pub(crate) struct NameRoom {
+    raw: Option<Vec<u8>>,
+    folded: Option<Vec<u8>>,
+    pairs: Option<Vec<NamePair>>,
+    refcount: Option<Vec<u32>>,
+    head: Option<Vec<EntryIdx>>,
+    rank_of: Option<Vec<u32>>,
+    folder_bearer: Option<Vec<u64>>,
+    /// The table's length when planned, and the table.
+    by_bytes: Option<(usize, hashbrown::HashTable<NameId>)>,
+}
+
+impl NameRoom {
+    fn grows(&self) -> bool {
+        self.raw.is_some()
+            || self.folded.is_some()
+            || self.pairs.is_some()
+            || self.refcount.is_some()
+            || self.head.is_some()
+            || self.rank_of.is_some()
+            || self.folder_bearer.is_some()
+            || self.by_bytes.is_some()
+    }
+}
+
+/// A merge of the waiting names into the order, built off the write lock
+/// (see [`NameStore::plan_merge`]). After an install it holds the old order
+/// and ranks.
+pub(crate) struct NameMerge {
+    order: Vec<NameId>,
+    rank_of: Vec<u32>,
+    /// How many names waited, and how many ids there were, when planned.
+    unranked: usize,
+    ids: usize,
+}
+
 /// A name not (yet) in the order.
 pub(crate) const UNRANKED: u32 = u32::MAX;
 
@@ -176,6 +231,31 @@ fn room_for<T>(v: &mut Vec<T>, more: usize) {
     }
 }
 
+/// A copy of `v` with room for `more` items past its length, grown as
+/// [`room_for`] would grow it in place, or `None` when `v` already has the
+/// room. Built off the write lock (see [`super::volume::RoomPlan`]): a
+/// growth copies the whole buffer and faults in its pages, which held the
+/// lock 28.5 ms when a 5.1M-entry volume's columns grew.
+fn grown<T: Clone>(v: &Vec<T>, more: usize) -> Option<Vec<T>> {
+    if v.capacity() - v.len() >= more {
+        return None;
+    }
+    let mut fresh = Vec::with_capacity(v.len() + (v.len() / 16).max(more).max(GROW_MIN));
+    fresh.extend_from_slice(v);
+    Some(fresh)
+}
+
+/// Swaps a buffer [`grown`] built into `slot` when it still holds what
+/// `slot` holds, leaving the old buffer in `fresh` to be freed after the
+/// lock is released. A plan built from another state is dropped unused.
+fn swap_grown<T>(slot: &mut Vec<T>, fresh: &mut Option<Vec<T>>) {
+    if let Some(v) = fresh
+        && v.len() == slot.len()
+    {
+        core::mem::swap(v, slot);
+    }
+}
+
 /// `NameStore::folded_bytes_of` over explicit tables, for closures that sort
 /// or merge ids while another field is mutably borrowed.
 fn folded_in<'a>(pairs: &'a [NamePair], folded: &'a [u8], id: NameId) -> &'a [u8] {
@@ -200,6 +280,32 @@ fn raw_bytes_in<'a>(
     };
     let off = (r.off & !RAW_IN_FOLDED) as usize;
     &buf[off..off + r.len as usize]
+}
+
+/// Recomputes every rank from the order: equal folded names share the
+/// position of the first live one of them; dead and waiting ids rank with
+/// nothing.
+fn rank_into(
+    order: &[NameId],
+    refcount: &[u32],
+    pairs: &[NamePair],
+    folded: &[u8],
+    rank_of: &mut [u32],
+) {
+    rank_of.iter_mut().for_each(|r| *r = UNRANKED);
+    let mut group_start = 0usize;
+    let mut prev_live: Option<&[u8]> = None;
+    for (pos, &id) in order.iter().enumerate() {
+        if refcount[id as usize] == 0 {
+            continue;
+        }
+        let f = folded_in(pairs, folded, id);
+        if prev_live != Some(f) {
+            group_start = pos;
+            prev_live = Some(f);
+        }
+        rank_of[id as usize] = group_start as u32;
+    }
 }
 
 impl NameStore {
@@ -424,6 +530,11 @@ impl NameStore {
             pairs: Vec::with_capacity(room(live)),
             refcount: Vec::with_capacity(room(live)),
             head: Vec::with_capacity(room(live)),
+            by_bytes: hashbrown::HashTable::with_capacity(live),
+            order: Vec::new(),
+            unranked: Vec::new(),
+            rank_of: Vec::with_capacity(room(live)),
+            folder_bearer: vec![0; live.div_ceil(64)],
             remap: vec![NIL; self.pairs.len()],
         };
         for (i, &rc) in self.refcount.iter().enumerate() {
@@ -445,24 +556,9 @@ impl NameStore {
             c.refcount.push(rc);
             c.head.push(self.head[i]);
         }
-        c
-    }
-
-    /// Installs storage built by [`Self::plan_compact`], returning the id
-    /// remap (`remap[old_id]` = new id or [`NIL`]). The caller must rewrite
-    /// every entry's name id through it, and mark the name of every folder
-    /// again ([`Self::mark_folder`]): the folder-bearer bits come back clear,
-    /// so that bits whose folders are gone stop costing queries a chain
-    /// walk. Buffer swaps plus one intern-table rebuild; this is the half
-    /// that runs under the exclusive lock.
-    ///
-    /// The plan is only valid if the index has not changed since it was
-    /// built; the volume's single-writer discipline (one tail thread, which
-    /// plans and applies back to back under an upgradable lock) provides that.
-    pub(crate) fn install_compacted(&mut self, c: CompactedNames) -> Vec<NameId> {
-        // The order and the waiting list carry old ids: renumber them before
-        // the tables change, dropping the dead. Renumbering keeps relative
-        // order, so the order stays sorted.
+        // The intern table, the order and the ranks over the new ids. The
+        // order and the waiting list carry old ids: renumbering keeps
+        // relative order, so the order stays sorted, and drops the dead.
         let renumber = |ids: &[NameId]| -> Vec<NameId> {
             // Sized up front: a filtered `collect` grows by doubling.
             let mut out = Vec::with_capacity(ids.len());
@@ -472,28 +568,52 @@ impl NameStore {
             }));
             out
         };
-        self.order = renumber(&self.order);
-        self.unranked = renumber(&self.unranked);
-        self.raw = c.raw;
-        self.folded = c.folded;
-        self.pairs = c.pairs;
-        self.refcount = c.refcount;
-        self.head = c.head;
-        self.folder_bearer = vec![0; self.pairs.len().div_ceil(64)];
-        self.garbage = 0;
-        let mut table = hashbrown::HashTable::with_capacity(self.pairs.len());
-        let (pairs, raw, folded) = (&self.pairs, &self.raw, &self.folded);
-        for id in 0..pairs.len() as NameId {
-            let hash = hash_bytes(raw_bytes_in(pairs, raw, folded, id));
-            table.insert_unique(hash, id, |&i| {
-                hash_bytes(raw_bytes_in(pairs, raw, folded, i))
-            });
+        c.order = renumber(&self.order);
+        c.unranked = renumber(&self.unranked);
+        {
+            let CompactedNames {
+                raw,
+                folded,
+                pairs,
+                by_bytes,
+                ..
+            } = &mut c;
+            for id in 0..pairs.len() as NameId {
+                let hash = hash_bytes(raw_bytes_in(pairs, raw, folded, id));
+                by_bytes.insert_unique(hash, id, |&i| {
+                    hash_bytes(raw_bytes_in(pairs, raw, folded, i))
+                });
+            }
         }
-        self.by_bytes = table;
-        self.rank_of = vec![UNRANKED; self.pairs.len()];
+        c.rank_of.resize(c.pairs.len(), UNRANKED);
+        rank_into(&c.order, &c.refcount, &c.pairs, &c.folded, &mut c.rank_of);
+        c
+    }
+
+    /// Installs storage built by [`Self::plan_compact`], leaving the old
+    /// buffers in `c` to be freed off the lock. The caller must rewrite every
+    /// entry's name id through `c.remap`, and must have marked in `c` the
+    /// name of every folder ([`CompactedNames::mark_folder`]): the
+    /// folder-bearer bits start clear, so that bits whose folders are gone
+    /// stop costing queries a chain walk. Buffer swaps only; this is the
+    /// half that runs under the exclusive lock.
+    ///
+    /// The plan is only valid if the index has not changed since it was
+    /// built; the volume's single-writer discipline (one tail thread, which
+    /// plans and applies back to back under an upgradable lock) provides that.
+    pub(crate) fn install_compacted(&mut self, c: &mut CompactedNames) {
+        core::mem::swap(&mut self.raw, &mut c.raw);
+        core::mem::swap(&mut self.folded, &mut c.folded);
+        core::mem::swap(&mut self.pairs, &mut c.pairs);
+        core::mem::swap(&mut self.refcount, &mut c.refcount);
+        core::mem::swap(&mut self.head, &mut c.head);
+        core::mem::swap(&mut self.by_bytes, &mut c.by_bytes);
+        core::mem::swap(&mut self.order, &mut c.order);
+        core::mem::swap(&mut self.unranked, &mut c.unranked);
+        core::mem::swap(&mut self.rank_of, &mut c.rank_of);
+        core::mem::swap(&mut self.folder_bearer, &mut c.folder_bearer);
+        self.garbage = 0;
         self.dead_ranked = 0;
-        self.rerank();
-        c.remap
     }
 
     // -- name order ---------------------------------------------------------
@@ -574,46 +694,103 @@ impl NameStore {
             self.build_order();
             return;
         }
-        let mut new: Vec<NameId> = core::mem::take(&mut self.unranked);
-        let old: Vec<NameId> = core::mem::take(&mut self.order);
-        let merged = {
-            let Self {
-                pairs,
-                folded,
-                refcount,
-                ..
-            } = &*self;
-            let key = |id: NameId| (folded_in(pairs, folded, id), id);
-            new.retain(|&id| refcount[id as usize] > 0);
-            new.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
-            let mut merged = Vec::with_capacity(old.len() + new.len());
-            let mut old_live = old
-                .iter()
-                .copied()
-                .filter(|&id| refcount[id as usize] > 0)
-                .peekable();
-            let mut new_it = new.into_iter().peekable();
-            while let (Some(o), Some(n)) = (old_live.peek().copied(), new_it.peek().copied()) {
-                if key(n) < key(o) {
-                    merged.push(n);
-                    new_it.next();
-                } else {
-                    merged.push(o);
-                    old_live.next();
-                }
-            }
-            merged.extend(old_live);
-            merged.extend(new_it);
-            merged
-        };
-        self.order = merged;
+        self.order = self.merged_order();
+        self.unranked.clear();
         self.dead_ranked = 0;
         self.rerank();
     }
 
-    /// Recomputes every rank from the order: equal folded names share the
-    /// position of the first live one of them; dead and waiting ids rank with
-    /// nothing.
+    /// Whether so many names wait outside the order that the apply merges
+    /// them itself: eight times what [`Self::wants_merge`] asks a merge
+    /// for, which only a caller that never merges off the lock leaves.
+    pub(crate) fn wants_merge_now(&self) -> bool {
+        let limit = 8 * 1024.max(self.order.len() / 1000);
+        self.unranked.len() > limit || self.dead_ranked > limit
+    }
+
+    /// The merge [`Self::merge_unranked`] makes, built without changing the
+    /// store so it runs off the write lock: the merged order and every rank.
+    /// O(names) with a byte compare a name, 25 ms on 1.6M names under the
+    /// lock every 1,600 new ones. `None` while no order is built.
+    pub(crate) fn plan_merge(&self) -> Option<NameMerge> {
+        if self.order.is_empty() {
+            return None;
+        }
+        let order = self.merged_order();
+        let mut rank_of = Vec::with_capacity(self.rank_of.capacity());
+        rank_of.resize(self.rank_of.len(), UNRANKED);
+        rank_into(
+            &order,
+            &self.refcount,
+            &self.pairs,
+            &self.folded,
+            &mut rank_of,
+        );
+        Some(NameMerge {
+            order,
+            rank_of,
+            unranked: self.unranked.len(),
+            ids: self.pairs.len(),
+        })
+    }
+
+    /// Installs a merge [`Self::plan_merge`] built, leaving the old order
+    /// and ranks in `merge`. Swaps only. `false`, and nothing changed, when
+    /// names were interned since the plan.
+    pub(crate) fn install_merge(&mut self, merge: &mut NameMerge) -> bool {
+        if merge.unranked != self.unranked.len()
+            || merge.ids != self.pairs.len()
+            || merge.rank_of.len() != self.rank_of.len()
+        {
+            return false;
+        }
+        core::mem::swap(&mut self.order, &mut merge.order);
+        core::mem::swap(&mut self.rank_of, &mut merge.rank_of);
+        self.unranked.clear();
+        self.dead_ranked = 0;
+        true
+    }
+
+    /// The order with the waiting names merged in and the dead dropped:
+    /// one O(n) merge, deliberately never a re-sort.
+    fn merged_order(&self) -> Vec<NameId> {
+        let Self {
+            pairs,
+            folded,
+            refcount,
+            order,
+            unranked,
+            ..
+        } = self;
+        let key = |id: NameId| (folded_in(pairs, folded, id), id);
+        let mut new: Vec<NameId> = unranked
+            .iter()
+            .copied()
+            .filter(|&id| refcount[id as usize] > 0)
+            .collect();
+        new.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)));
+        let mut merged = Vec::with_capacity(order.len() + new.len());
+        let mut old_live = order
+            .iter()
+            .copied()
+            .filter(|&id| refcount[id as usize] > 0)
+            .peekable();
+        let mut new_it = new.into_iter().peekable();
+        while let (Some(o), Some(n)) = (old_live.peek().copied(), new_it.peek().copied()) {
+            if key(n) < key(o) {
+                merged.push(n);
+                new_it.next();
+            } else {
+                merged.push(o);
+                old_live.next();
+            }
+        }
+        merged.extend(old_live);
+        merged.extend(new_it);
+        merged
+    }
+
+    /// Recomputes every rank from the order (see [`rank_into`]).
     fn rerank(&mut self) {
         let Self {
             order,
@@ -623,20 +800,7 @@ impl NameStore {
             refcount,
             ..
         } = self;
-        rank_of.iter_mut().for_each(|r| *r = UNRANKED);
-        let mut group_start = 0usize;
-        let mut prev_live: Option<&[u8]> = None;
-        for (pos, &id) in order.iter().enumerate() {
-            if refcount[id as usize] == 0 {
-                continue;
-            }
-            let f = folded_in(pairs, folded, id);
-            if prev_live != Some(f) {
-                group_start = pos;
-                prev_live = Some(f);
-            }
-            rank_of[id as usize] = group_start as u32;
-        }
+        rank_into(order, refcount, pairs, folded, rank_of);
     }
 
     /// The integer a name-sorted candidate is ordered by: `2 * rank + 1` for
@@ -689,6 +853,88 @@ impl NameStore {
         lo
     }
 
+    /// Grown copies of the buffers that `names` more names of `raw_bytes`
+    /// and `folded_bytes` more bytes (separators included) would make grow,
+    /// built off the write lock; `None` when every buffer has the room. The
+    /// intern table is rebuilt at twice its buckets, as a growth in place
+    /// would, and its items hashed here rather than under the lock.
+    pub(crate) fn plan_room(
+        &self,
+        names: usize,
+        raw_bytes: usize,
+        folded_bytes: usize,
+    ) -> Option<NameRoom> {
+        let by_bytes = (self.by_bytes.capacity() - self.by_bytes.len() < names).then(|| {
+            let (pairs, raw, folded) = (&self.pairs, &self.raw, &self.folded);
+            let mut table = hashbrown::HashTable::with_capacity(
+                (self.by_bytes.capacity() * 2).max(self.by_bytes.len() + names),
+            );
+            for &id in self.by_bytes.iter() {
+                let hash = hash_bytes(raw_bytes_in(pairs, raw, folded, id));
+                table.insert_unique(hash, id, |&i| {
+                    hash_bytes(raw_bytes_in(pairs, raw, folded, i))
+                });
+            }
+            (self.by_bytes.len(), table)
+        });
+        let room = NameRoom {
+            raw: grown(&self.raw, raw_bytes),
+            folded: grown(&self.folded, folded_bytes),
+            pairs: grown(&self.pairs, names),
+            refcount: grown(&self.refcount, names),
+            head: grown(&self.head, names),
+            rank_of: grown(&self.rank_of, names),
+            folder_bearer: grown(&self.folder_bearer, names / 64 + 1),
+            by_bytes,
+        };
+        room.grows().then_some(room)
+    }
+
+    /// Installs what [`Self::plan_room`] built, leaving the old buffers in
+    /// `room` to be freed off the lock. Swaps only.
+    pub(crate) fn install_room(&mut self, room: &mut NameRoom) {
+        swap_grown(&mut self.raw, &mut room.raw);
+        swap_grown(&mut self.folded, &mut room.folded);
+        swap_grown(&mut self.pairs, &mut room.pairs);
+        swap_grown(&mut self.refcount, &mut room.refcount);
+        swap_grown(&mut self.head, &mut room.head);
+        swap_grown(&mut self.rank_of, &mut room.rank_of);
+        swap_grown(&mut self.folder_bearer, &mut room.folder_bearer);
+        if let Some((len, table)) = &mut room.by_bytes
+            && *len == self.by_bytes.len()
+        {
+            core::mem::swap(table, &mut self.by_bytes);
+        }
+    }
+
+    /// Every buffer's bytes, by name, for a detailed breakdown.
+    pub(crate) fn parts_mem(&self) -> Vec<(&'static str, ComponentBytes)> {
+        vec![
+            ("names raw", ComponentBytes::of_vec(&self.raw)),
+            ("names folded", ComponentBytes::of_vec(&self.folded)),
+            ("name pairs", ComponentBytes::of_vec(&self.pairs)),
+            ("name refcount", ComponentBytes::of_vec(&self.refcount)),
+            ("name head", ComponentBytes::of_vec(&self.head)),
+            ("name order", ComponentBytes::of_vec(&self.order)),
+            ("name rank_of", ComponentBytes::of_vec(&self.rank_of)),
+            ("name unranked", ComponentBytes::of_vec(&self.unranked)),
+            (
+                "name folder_bearer",
+                ComponentBytes::of_vec(&self.folder_bearer),
+            ),
+            ("name intern table", self.intern_mem()),
+        ]
+    }
+
+    fn intern_mem(&self) -> ComponentBytes {
+        let intern_per = (size_of::<NameId>() + 1) as u64;
+        let intern_buckets = ((self.by_bytes.capacity() as u64 * 8) / 7).next_power_of_two();
+        ComponentBytes {
+            used: self.by_bytes.len() as u64 * intern_per,
+            allocated: intern_buckets * intern_per,
+        }
+    }
+
     pub(crate) fn raw_mem(&self) -> ComponentBytes {
         ComponentBytes::of_vec(&self.raw)
     }
@@ -699,8 +945,6 @@ impl NameStore {
 
     /// Per-name table bytes (pairs + refcounts + chain heads + intern table).
     pub(crate) fn tables_mem(&self) -> ComponentBytes {
-        let intern_per = (size_of::<NameId>() + 1) as u64;
-        let intern_buckets = ((self.by_bytes.capacity() as u64 * 8) / 7).next_power_of_two();
         ComponentBytes::of_vec(&self.pairs)
             + ComponentBytes::of_vec(&self.refcount)
             + ComponentBytes::of_vec(&self.head)
@@ -708,10 +952,7 @@ impl NameStore {
             + ComponentBytes::of_vec(&self.rank_of)
             + ComponentBytes::of_vec(&self.unranked)
             + ComponentBytes::of_vec(&self.folder_bearer)
-            + ComponentBytes {
-                used: self.by_bytes.len() as u64 * intern_per,
-                allocated: intern_buckets * intern_per,
-            }
+            + self.intern_mem()
     }
 
     /// Returns growth slack to the OS, keeping ~1.6% headroom. Called once
@@ -865,9 +1106,109 @@ pub(crate) struct EntryTable {
     settled: bool,
 }
 
+/// Generates, over the entry columns: [`EntryRoom`] and the
+/// `EntryTable` methods that reserve, grow off the lock, install and
+/// measure every column alike.
+macro_rules! entry_columns {
+    ($($col:ident: $ty:ty),* $(,)?) => {
+        /// Grown copies of the entry columns (see [`EntryTable::plan_room`]);
+        /// `None` where a column has the room. After an install it holds
+        /// the old columns.
+        pub(crate) struct EntryRoom {
+            $($col: Option<Vec<$ty>>,)*
+        }
+
+        impl EntryRoom {
+            fn grows(&self) -> bool {
+                false $(|| self.$col.is_some())*
+            }
+        }
+
+        impl EntryTable {
+            fn reserve_columns(&mut self, slots: usize) {
+                $(self.$col.reserve_exact(slots.saturating_sub(self.$col.len()));)*
+            }
+
+            fn plan_columns(&self, more: usize) -> EntryRoom {
+                EntryRoom {
+                    $($col: grown(&self.$col, more),)*
+                }
+            }
+
+            fn install_columns(&mut self, room: &mut EntryRoom) {
+                $(swap_grown(&mut self.$col, &mut room.$col);)*
+            }
+
+            /// Every column's bytes, by name, for a detailed breakdown.
+            pub(crate) fn columns_mem(&self) -> Vec<(&'static str, ComponentBytes)> {
+                vec![
+                    $((stringify!($col), ComponentBytes::of_vec(&self.$col)),)*
+                    ("free", ComponentBytes::of_vec(&self.free)),
+                ]
+            }
+        }
+    };
+}
+
+entry_columns! {
+    frn: Frn,
+    parent: EntryIdx,
+    name_id: NameId,
+    flags: EntryFlags,
+    size: u64,
+    mtime: i64,
+    next_link: EntryIdx,
+    next_same: EntryIdx,
+    prev_same: EntryIdx,
+    first_child: EntryIdx,
+    next_child: EntryIdx,
+    prev_child: EntryIdx,
+}
+
 impl EntryTable {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Reserves room for `slots` entries in every column before a build
+    /// and settles the columns, so past the room they grow by a sixteenth
+    /// (see [`room_for`]) instead of doubling. Sized from the volume's MFT
+    /// record count, a build no longer passes through columns twice what
+    /// they hold, nor copies them at each doubling.
+    pub(crate) fn reserve(&mut self, slots: usize) {
+        self.reserve_columns(slots);
+        self.settled = true;
+    }
+
+    /// Grown copies of the columns, for `slots` more entries than the free
+    /// list holds, built off the write lock; `None` when the columns have
+    /// the room.
+    pub(crate) fn plan_room(&self, slots: usize) -> Option<EntryRoom> {
+        let more = slots.saturating_sub(self.free.len());
+        if more == 0 {
+            return None;
+        }
+        let room = self.plan_columns(more);
+        room.grows().then_some(room)
+    }
+
+    /// Installs what [`Self::plan_room`] built, leaving the old columns in
+    /// `room` to be freed off the lock. Swaps only.
+    pub(crate) fn install_room(&mut self, room: &mut EntryRoom) {
+        self.install_columns(room);
+    }
+
+    /// The name-id column, for a compaction to rewrite off the lock.
+    pub(crate) fn name_ids(&self) -> &Vec<NameId> {
+        &self.name_id
+    }
+
+    /// Swaps in a name-id column a compaction rewrote, leaving the old one
+    /// in `ids`. Ignored unless it is as long as the column.
+    pub(crate) fn swap_name_ids(&mut self, ids: &mut Vec<NameId>) {
+        if ids.len() == self.name_id.len() {
+            core::mem::swap(ids, &mut self.name_id);
+        }
     }
 
     /// Allocates a slot (reusing a freed one when available). The caller
@@ -1114,6 +1455,13 @@ impl EntryTable {
     }
 }
 
+/// A grown [`FrnMap`] backing (see [`FrnMap::plan_room`]).
+pub(crate) enum FrnRoom {
+    Dense(Vec<EntryIdx>),
+    /// The map's length when planned, and the grown map.
+    Sparse(usize, FxHashMap<u64, EntryIdx>),
+}
+
 /// How many records past twice its length a dense [`FrnMap`] still grows to
 /// before [`FrnMap::set`] switches it to the sparse backing.
 const DENSE_GROWTH_SLACK: u64 = 1 << 16;
@@ -1236,6 +1584,44 @@ impl FrnMap {
         }
     }
 
+    /// A grown copy of the map with room for `records` more records and for
+    /// record numbers up to `max_record`, built off the write lock; `None`
+    /// when it has the room, or when `max_record` is so far past a dense
+    /// map's end that [`Self::set`] will switch it to the sparse backing.
+    pub(crate) fn plan_room(&self, records: usize, max_record: u64) -> Option<FrnRoom> {
+        match self {
+            FrnMap::Dense(v) => {
+                if max_record > v.len() as u64 * 2 + DENSE_GROWTH_SLACK {
+                    return None;
+                }
+                let more = (max_record as usize + 1).saturating_sub(v.len());
+                grown(v, more).map(FrnRoom::Dense)
+            }
+            FrnMap::Sparse(m) => (m.capacity() - m.len() < records).then(|| {
+                let mut fresh = FxHashMap::with_capacity_and_hasher(
+                    (m.capacity() * 2).max(m.len() + records),
+                    Default::default(),
+                );
+                fresh.extend(m.iter().map(|(&k, &v)| (k, v)));
+                FrnRoom::Sparse(m.len(), fresh)
+            }),
+        }
+    }
+
+    /// Installs what [`Self::plan_room`] built, leaving the old backing in
+    /// `room` to be freed off the lock.
+    pub(crate) fn install_room(&mut self, room: &mut FrnRoom) {
+        match (self, room) {
+            (FrnMap::Dense(v), FrnRoom::Dense(fresh)) if fresh.len() == v.len() => {
+                core::mem::swap(v, fresh);
+            }
+            (FrnMap::Sparse(m), FrnRoom::Sparse(len, fresh)) if *len == m.len() => {
+                core::mem::swap(m, fresh);
+            }
+            _ => {}
+        }
+    }
+
     /// A short label for diagnostics ("dense" / "sparse").
     pub fn kind(&self) -> &'static str {
         match self {
@@ -1333,8 +1719,8 @@ mod tests {
         for &id in &ids[..12_000] {
             names.release(id);
         }
-        let compacted = names.plan_compact();
-        names.install_compacted(compacted);
+        let mut compacted = names.plan_compact();
+        names.install_compacted(&mut compacted);
         check(&names, "compacted");
         for i in 0..2_000 {
             names.intern(format!("Late{i}.TXT").as_bytes());
