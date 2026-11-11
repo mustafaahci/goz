@@ -124,6 +124,19 @@ impl List {
                 EsColumn::DateModified => {
                     json_number(b"date_modified", item.mtime_ft.map(|ft| ft as u64), out);
                 }
+                EsColumn::DateCreated => {
+                    json_number(b"date_created", item.ctime_ft.map(|ft| ft as u64), out);
+                }
+                EsColumn::DateAccessed => {
+                    json_number(b"date_accessed", item.atime_ft.map(|ft| ft as u64), out);
+                }
+                EsColumn::DateRecentlyChanged => {
+                    let rtime = item.rtime_ft.map(|ft| ft as u64);
+                    json_number(b"date_recently_changed", rtime, out);
+                }
+                EsColumn::Attributes => {
+                    json_number(b"attributes", item.attrib.map(u64::from), out);
+                }
             }
             out.push(b',');
         }
@@ -180,6 +193,7 @@ mod tests {
             is_dir,
             size,
             mtime_ft,
+            ..Default::default()
         }
     }
 

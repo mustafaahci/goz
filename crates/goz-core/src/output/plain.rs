@@ -30,6 +30,10 @@ pub const SIZE_WIDTH: usize = 14;
 /// against a capture of es.exe's console output, as [`SIZE_WIDTH`] is.
 pub const DATE_WIDTH: usize = 19;
 
+/// The width of the Attributes column, in characters: room for the
+/// letters a file usually has.
+pub const ATTRIB_WIDTH: usize = 6;
+
 /// Options for the plain listing.
 #[derive(Clone, Debug)]
 pub struct PlainOptions {
@@ -136,12 +140,20 @@ pub fn write_plain_row(opts: &PlainOptions, row: &Row<'_>, out: &mut Vec<u8>) {
     let mut overflow = 0;
     for &col in &opts.columns {
         let size;
+        let letters;
         let (text, width, right_aligned) = match col {
             EsColumn::Size => {
                 size = row.file_size().map(|s| opts.grouping.format(s));
                 (size.as_deref().unwrap_or(""), SIZE_WIDTH, true)
             }
             EsColumn::DateModified => (row.mtime.unwrap_or(""), DATE_WIDTH, false),
+            EsColumn::DateCreated => (row.ctime.unwrap_or(""), DATE_WIDTH, false),
+            EsColumn::DateAccessed => (row.atime.unwrap_or(""), DATE_WIDTH, false),
+            EsColumn::DateRecentlyChanged => (row.rtime.unwrap_or(""), DATE_WIDTH, false),
+            EsColumn::Attributes => {
+                letters = row.attrib.map(super::attribute_letters);
+                (letters.as_deref().unwrap_or(""), ATTRIB_WIDTH, false)
+            }
         };
         // Characters, which for the separators locales use is es's count
         // of UTF-16 units.
@@ -193,6 +205,7 @@ mod tests {
             size,
             mtime,
             is_dir: false,
+            ..Default::default()
         }
     }
 
@@ -229,6 +242,7 @@ mod tests {
             size,
             mtime_ft: unix_secs.map(|secs| unix_ms_to_filetime(secs * 1000)),
             is_dir,
+            ..Default::default()
         };
         let page = QueryResults {
             total: 3,

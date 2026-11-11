@@ -62,11 +62,14 @@
 //! query is parsed with.
 
 use super::dates::{DateFilter, LocalClock, date_filter};
-use super::expr::{self, Anchors, CountOf, Expr, FolderPath, Leaf, LenOf, Relation, Skip, Target};
+use super::expr::{
+    self, Anchors, CountOf, Expr, FolderPath, Leaf, LenOf, PropTest, Relation, Skip, Target,
+};
 use super::lex::{self, Func, Macro, ModSet, Prefix, Text, Tok, Token};
 use super::pattern::RegexTerm;
 use super::value::{self, Number};
 use crate::fold::{fold, fold_exact};
+use crate::index::Column;
 
 pub use super::glob::{CodePointBuf, Wildcard};
 
@@ -865,6 +868,28 @@ impl<'t> Parser<'t, '_> {
                     leaf
                 });
             }
+            Func::DateCreated | Func::DateAccessed | Func::RecentChange => {
+                let (nots, item) = bangs(item);
+                let test = PropTest::Date(date_filter(
+                    &String::from_utf8_lossy(item),
+                    self.clock.ok_or(QueryError::NoClock)?,
+                )?);
+                let leaf = Expr::Leaf(Leaf::Prop {
+                    column: prop_column(func),
+                    test,
+                });
+                return Ok(if nots % 2 == 1 {
+                    not_value(func, leaf)
+                } else {
+                    leaf
+                });
+            }
+            Func::Attrib => {
+                return Ok(Expr::Leaf(Leaf::Prop {
+                    column: Column::Attributes,
+                    test: attrib_test(item),
+                }));
+            }
             Func::Size
             | Func::Len
             | Func::NameLen
@@ -1098,9 +1123,84 @@ fn not_value(func: Func, e: Expr) -> Expr {
             Expr::Leaf(Leaf::Kind(Kind::Folder))
         }
         Func::TotalChildSize => Expr::Leaf(Leaf::TotalChildSize(any)),
+        // A live Everything 1.5 answers `rc:!today` with every entry whose
+        // date recently changed is unknown, as `!rc:today` (W9).
+        Func::RecentChange => Expr::True,
+        // A known date, as for `dm:`.
+        Func::DateCreated | Func::DateAccessed => Expr::Leaf(Leaf::Prop {
+            column: prop_column(func),
+            test: PropTest::Date(DateFilter::Within {
+                min: i64::MIN,
+                max: i64::MAX,
+            }),
+        }),
         _ => Expr::True,
     };
     Expr::and(known, e.not())
+}
+
+/// The column a date function of the optional columns tests.
+fn prop_column(func: Func) -> Column {
+    match func {
+        Func::DateCreated => Column::DateCreated,
+        Func::DateAccessed => Column::DateAccessed,
+        Func::Attrib => Column::Attributes,
+        _ => Column::RecentChange,
+    }
+}
+
+/// Everything's attribute letters (its search syntax help) and their
+/// `FILE_ATTRIBUTE_*` bits.
+pub(crate) const ATTRIB_LETTERS: [(u8, u32); 17] = [
+    (b'a', 0x20),
+    (b'c', 0x800),
+    (b'd', 0x10),
+    (b'e', 0x4000),
+    (b'h', 0x2),
+    (b'i', 0x2000),
+    (b'l', 0x400),
+    (b'n', 0x80),
+    (b'm', 0x40_0000),
+    (b'o', 0x1000),
+    (b'p', 0x8_0000),
+    (b'r', 0x1),
+    (b's', 0x4),
+    (b't', 0x100),
+    (b'u', 0x10_0000),
+    (b'v', 0x8000),
+    (b'x', 0x2_0000),
+];
+
+/// An `attrib:` value, as a live Everything 1.5 reads one (W9): a number,
+/// `0x` hex or decimal, whose bits the entry must all have (hex that does
+/// not parse is 0, `attrib:0xZZ` matching every entry); or else
+/// Everything's letters, any case, each an attribute it must have, every
+/// other character (`!`, `-`, `,`, an unknown letter) ignored, so
+/// `attrib:!h` is `attrib:h`, and `attrib:` and `attrib:q` match every
+/// entry. `!attrib:h` is the NOT of the term.
+fn attrib_test(item: &[u8]) -> PropTest {
+    if let Some(hex) = item
+        .strip_prefix(b"0x")
+        .or_else(|| item.strip_prefix(b"0X"))
+    {
+        let hex = String::from_utf8_lossy(hex);
+        return PropTest::Attrib(u32::from_str_radix(&hex, 16).unwrap_or(0));
+    }
+    if item.first().is_some_and(u8::is_ascii_digit) {
+        let digits: String = item
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .map(|&b| char::from(b))
+            .collect();
+        return PropTest::Attrib(digits.parse::<u32>().unwrap_or(u32::MAX));
+    }
+    let all = item.iter().fold(0, |all, b| {
+        ATTRIB_LETTERS
+            .iter()
+            .find(|(l, _)| *l == b.to_ascii_lowercase())
+            .map_or(all, |(_, bit)| all | bit)
+    });
+    PropTest::Attrib(all)
 }
 
 /// What a count function counts; `None` for any other function.
@@ -1697,8 +1797,8 @@ mod tests {
     #[test]
     fn unknown_functions_are_refused_but_drives_are_paths() {
         assert_eq!(
-            parse_query("dc:today"),
-            Err(QueryError::UnknownFunction("dc:".to_string()))
+            parse_query("date-run:today"),
+            Err(QueryError::UnknownFunction("date-run:".to_string()))
         );
         assert_eq!(
             parse_query("report Bogus:foo"),
@@ -1715,8 +1815,8 @@ mod tests {
             "parent: takes an absolute path"
         );
         assert_eq!(
-            parse_query("a|!dc:x"),
-            Err(QueryError::UnknownFunction("dc:".to_string()))
+            parse_query("a|!dr:x"),
+            Err(QueryError::UnknownFunction("dr:".to_string()))
         );
         assert_eq!(q(r"C:\Windows").path_terms, vec![br"c:\windows".to_vec()]);
         assert_eq!(q("12:30").name_terms, vec![b"12:30".to_vec()]);

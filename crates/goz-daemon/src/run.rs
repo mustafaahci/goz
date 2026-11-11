@@ -27,11 +27,15 @@ pub(crate) struct Engine {
 /// until every volume is built. Volumes attached later, or not ready yet, are
 /// found by the supervisor's scans.
 pub(crate) fn start_engine() -> Result<Engine> {
+    // The index options, before any volume builds with them.
+    let options = crate::config::init().get();
+    tracing::info!(?options, "index options");
     let listed = bootstrap::list_volumes()?;
     if !listed.iter().any(bootstrap::indexable) {
         bail!("no fixed NTFS volumes found");
     }
     let volumes = Arc::new(VolumeRegistry::default());
+    crate::folder_sizes::set(&volumes.current(), options.index_folder_size);
     let supervisor =
         Supervisor::spawn(volumes.clone(), &listed).context("starting the volume supervisor")?;
     Ok(Engine {

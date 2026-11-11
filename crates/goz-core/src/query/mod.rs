@@ -11,6 +11,11 @@
 pub mod budget;
 mod cexpr;
 pub mod dates;
+pub mod disk;
+#[cfg(test)]
+mod disk_live;
+#[cfg(test)]
+mod disk_tests;
 pub mod engine;
 mod expr;
 mod folder_rank;
@@ -31,11 +36,12 @@ pub use crate::fold;
 
 pub use budget::{Budget, Stopped};
 pub use dates::{DateFilter, DateOrder, LocalClock};
+pub use disk::{BasicInfo, DiskProps, disk_columns, sort_column};
 pub use engine::{
-    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, mtime_key, resolve_scope, run_query,
-    run_query_refs, size_key,
+    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, column_key, mtime_key,
+    resolve_scope, run_query, run_query_refs, run_query_refs_disk, size_key,
 };
-pub use expr::{Anchors, Expr, FolderPath, Leaf, LenOf, Skip, Target};
+pub use expr::{Anchors, Expr, FolderPath, Leaf, LenOf, PropTest, Skip, Target};
 pub use parse::{
     Filters, Kind, ParsedQuery, QueryError, SizeRange, Wildcard, parse_query, parse_query_at,
     parse_query_with_case,

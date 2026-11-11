@@ -15,15 +15,15 @@ pub mod frame;
 pub mod types;
 
 pub use binary::{
-    RESP_TAG_JSON, RESP_TAG_RESULTS, decode_results_payload, encode_results_payload,
-    patch_results_header, push_item, push_results_header,
+    ItemColumns, RESP_TAG_JSON, RESP_TAG_RESULTS, decode_results_payload, encode_results_payload,
+    patch_results_header, push_item, push_item_with, push_results_header,
 };
 pub use frame::{
     FrameDecoder, FrameError, RespFrameError, decode_request, decode_response,
     decode_response_frame, encode_frame, encode_request, encode_response, encode_response_frame,
 };
 pub use types::{
-    DaemonStatus, MAX_CLIENT_FRAME, MAX_SERVER_FRAME, MemPair, PAGE_ROWS, PIPE_NAME, PROTO_VERSION,
-    ProtoError, QueryRequest, QueryResults, Request, Response, ResultItem, SERVICE_NAME,
-    VolumeMemory, VolumeStatus,
+    CONFIG_KEYS, ColumnStatus, ConfigChange, DaemonStatus, IndexConfig, MAX_CLIENT_FRAME,
+    MAX_SERVER_FRAME, MemPair, PAGE_ROWS, PIPE_NAME, PROTO_VERSION, ProtoError, QueryRequest,
+    QueryResults, Request, Response, ResultItem, SERVICE_NAME, VolumeMemory, VolumeStatus, feature,
 };

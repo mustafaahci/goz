@@ -207,6 +207,15 @@ pub(super) enum Func {
     Size,
     /// `dm:` (`date:`, `date-modified:`).
     Date,
+    /// `dc:` (`date-created:`).
+    DateCreated,
+    /// `da:` (`date-accessed:`).
+    DateAccessed,
+    /// `rc:` (`recent-change:`, `date-recently-changed:`).
+    RecentChange,
+    /// `attrib:` (`attributes:`, `attr:`): the entry has every attribute
+    /// named.
+    Attrib,
     /// `len:`: the name's length, or the full path's under `path:`.
     Len,
     /// `name-length:`.
@@ -323,6 +332,9 @@ impl Func {
             self,
             Func::Size
                 | Func::Date
+                | Func::DateCreated
+                | Func::DateAccessed
+                | Func::RecentChange
                 | Func::Len
                 | Func::NameLen
                 | Func::PathLen
@@ -389,6 +401,10 @@ impl Func {
             Func::Extension => "extension:",
             Func::Size => "size:",
             Func::Date => "dm:",
+            Func::DateCreated => "dc:",
+            Func::DateAccessed => "da:",
+            Func::RecentChange => "rc:",
+            Func::Attrib => "attrib:",
             Func::Len => "len:",
             Func::NameLen => "name-length:",
             Func::PathLen => "full-path-length:",
@@ -532,9 +548,10 @@ const NO_CHILD_FOLDER_SIZES: &str = "goz does not yet test a child folder's size
 const NO_FOLDER_SIZES: &str = "goz does not yet test a parent's size from its folder sizes";
 /// Why the date created, accessed, changed and run, run count and
 /// attribute functions of related entries are refused.
-const NO_SUCH_DATA: &str = "goz's index holds no dates created, accessed, recently changed \
-                            or run, no run counts and no attributes (M7); of a file it \
-                            holds the size and the date modified";
+const NO_SUCH_DATA: &str = "goz answers a related entry's size and date modified, and \
+                            dc:, da:, rc: and attrib: of the entry itself; it keeps no \
+                            dates run or run counts, and does not read related entries' \
+                            dates created, accessed or recently changed or attributes";
 /// Why the occurrence counts are refused.
 const NO_OCCURRENCES: &str = "it counts the hits of the query's child: or descendant: term \
                               in each folder, which goz does not keep; child-count:, \
@@ -608,6 +625,10 @@ impl Prefix {
             "extension" => func(F::Extension),
             "size" => func(F::Size),
             "dm" | "date" | "datemodified" => func(F::Date),
+            "dc" | "datecreated" => func(F::DateCreated),
+            "da" | "dateaccessed" => func(F::DateAccessed),
+            "rc" | "recentchange" | "daterecentlychanged" => func(F::RecentChange),
+            "attrib" | "attributes" | "attr" => func(F::Attrib),
             "len" => func(F::Len),
             "namelength" | "namelen" => func(F::NameLen),
             "fullpathlength" | "fullpathlen" | "pathlength" | "pathlen" => func(F::PathLen),
@@ -1736,7 +1757,7 @@ mod tests {
         ] {
             assert_eq!(shape(input), want, "{input}");
         }
-        for unknown in ["nodir:", "no-dir:", "noext:", "bogus:", "dc:", "length:"] {
+        for unknown in ["nodir:", "no-dir:", "noext:", "bogus:", "dr:", "length:"] {
             assert!(
                 matches!(lex(unknown), Err(QueryError::UnknownFunction(_))),
                 "{unknown}"

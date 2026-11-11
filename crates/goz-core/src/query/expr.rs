@@ -14,6 +14,7 @@ use super::dates::DateFilter;
 use super::glob::Wildcard;
 use super::parse::{Kind, ParsedQuery, SizeRange};
 use super::pattern::RegexTerm;
+use crate::index::{Column, Columns};
 
 /// A boolean expression over the query's terms.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,6 +221,10 @@ pub enum Leaf {
     SizeUnknown,
     /// The date modified passes.
     Date(DateFilter),
+    /// A property of the optional columns passes (`dc:`, `da:`, `rc:`,
+    /// `attrib:`): read from the index while its column is indexed, and
+    /// otherwise from disk, after the other terms (see `cexpr::compile`).
+    Prop { column: Column, test: PropTest },
     /// A length, in UTF-16 units, is in range.
     Len { of: LenOf, range: SizeRange },
     /// A count is in range. Only a folder has children, so a file matches
@@ -246,6 +251,26 @@ pub enum Leaf {
         kind: Option<Kind>,
         term: Box<Expr>,
     },
+}
+
+/// What a [`Leaf::Prop`] tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropTest {
+    /// A date column's date passes.
+    Date(DateFilter),
+    /// The attributes are known and hold every bit of these
+    /// (`FILE_ATTRIBUTE_*` bits).
+    Attrib(u32),
+}
+
+impl PropTest {
+    /// Whether a value passes: a date column's FILETIME, or attributes.
+    pub fn matches(self, date: Option<i64>, attrib: Option<u32>) -> bool {
+        match self {
+            PropTest::Date(d) => d.matches(date),
+            PropTest::Attrib(all) => attrib.is_some_and(|a| a & all == all),
+        }
+    }
 }
 
 /// A folder `parent:` or `ancestor:` names.
@@ -461,6 +486,17 @@ pub(super) fn lower(e: Expr, q: &mut ParsedQuery) {
 /// wildcard.
 pub(super) fn is_plain_ext(v: &[u8]) -> bool {
     !v.is_empty() && !v.iter().any(|&b| b == b'*' || b == b'?')
+}
+
+/// The optional columns `e`'s terms read.
+pub(super) fn prop_columns(e: &Expr) -> Columns {
+    let mut cols = Columns::NONE;
+    e.for_each_leaf(&mut |leaf| {
+        if let Leaf::Prop { column, .. } = leaf {
+            cols = cols.with(*column, true);
+        }
+    });
+    cols
 }
 
 /// How many `regex:` terms `e` holds.

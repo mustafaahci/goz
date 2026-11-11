@@ -3,8 +3,8 @@
 //! below it (see [`goz_core::index::VolumeIndex::folder_sizes`]); they cost no
 //! memory, since every folder already has a size slot.
 //!
-//! The one switch is [`set`]; whoever reads the setting (the daemon's config)
-//! calls it. A build sums a volume's folders when it finishes, unless its
+//! The one switch is [`set`], which the daemon's options call at start and on
+//! each change of `index_folder_size`. A build sums a volume's folders when it finishes, unless its
 //! FILE_LAYOUT pass stopped and left sizes unread: then the volume's folder
 //! sizes stay unknown until a build reads them all, rather than totals that
 //! leave files out.
@@ -27,7 +27,6 @@ pub(crate) fn wanted() -> bool {
 /// Turns folder sizes on or off for every volume. On sums each volume's
 /// folders off its write lock; off makes every folder's size unknown again.
 /// Builds that finish later follow the new setting.
-#[allow(dead_code)] // the config that calls it is wired apart (M7b)
 pub(crate) fn set(volumes: &VolumeSet, on: bool) {
     WANTED.store(on, Ordering::Release);
     for volume in volumes.iter() {

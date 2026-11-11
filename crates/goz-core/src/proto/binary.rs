@@ -24,10 +24,20 @@
 //! count items, each:
 //!   path_len: u32 LE    raw path byte length (WTF-8, mount prefix included)
 //!   path:     path_len bytes
-//!   iflags:   u8        bit0 is_dir, bit1 has_size, bit2 has_mtime
+//!   iflags:   u8        bit0 is_dir, bit1 has_size, bit2 has_mtime,
+//!                       bit3 has_ctime, bit4 has_rtime, bit5 has_attrib,
+//!                       bit6 has_atime
 //!   size:     u64 LE    iff has_size
 //!   mtime:    i64 LE    iff has_mtime
+//!   ctime:    i64 LE    iff has_ctime (FILETIME, date created)
+//!   rtime:    i64 LE    iff has_rtime (FILETIME, date recently changed)
+//!   attrib:   u32 LE    iff has_attrib (FILE_ATTRIBUTE_* bits)
+//!   atime:    i64 LE    iff has_atime (FILETIME, date accessed)
 //! ```
+//!
+//! Bits 3-6 are set only for a query that asked for those columns
+//! (`want_ctime` ...), which a client predating them never does, so its
+//! parser never meets a value it cannot skip.
 //!
 //! Paths travel as raw WTF-8, exactly the bytes the daemon stored. The decoder
 //! lossy-decodes them to `ResultItem::path` and, when they were not valid UTF-8,
@@ -50,6 +60,32 @@ const FLAG_TOTAL_SIZE: u8 = 1 << 3;
 const IFLAG_IS_DIR: u8 = 1;
 const IFLAG_HAS_SIZE: u8 = 1 << 1;
 const IFLAG_HAS_MTIME: u8 = 1 << 2;
+const IFLAG_HAS_CTIME: u8 = 1 << 3;
+const IFLAG_HAS_RTIME: u8 = 1 << 4;
+const IFLAG_HAS_ATTRIB: u8 = 1 << 5;
+const IFLAG_HAS_ATIME: u8 = 1 << 6;
+
+/// The optional columns of one item, each sent only when the query asked
+/// for it and it could be read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ItemColumns {
+    pub ctime: Option<i64>,
+    pub rtime: Option<i64>,
+    pub attrib: Option<u32>,
+    pub atime: Option<i64>,
+}
+
+impl ItemColumns {
+    /// The columns of `item`.
+    pub fn of(item: &ResultItem) -> Self {
+        Self {
+            ctime: item.ctime_ft,
+            rtime: item.rtime_ft,
+            attrib: item.attrib,
+            atime: item.atime_ft,
+        }
+    }
+}
 
 /// A truncated or malformed binary results page.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -119,6 +155,18 @@ pub fn push_item(
     size: Option<u64>,
     mtime: Option<i64>,
 ) {
+    push_item_with(out, raw_path, is_dir, size, mtime, &ItemColumns::default());
+}
+
+/// [`push_item`] with the optional columns.
+pub fn push_item_with(
+    out: &mut Vec<u8>,
+    raw_path: &[u8],
+    is_dir: bool,
+    size: Option<u64>,
+    mtime: Option<i64>,
+    cols: &ItemColumns,
+) {
     out.extend_from_slice(&(raw_path.len() as u32).to_le_bytes());
     out.extend_from_slice(raw_path);
     let mut iflags = 0u8;
@@ -131,12 +179,36 @@ pub fn push_item(
     if mtime.is_some() {
         iflags |= IFLAG_HAS_MTIME;
     }
+    if cols.ctime.is_some() {
+        iflags |= IFLAG_HAS_CTIME;
+    }
+    if cols.rtime.is_some() {
+        iflags |= IFLAG_HAS_RTIME;
+    }
+    if cols.attrib.is_some() {
+        iflags |= IFLAG_HAS_ATTRIB;
+    }
+    if cols.atime.is_some() {
+        iflags |= IFLAG_HAS_ATIME;
+    }
     out.push(iflags);
     if let Some(s) = size {
         out.extend_from_slice(&s.to_le_bytes());
     }
     if let Some(m) = mtime {
         out.extend_from_slice(&m.to_le_bytes());
+    }
+    if let Some(c) = cols.ctime {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    if let Some(r) = cols.rtime {
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    if let Some(a) = cols.attrib {
+        out.extend_from_slice(&a.to_le_bytes());
+    }
+    if let Some(a) = cols.atime {
+        out.extend_from_slice(&a.to_le_bytes());
     }
 }
 
@@ -172,7 +244,14 @@ pub fn encode_results_payload(page: &QueryResults, out: &mut Vec<u8>) {
     let mut scratch = Vec::new();
     for it in &page.items {
         let raw = raw_path_bytes(it, &mut scratch);
-        push_item(out, raw, it.is_dir, it.size, it.mtime_ft);
+        push_item_with(
+            out,
+            raw,
+            it.is_dir,
+            it.size,
+            it.mtime_ft,
+            &ItemColumns::of(it),
+        );
     }
 }
 
@@ -235,6 +314,18 @@ pub fn decode_results_payload(body: &[u8]) -> Result<QueryResults, BinError> {
         let mtime = (iflags & IFLAG_HAS_MTIME != 0)
             .then(|| r.i64())
             .transpose()?;
+        let ctime = (iflags & IFLAG_HAS_CTIME != 0)
+            .then(|| r.i64())
+            .transpose()?;
+        let rtime = (iflags & IFLAG_HAS_RTIME != 0)
+            .then(|| r.i64())
+            .transpose()?;
+        let attrib = (iflags & IFLAG_HAS_ATTRIB != 0)
+            .then(|| r.u32())
+            .transpose()?;
+        let atime = (iflags & IFLAG_HAS_ATIME != 0)
+            .then(|| r.i64())
+            .transpose()?;
         let lossy = core::str::from_utf8(path).is_err();
         items.push(ResultItem {
             path: wtf8::to_string_lossy(path),
@@ -242,6 +333,10 @@ pub fn decode_results_payload(body: &[u8]) -> Result<QueryResults, BinError> {
             size,
             mtime_ft: mtime,
             is_dir: iflags & IFLAG_IS_DIR != 0,
+            ctime_ft: ctime,
+            atime_ft: atime,
+            rtime_ft: rtime,
+            attrib,
         });
     }
     Ok(QueryResults {
@@ -288,6 +383,70 @@ mod tests {
         assert_eq!(&back, page);
     }
 
+    /// The columns of wave 9 travel in bit order after the old fields, each
+    /// only when present, and an item without them keeps its old bytes.
+    #[test]
+    fn optional_columns_round_trip_in_bit_order() {
+        let mut out = Vec::new();
+        let cols = ItemColumns {
+            ctime: Some(11),
+            rtime: Some(22),
+            attrib: Some(0x0040_0021),
+            atime: Some(33),
+        };
+        push_item_with(&mut out, b"C:\\a", false, Some(5), Some(6), &cols);
+        let mut want = Vec::new();
+        want.extend_from_slice(&4u32.to_le_bytes());
+        want.extend_from_slice(b"C:\\a");
+        want.push(0b0111_1110);
+        want.extend_from_slice(&5u64.to_le_bytes());
+        want.extend_from_slice(&6i64.to_le_bytes());
+        want.extend_from_slice(&11i64.to_le_bytes());
+        want.extend_from_slice(&22i64.to_le_bytes());
+        want.extend_from_slice(&0x0040_0021u32.to_le_bytes());
+        want.extend_from_slice(&33i64.to_le_bytes());
+        assert_eq!(out, want);
+
+        let mut old = Vec::new();
+        push_item(&mut old, b"C:\\a", true, None, Some(6));
+        let mut none = Vec::new();
+        push_item_with(
+            &mut none,
+            b"C:\\a",
+            true,
+            None,
+            Some(6),
+            &ItemColumns::default(),
+        );
+        assert_eq!(old, none);
+
+        for item in [
+            ResultItem {
+                path: r"C:\a".into(),
+                ctime_ft: Some(-7),
+                attrib: Some(u32::MAX),
+                ..ResultItem::default()
+            },
+            ResultItem {
+                path: r"C:\b".into(),
+                is_dir: true,
+                rtime_ft: Some(9),
+                atime_ft: Some(i64::MIN),
+                ..ResultItem::default()
+            },
+        ] {
+            round_trip(&QueryResults {
+                total: 1,
+                items: vec![item],
+                more: false,
+                volumes_incomplete: false,
+                metadata_pending: false,
+                generation: 0,
+                total_size: None,
+            });
+        }
+    }
+
     #[test]
     fn empty_page_round_trips() {
         round_trip(&QueryResults {
@@ -314,6 +473,7 @@ mod tests {
                     size: Some(9),
                     mtime_ft: None,
                     is_dir: false,
+                    ..Default::default()
                 }],
                 more: false,
                 volumes_incomplete: false,
@@ -349,6 +509,7 @@ mod tests {
                     size: Some(1234),
                     mtime_ft: Some(133_500_000_000_000_000),
                     is_dir: false,
+                    ..Default::default()
                 },
                 ResultItem {
                     path: r"D:\folder".into(),
@@ -356,6 +517,7 @@ mod tests {
                     size: None,
                     mtime_ft: None,
                     is_dir: true,
+                    ..Default::default()
                 },
                 ResultItem {
                     path: "E:\\ünïcode\\文件.txt".into(),
@@ -363,6 +525,7 @@ mod tests {
                     size: Some(0),
                     mtime_ft: Some(-1),
                     is_dir: false,
+                    ..Default::default()
                 },
             ],
             more: true,
@@ -387,6 +550,7 @@ mod tests {
             size: Some(7),
             mtime_ft: None,
             is_dir: false,
+            ..Default::default()
         };
         let page = QueryResults {
             total: 1,
@@ -412,6 +576,7 @@ mod tests {
                     size: Some(9),
                     mtime_ft: None,
                     is_dir: false,
+                    ..Default::default()
                 }],
                 more: false,
                 volumes_incomplete: false,
@@ -452,6 +617,7 @@ mod tests {
                     size: Some(55),
                     mtime_ft: Some(7),
                     is_dir: false,
+                    ..Default::default()
                 }],
                 more: false,
                 volumes_incomplete: false,

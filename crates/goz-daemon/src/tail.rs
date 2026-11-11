@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use goz_core::index::{LinkTarget, Room, VolumeIndex, WtfName};
+use goz_core::index::{Column, Columns, LinkTarget, Room, StatInfo, VolumeIndex, WtfName};
+use goz_core::layout::{QUERY_FILE_LAYOUT_INCLUDE_EXTRA_INFO, walk_layout_buffer};
 use goz_core::query::resolve_scope;
 use goz_core::types::{Frn, VolumePhase};
 use goz_core::usn::record::{
@@ -37,13 +38,13 @@ use goz_core::usn::record::{
 use goz_core::usn::{RescanReason, walk_journal_buffer};
 use goz_winfs::{
     ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE,
-    JournalInfo, VolumeHandle, read_usn_journal, stat_file,
+    JournalInfo, VolumeHandle, open_volume, query_file_layout, read_usn_journal, stat_file,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bootstrap::{self, JournalSetup};
 use crate::pulse::TailPulse;
-use crate::volume_state::VolumeState;
+use crate::volume_state::{ColumnBuild, VolumeState};
 
 /// Reason bits we ask the kernel to report: everything that changes a name,
 /// a hard link, or a file's size/timestamps.
@@ -220,11 +221,16 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
     let mut failing_since: Option<Instant> = None;
     let mut backoff = RETRY_BACKOFF_MIN;
     let mut degraded = false;
+    let mut columns = ColumnBuilder::default();
 
     while !stop.load(Ordering::Relaxed) {
         // Liveness stamp for the supervisor: as long as this loop is turning,
         // however unhealthily, no one cancels our I/O.
         pulse.beat();
+        // The optional columns follow the options: one switched off is freed
+        // at once, one switched on is built a buffer per turn, between the
+        // journal's batches, by this thread, the volume's one writer.
+        columns.step(state, crate::config::wanted_columns());
         match read_usn_journal(handle, start_usn, journal_id, REASON_MASK, 0, &mut buf) {
             Ok(bytes) => {
                 if degraded {
@@ -252,6 +258,9 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                             stop,
                         ) {
                             Some(c) => {
+                                // A rebuilt index brings its own columns; a pass over
+                                // the old one would settle the new one unfilled.
+                                columns = ColumnBuilder::default();
                                 start_usn = c.next_usn;
                                 journal_id = c.journal_id;
                                 continue;
@@ -261,9 +270,12 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                     }
                 };
                 if walk.records.is_empty() {
-                    // Caught up (or only filtered-out records): advance and idle.
+                    // Caught up (or only filtered-out records): advance and idle,
+                    // unless a column is building.
                     start_usn = walk.next_usn;
-                    std::thread::sleep(IDLE_POLL);
+                    if !columns.building() {
+                        std::thread::sleep(IDLE_POLL);
+                    }
                     continue;
                 }
                 // Apply structural changes under the write lock, then collect
@@ -324,6 +336,9 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                     stop,
                 ) {
                     Some(c) => {
+                        // A rebuilt index brings its own columns; a pass over
+                        // the old one would settle the new one unfilled.
+                        columns = ColumnBuilder::default();
                         start_usn = c.next_usn;
                         journal_id = c.journal_id;
                         failing_since = None;
@@ -355,6 +370,9 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                     stop,
                 ) {
                     Some(c) => {
+                        // A rebuilt index brings its own columns; a pass over
+                        // the old one would settle the new one unfilled.
+                        columns = ColumnBuilder::default();
                         start_usn = c.next_usn;
                         journal_id = c.journal_id;
                         failing_since = None;
@@ -397,6 +415,9 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                         stop,
                     ) {
                         Some(c) => {
+                            // A rebuilt index brings its own columns; a pass over
+                            // the old one would settle the new one unfilled.
+                            columns = ColumnBuilder::default();
                             start_usn = c.next_usn;
                             journal_id = c.journal_id;
                             failing_since = None;
@@ -426,6 +447,137 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                 sleep_unless_stopped(stop, backoff);
                 backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
             }
+        }
+    }
+}
+
+/// The build of optional columns switched on while the volume is live: a
+/// FILE_LAYOUT pass of its own, on a volume handle of its own (so the
+/// tail's handle keeps no enumeration of it), asking for the info entries
+/// alone, one buffer per turn of the tail loop, each applied under a short
+/// write lock. A column settles when its pass ends; one switched off is
+/// freed at once, its pass dropped or narrowed. The date recently changed
+/// reads nothing: it holds what the journal says from the moment it is on.
+///
+/// The pass and the journal stay in order because one thread runs both: a
+/// buffer is applied as soon as it is read, before any record after it, and
+/// a later record that changes a file sets its value again.
+#[derive(Default)]
+struct ColumnBuilder {
+    pass: Option<ColumnPass>,
+    /// Columns whose pass failed, not tried again until the options change.
+    failed: Columns,
+}
+
+struct ColumnPass {
+    columns: Columns,
+    handle: VolumeHandle,
+    restart: bool,
+    buf: Vec<u8>,
+    built: u64,
+}
+
+impl ColumnBuilder {
+    fn building(&self) -> bool {
+        self.pass.is_some()
+    }
+
+    fn step(&mut self, state: &VolumeState, want: Columns) {
+        let (have, settled) = {
+            let index = state.index.read();
+            (index.columns(), index.settled_columns())
+        };
+        if have != want {
+            let mut index = state.index.write();
+            for c in Column::ALL {
+                index.set_column(c, want.contains(c));
+            }
+            if want.contains(Column::RecentChange) {
+                index.settle_column(Column::RecentChange);
+            }
+            drop(index);
+            tracing::info!(volume = %state.mount_prefix(), columns = ?want, "optional columns switched");
+            self.failed = Columns::NONE;
+        }
+        let todo = want
+            .minus(settled)
+            .minus(self.failed)
+            .with(Column::RecentChange, false);
+        if self.pass.as_ref().is_some_and(|p| p.columns != todo) {
+            self.pass = None;
+        }
+        if todo.is_empty() {
+            self.publish(state, ColumnBuild::default());
+            return;
+        }
+        if self.pass.is_none() {
+            match open_volume(&state.guid) {
+                Ok(handle) => {
+                    self.pass = Some(ColumnPass {
+                        columns: todo,
+                        handle,
+                        restart: true,
+                        buf: vec![0u8; bootstrap::IO_BUFFER_BYTES],
+                        built: 0,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(volume = %state.mount_prefix(), error = %e, "cannot open the volume to build columns; they are read from disk");
+                    self.failed = self.failed.with_all(todo);
+                    return;
+                }
+            }
+        }
+        let Some(pass) = self.pass.as_mut() else {
+            return;
+        };
+        let flags = QUERY_FILE_LAYOUT_INCLUDE_EXTRA_INFO;
+        match query_file_layout(&pass.handle, flags, pass.restart, &mut pass.buf) {
+            Ok(Some(bytes)) => {
+                pass.restart = false;
+                match walk_layout_buffer(&pass.buf[..bytes]) {
+                    Ok(files) => {
+                        let mut index = state.index.write();
+                        for f in &files {
+                            index.fill_columns(f, pass.columns);
+                        }
+                        drop(index);
+                        pass.built += files.len() as u64;
+                        let progress = ColumnBuild {
+                            building: pass.columns,
+                            built: pass.built,
+                        };
+                        self.publish(state, progress);
+                    }
+                    Err(e) => self.fail(state, &format!("{e:?}")),
+                }
+            }
+            Ok(None) => {
+                let mut index = state.index.write();
+                for c in pass.columns.iter() {
+                    index.settle_column(c);
+                }
+                drop(index);
+                tracing::info!(volume = %state.mount_prefix(), columns = ?pass.columns, files = pass.built, "optional columns built");
+                self.pass = None;
+                self.publish(state, ColumnBuild::default());
+            }
+            Err(e) => self.fail(state, &e.to_string()),
+        }
+    }
+
+    fn fail(&mut self, state: &VolumeState, why: &str) {
+        if let Some(pass) = self.pass.take() {
+            tracing::warn!(volume = %state.mount_prefix(), columns = ?pass.columns, error = why, "building columns stopped; they are read from disk until the options change");
+            self.failed = self.failed.with_all(pass.columns);
+        }
+        self.publish(state, ColumnBuild::default());
+    }
+
+    fn publish(&self, state: &VolumeState, progress: ColumnBuild) {
+        let mut slot = state.column_build.lock();
+        if *slot != progress {
+            *slot = progress;
         }
     }
 }
@@ -677,7 +829,7 @@ fn enrich_stats(
     if frns.is_empty() {
         return;
     }
-    let mut stats: Vec<(Frn, u64, i64)> = Vec::with_capacity(frns.len());
+    let mut stats: Vec<(Frn, StatInfo)> = Vec::with_capacity(frns.len());
     for &frn in frns {
         // Same teardown escape as `reconcile_links`: a large dirty batch of
         // blocking opens must not make a healthy tail look wedged.
@@ -687,7 +839,16 @@ fn enrich_stats(
         // Per-file liveness stamp, same reason as `reconcile_links`.
         pulse.beat();
         match stat_file(handle, frn) {
-            Ok(Some(s)) => stats.push((Frn(frn), s.size, s.mtime_ft)),
+            Ok(Some(s)) => stats.push((
+                Frn(frn),
+                StatInfo {
+                    size: s.size,
+                    mtime: s.mtime_ft,
+                    ctime: s.ctime_ft,
+                    atime: s.atime_ft,
+                    attributes: s.attributes,
+                },
+            )),
             Ok(None) => {} // gone or locked: nothing to refresh
             Err(e) => {
                 tracing::debug!(volume = %state.mount_prefix(), frn, error = %e, "live stat failed")
@@ -698,8 +859,8 @@ fn enrich_stats(
         return;
     }
     let mut index = state.index.write();
-    for (frn, size, mtime) in stats {
-        index.set_stat(frn, size, mtime);
+    for (frn, stat) in stats {
+        index.set_stat_info(frn, &stat);
     }
 }
 
@@ -750,7 +911,7 @@ fn first_build(
         let _busy = pulse.busy_scope();
         *state.phase.write() = VolumePhase::Bootstrapping;
         tracing::info!(volume = %state.mount_prefix(), "indexing volume");
-        match bootstrap::build_index(handle, Some(stop)) {
+        match bootstrap::build_index(handle, Some(stop), crate::config::wanted_columns()) {
             Ok(Some(built)) => built,
             Ok(None) => return None,
             Err(e) => {
@@ -833,7 +994,7 @@ fn rescan(
 
     // Pass the stop flag so a shutdown arriving mid-rebuild aborts promptly
     // instead of blocking `TailHandle::shutdown`'s join for the full MFT scan.
-    let built = match bootstrap::build_index(handle, Some(stop)) {
+    let built = match bootstrap::build_index(handle, Some(stop), crate::config::wanted_columns()) {
         Ok(Some(built)) => built,
         // Aborted by shutdown: leave the old index in place and stop cleanly;
         // this is NOT a failure, so do not mark the volume Failed.
@@ -1102,6 +1263,7 @@ mod tests {
                 rel: b"windows".to_vec(),
                 entry: 1,
             })),
+            column_build: parking_lot::Mutex::new(Default::default()),
         }
     }
 

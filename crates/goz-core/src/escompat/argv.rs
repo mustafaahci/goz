@@ -76,6 +76,7 @@
 
 use super::Exit;
 use super::es_only::ES_ONLY_SWITCHES;
+use crate::proto::{CONFIG_KEYS, ConfigChange};
 use crate::query::{DateOrder, LocalClock, QueryError, parse_query_at};
 use crate::types::{EsColumn, SortDir, SortKey, SortSpec};
 
@@ -191,6 +192,18 @@ pub struct EsPlan {
     /// Native `--insecure-no-server-check`: skip the pipe-server owner-SID
     /// verification (dev escape hatch).
     pub insecure_no_server_check: bool,
+    /// Native `--config get` or `--config set KEY=0|1...`: read or change
+    /// gozd's index options instead of searching.
+    pub config: Option<ConfigCommand>,
+}
+
+/// What `--config` asks of gozd.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigCommand {
+    /// Print every option.
+    Get,
+    /// Change these options (an elevated administrator only).
+    Set(ConfigChange),
 }
 
 impl Default for EsPlan {
@@ -221,6 +234,7 @@ impl Default for EsPlan {
             status: false,
             server_version: false,
             insecure_no_server_check: false,
+            config: None,
         }
     }
 }
@@ -393,6 +407,9 @@ pub(super) enum SwitchAction {
     ServerVersion,
     /// `--insecure-no-server-check`: skip the pipe server's trust check.
     InsecureNoServerCheck,
+    /// Native `--config`: consume `get`, or `set` and every later token as
+    /// `KEY=0|1`.
+    Config,
     /// A help switch: stop parsing and print that screen.
     Help(HelpScreen),
     /// A version switch: stop parsing and print goz's version.
@@ -412,6 +429,7 @@ impl SwitchAction {
             SwitchAction::Export(_) => Some("FILE"),
             SwitchAction::SortParam => Some("KEY"),
             SwitchAction::SearchParam => Some("TEXT"),
+            SwitchAction::Config => Some("get|set"),
             SwitchAction::Format(_)
             | SwitchAction::Column(_)
             | SwitchAction::SortFixed(..)
@@ -833,6 +851,46 @@ pub(super) const SWITCHES: &[Switch] = &[
         quick: false,
         help: "Add a Date Modified column",
     },
+    Switch {
+        spelling: names(
+            &["dc", "date-created"],
+            &[],
+            SwitchAction::Column(EsColumn::DateCreated),
+        ),
+        group: Group::Output,
+        quick: false,
+        help: "Add a Date Created column (read from disk unless indexed)",
+    },
+    Switch {
+        spelling: names(
+            &["da", "date-accessed"],
+            &[],
+            SwitchAction::Column(EsColumn::DateAccessed),
+        ),
+        group: Group::Output,
+        quick: false,
+        help: "Add a Date Accessed column (read from disk unless indexed)",
+    },
+    Switch {
+        spelling: names(
+            &["attributes", "attribs", "attrib"],
+            &[],
+            SwitchAction::Column(EsColumn::Attributes),
+        ),
+        group: Group::Output,
+        quick: false,
+        help: "Add an Attributes column (read from disk unless indexed)",
+    },
+    Switch {
+        spelling: names(
+            &["rc", "date-recently-changed"],
+            &[],
+            SwitchAction::Column(EsColumn::DateRecentlyChanged),
+        ),
+        group: Group::Output,
+        quick: false,
+        help: "Add a Date Recently Changed column (empty unless recent changes are indexed)",
+    },
     row(
         &["utf8-bom"],
         Group::Output,
@@ -910,6 +968,13 @@ pub(super) const SWITCHES: &[Switch] = &[
         group: Group::Other,
         quick: false,
         help: "Print the version of the running gozd",
+    },
+    Switch {
+        spelling: names(&[], &["config"], SwitchAction::Config),
+        group: Group::Other,
+        quick: false,
+        help: "Print gozd's index options; set KEY=0|1 ... changes them, from an elevated \
+               prompt: index_date_created, index_attributes ... (see README)",
     },
     row(
         &["argv"],
@@ -990,6 +1055,30 @@ pub(super) const SORT_KEYS: &[SortKeyRow] = &[
         names: &["dm", "date-modified"],
         key: SortKey::DateModified,
         what: "Date modified",
+        orders: ["oldest first", "newest first"],
+    },
+    SortKeyRow {
+        names: &["dc", "date-created"],
+        key: SortKey::DateCreated,
+        what: "Date created",
+        orders: ["oldest first", "newest first"],
+    },
+    SortKeyRow {
+        names: &["da", "date-accessed"],
+        key: SortKey::DateAccessed,
+        what: "Date accessed",
+        orders: ["oldest first", "newest first"],
+    },
+    SortKeyRow {
+        names: &["attributes", "attribs", "attrib"],
+        key: SortKey::Attributes,
+        what: "Attributes",
+        orders: ["lowest first", "highest first"],
+    },
+    SortKeyRow {
+        names: &["rc", "date-recently-changed"],
+        key: SortKey::DateRecentlyChanged,
+        what: "Date recently changed",
         orders: ["oldest first", "newest first"],
     },
 ];
@@ -1175,6 +1264,8 @@ enum Token {
     /// `--`: every later token is search text.
     EndOfSwitches,
     Switch(SwitchAction),
+    /// `/a<attributes>`: these `attrib:` terms join the search.
+    Attrib(String),
 }
 
 /// Parses an argv slice (excluding `argv[0]`) into a [`Command`].
@@ -1232,7 +1323,7 @@ pub fn parse_command_line(line: &str) -> Result<Command, EsFatal> {
 #[derive(Default)]
 struct Pending {
     terms: Vec<String>,
-    filters: Vec<&'static str>,
+    filters: Vec<String>,
     match_path: bool,
     /// The search modifiers set for the whole search, each once, the last
     /// setting winning.
@@ -1255,6 +1346,7 @@ fn parse_tokens(mut tokens: impl Tokens) -> Result<Command, EsFatal> {
                     pending.terms.push(term);
                 }
             }
+            Token::Attrib(terms) => pending.filters.push(terms),
             Token::Switch(SwitchAction::Help(screen)) => return Ok(Command::Help(screen)),
             Token::Switch(SwitchAction::Version) => return Ok(Command::Version),
             Token::Switch(action) => {
@@ -1345,25 +1437,91 @@ fn classify(token: &str) -> Result<Token, EsFatal> {
             .ok_or_else(|| refuse(token, name));
     }
     if let Some(name) = token.strip_prefix('-') {
-        return match_switch(name)
-            .map(Token::Switch)
-            .ok_or_else(|| refuse(token, name));
+        if let Some(action) = match_switch(name) {
+            return Ok(Token::Switch(action));
+        }
+        return attribute_token(token, name).unwrap_or_else(|| Err(refuse(token, name)));
     }
     if let Some(name) = token.strip_prefix('/') {
         let name = name.strip_prefix('-').unwrap_or(name);
         if let Some(action) = match_switch(name) {
             return Ok(Token::Switch(action));
         }
-        if is_es_only(name) || is_attribute_filter(name) {
+        if is_es_only(name) {
             return Err(EsFatal::unsupported_switch(token));
+        }
+        if let Some(attrib) = attribute_token(token, name) {
+            return attrib;
         }
     }
     Ok(Token::SearchText)
 }
 
+/// es's `DIR`-style attribute filter, `/ah`, `/a-h`, `/ar-hs`, as `attrib:`
+/// terms (see [`attribute_terms`]); an error for one naming a letter es
+/// does not have; `None` for a name that is no attribute filter, or one es
+/// has as another switch.
+fn attribute_token(token: &str, name: &str) -> Option<Result<Token, EsFatal>> {
+    if !is_attribute_filter(name) || is_es_only(name) {
+        return None;
+    }
+    Some(
+        attribute_terms(&name[1..])
+            .map(Token::Attrib)
+            .ok_or_else(|| EsFatal::unknown_switch(token)),
+    )
+}
+
+/// The `attrib:` terms of an es attribute filter's letters: those the
+/// entry has together (`attrib:RH`), then a `!attrib:` for each one after a
+/// `-`, which it lacks. es's V is Device (0x40), which Everything's `attrib:`
+/// letters name otherwise, so it goes as its number. `None` for any other
+/// character, or a `-` naming nothing.
+pub(super) fn attribute_terms(letters: &str) -> Option<String> {
+    let mut have = String::new();
+    let mut device = false;
+    let mut lack = Vec::new();
+    let mut not = false;
+    for c in letters.chars() {
+        if c == '-' && !not {
+            not = true;
+            continue;
+        }
+        let up = c.to_ascii_uppercase();
+        if !"RHSDAVXNTLCOIEUPM".contains(up) || c == '-' {
+            return None;
+        }
+        let term = if up == 'V' {
+            "0x40".to_string()
+        } else {
+            up.to_string()
+        };
+        if not {
+            lack.push(format!("!attrib:{term}"));
+            not = false;
+        } else if up == 'V' {
+            device = true;
+        } else if !have.contains(up) {
+            have.push(up);
+        }
+    }
+    if not {
+        return None;
+    }
+    let mut terms = Vec::new();
+    if !have.is_empty() {
+        terms.push(format!("attrib:{have}"));
+    }
+    if device {
+        terms.push("attrib:0x40".to_string());
+    }
+    terms.extend(lack);
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
 /// The error for a `-` switch goz does not know.
 fn refuse(token: &str, name: &str) -> EsFatal {
-    if is_es_only(name) || is_attribute_filter(name) {
+    if is_es_only(name) {
         EsFatal::unsupported_switch(token)
     } else {
         EsFatal::unknown_switch(token)
@@ -1377,8 +1535,8 @@ fn is_es_only(name: &str) -> bool {
         .any(|canonical| switch_name_matches(name, canonical))
 }
 
-/// Whether es reads this name as an attribute filter, which goz lacks, the
-/// `DIR`-style `/ah` and `/a-h`. `/ad` and `/a-d` are switches of their own.
+/// Whether es reads this name as an attribute filter, the `DIR`-style
+/// `/ah` and `/a-h`. `/ad` and `/a-d` are switches of their own.
 fn is_attribute_filter(name: &str) -> bool {
     name.len() > 1 && name.starts_with('a')
 }
@@ -1468,7 +1626,8 @@ fn apply_switch(
         }
         SwitchAction::MatchCase(on) => plan.match_case = on,
         SwitchAction::MatchPath(on) => pending.match_path = on,
-        SwitchAction::Filter(filter) => pending.filters.push(filter),
+        SwitchAction::Filter(filter) => pending.filters.push(filter.to_string()),
+        SwitchAction::Config => plan.config = Some(take_config(tokens, token)?),
         SwitchAction::SearchParam => pending.terms.push(take_param(tokens, token)?),
         SwitchAction::SearchRest => {
             let rest = tokens.rest();
@@ -1546,6 +1705,39 @@ fn match_sort_form(input: &str, base: &str, key: SortKey) -> Option<(SortKey, Op
         return Some((key, Some(SortDir::Desc)));
     }
     None
+}
+
+/// `--config`'s parameter: `get`, or `set` and every later token as
+/// `KEY=0|1` (Everything's option names; `KEY=on|off|true|false` too).
+fn take_config(tokens: &mut impl Tokens, token: &str) -> Result<ConfigCommand, EsFatal> {
+    let what = take_param(tokens, token)?;
+    match what.as_str() {
+        "get" => Ok(ConfigCommand::Get),
+        "set" => {
+            let mut change = ConfigChange::default();
+            let mut any = false;
+            while let Some(pair) = tokens.next_token()? {
+                let bad = || {
+                    let keys = CONFIG_KEYS.join(", ");
+                    EsFatal::bad_param(token, &pair, &format!("KEY=0|1 with KEY one of {keys}"))
+                };
+                let (key, value) = pair.split_once('=').ok_or_else(bad)?;
+                let on = match value.to_ascii_lowercase().as_str() {
+                    "1" | "on" | "true" | "yes" => true,
+                    "0" | "off" | "false" | "no" => false,
+                    _ => return Err(bad()),
+                };
+                *change.slot(key).ok_or_else(bad)? = Some(on);
+                any = true;
+            }
+            if any {
+                Ok(ConfigCommand::Set(change))
+            } else {
+                Err(EsFatal::missing_param(token))
+            }
+        }
+        other => Err(EsFatal::bad_param(token, other, "get or set")),
+    }
 }
 
 /// es switch-name comparison (`es_check_param`): case-sensitive, and every
@@ -2295,8 +2487,8 @@ mod tests {
                 assert!(err.message.contains("does not support"), "{}", err.message);
             }
         }
-        // As es reads any `/a...`, an attribute filter.
-        for token in ["/ah", "/a-h", "/apple"] {
+        // An attribute filter with a letter es lacks.
+        for token in ["/ab", "-a-", "/ah-"] {
             assert_eq!(fatal(&[token]).exit_code, 6, "{token}");
         }
         // Dashes stay optional in them.
@@ -2304,6 +2496,74 @@ mod tests {
         // A slash on anything else is still search text.
         assert_eq!(plan(&["/"]).query, "/");
         assert_eq!(plan(&["/downloads"]).query, "/downloads");
+    }
+
+    /// es's attribute filters become `attrib:` terms before the search
+    /// text; the columns and sorts of the optional columns parse; and
+    /// `--config` reads `get`, or `set` and its `KEY=0|1` pairs.
+    #[test]
+    fn attribute_filters_columns_sorts_and_config() {
+        assert_eq!(plan(&["/ah"]).query, "attrib:H");
+        assert_eq!(plan(&["/a-h"]).query, "!attrib:H");
+        assert_eq!(plan(&["-arh-s", "x"]).query, "attrib:RH !attrib:S x");
+        assert_eq!(plan(&["/av", "/a-v"]).query, "attrib:0x40 !attrib:0x40");
+        assert_eq!(plan(&["/ad"]).query, "folder:", "a switch of its own");
+        assert_eq!(attribute_terms("hh"), Some("attrib:H".to_string()));
+        assert_eq!(attribute_terms(""), None);
+        assert_eq!(
+            plan(&["-dc", "-da", "-attrib", "-rc", "-dc"]).columns,
+            vec![
+                EsColumn::DateAccessed,
+                EsColumn::Attributes,
+                EsColumn::DateRecentlyChanged,
+                EsColumn::DateCreated,
+            ]
+        );
+        let spec = |key, dir| SortSpec { key, dir };
+        for (args, want) in [
+            (
+                &["-sort", "date-created"][..],
+                spec(SortKey::DateCreated, SortDir::Desc),
+            ),
+            (&["-sort", "dc"], spec(SortKey::DateCreated, SortDir::Desc)),
+            (
+                &["-sort-date-accessed-ascending"],
+                spec(SortKey::DateAccessed, SortDir::Asc),
+            ),
+            (
+                &["-sort", "attributes"],
+                spec(SortKey::Attributes, SortDir::Asc),
+            ),
+            (
+                &["-sort-rc-descending"],
+                spec(SortKey::DateRecentlyChanged, SortDir::Desc),
+            ),
+        ] {
+            assert_eq!(plan(args).sort, want, "{args:?}");
+        }
+        assert_eq!(plan(&["--config", "get"]).config, Some(ConfigCommand::Get));
+        let Some(ConfigCommand::Set(change)) = plan(&[
+            "--config",
+            "set",
+            "index_attributes=1",
+            "fast_size_sort=off",
+        ])
+        .config
+        else {
+            panic!("expected a set");
+        };
+        assert_eq!(change.index_attributes, Some(true));
+        assert_eq!(change.fast_size_sort, Some(false));
+        assert_eq!(change.index_date_created, None);
+        for bad in [
+            &["--config", "set"][..],
+            &["--config", "set", "bogus=1"],
+            &["--config", "set", "index_attributes=2"],
+            &["--config", "toggle"],
+            &["--config"],
+        ] {
+            assert_eq!(fatal(bad).exit_code, 4, "{bad:?}");
+        }
     }
 
     /// The search options es sets for the whole search become the

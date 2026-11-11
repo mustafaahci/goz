@@ -174,6 +174,7 @@ fn layout(f: Frn, parent: Frn, name: &str, is_dir: bool, rng: &mut Rng) -> Layou
             name_lossy: false,
             dos_only: false,
         }],
+        ..Default::default()
     }
 }
 

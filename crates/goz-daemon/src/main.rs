@@ -15,6 +15,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(windows)]
 mod bootstrap;
+mod config;
 #[cfg(windows)]
 mod folder_sizes;
 #[cfg(windows)]

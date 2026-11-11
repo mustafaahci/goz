@@ -113,18 +113,28 @@ fn each_row(
     date: &mut impl FnMut(i64) -> String,
     mut write: impl FnMut(&Row<'_>),
 ) {
-    let wants_date = columns.contains(&EsColumn::DateModified);
+    let wants = |c: EsColumn| columns.contains(&c);
+    let (dm, dc, da, rc) = (
+        wants(EsColumn::DateModified),
+        wants(EsColumn::DateCreated),
+        wants(EsColumn::DateAccessed),
+        wants(EsColumn::DateRecentlyChanged),
+    );
     for item in &page.items {
-        let mtime = if wants_date {
-            item.mtime_ft.map(&mut *date)
-        } else {
-            None
-        };
+        let mut fmt = |on: bool, ft: Option<i64>| if on { ft.map(&mut *date) } else { None };
+        let mtime = fmt(dm, item.mtime_ft);
+        let ctime = fmt(dc, item.ctime_ft);
+        let atime = fmt(da, item.atime_ft);
+        let rtime = fmt(rc, item.rtime_ft);
         write(&Row {
             path: &item.path,
             size: item.size,
             mtime: mtime.as_deref(),
             is_dir: item.is_dir,
+            ctime: ctime.as_deref(),
+            atime: atime.as_deref(),
+            rtime: rtime.as_deref(),
+            attrib: item.attrib,
         });
     }
 }
@@ -143,6 +153,7 @@ mod tests {
             size,
             mtime_ft,
             is_dir,
+            ..Default::default()
         }
     }
 
@@ -224,6 +235,7 @@ mod tests {
                 size,
                 mtime_ft,
                 is_dir,
+                ..Default::default()
             })
     }
 
@@ -277,6 +289,7 @@ mod tests {
                 size: it.size,
                 mtime: d.as_deref(),
                 is_dir: it.is_dir,
+                ..Default::default()
             });
             let mut expected = Vec::new();
             write_csv(&opts, rows, &mut expected);

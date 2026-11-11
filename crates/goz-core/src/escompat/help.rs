@@ -200,6 +200,18 @@ const SEARCH_TEXT: &[(&str, &str)] = &[
          dm:2024-05, dm:<30days (newer), dm:2024-01-01..2024-03-31 or \
          dm:unknown",
     ),
+    (
+        "dc:2020, da:today, rc:today",
+        "Created, accessed or recently changed then, read as dm: reads a date; \
+         read from disk unless goz --config indexes them; rc: needs \
+         index_recent_changes, as in Everything",
+    ),
+    (
+        "attrib:rh, attrib:0x200",
+        "Entries with every attribute named: A C D E H I L M N O P R S T U V X, \
+         or a number; read from disk unless indexed; es's /ah and /a-h add \
+         attrib:H and !attrib:H",
+    ),
     ("len:>40", "Names longer than 40 characters"),
     (
         r"parent:C:\src",
@@ -532,6 +544,7 @@ mod tests {
                             "FILE" => "out.csv",
                             "KEY" => "size",
                             "TEXT" => "text",
+                            "get|set" => "get",
                             other => panic!("{form}: no sample value for {other}"),
                         };
                     }

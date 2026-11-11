@@ -12,14 +12,17 @@
 // past every invariant it maintains. Not `mod`, which query::engine's tests
 // (not a descendant of `index`) would fail to reach. The `pub use` below keeps
 // the three types that are genuinely part of the index's vocabulary public.
+pub mod columns;
 pub(crate) mod store;
 pub mod volume;
 
+pub use columns::{Column, Columns};
 pub(crate) use store::NameId;
 pub use store::{ComponentBytes, EntryFlags, FrnMap, NameRef};
 pub use volume::{
     Anomaly, ApplyOutcome, CompactPlan, EntryView, FolderSizePlan, IndexMemory, IndexStats,
-    LinkTarget, NTFS_ROOT_FRN, NameMergePlan, PathStatus, Room, RoomPlan, VolumeIndex, WtfName,
+    LinkTarget, NTFS_ROOT_FRN, NameMergePlan, PathStatus, Room, RoomPlan, StatInfo, VolumeIndex,
+    WtfName,
 };
 
 #[cfg(test)]

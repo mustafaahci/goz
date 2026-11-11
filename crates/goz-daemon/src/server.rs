@@ -12,26 +12,29 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use goz_core::fold::fold;
-use goz_core::index::{PathStatus, VolumeIndex};
+use goz_core::index::columns::as_kept;
+use goz_core::index::{Column, Columns, PathStatus, VolumeIndex};
 use goz_core::proto::{
-    DaemonStatus, MemPair, PIPE_NAME, PROTO_VERSION, ProtoError, Request, Response, VolumeMemory,
-    VolumeStatus,
+    ColumnStatus, ConfigChange, DaemonStatus, ItemColumns, MemPair, PIPE_NAME, PROTO_VERSION,
+    ProtoError, Request, Response, VolumeMemory, VolumeStatus, feature, push_item_with,
 };
 use goz_core::proto::{
     MAX_CLIENT_FRAME, MAX_SERVER_FRAME, PAGE_ROWS, QueryRequest, encode_response_frame,
     patch_results_header, push_item, push_results_header,
 };
 use goz_core::query::{
-    Budget, HitRef, mtime_key, parse_query_at, resolve_scope, run_query_refs, size_key,
+    BasicInfo, Budget, DiskProps, HitRef, Stopped, column_key, disk_columns, mtime_key,
+    parse_query_at, resolve_scope, run_query_refs, run_query_refs_disk, size_key,
 };
-use goz_core::types::{EntryIdx, SortDir, SortKey, SortSpec};
-use goz_winfs::{PipeSecurity, build_pipe_security};
+use goz_core::types::{EntryIdx, Frn, SortDir, SortKey, SortSpec};
+use goz_winfs::{PipeSecurity, VolumeHint, basic_info, build_pipe_security};
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{Semaphore, watch};
 
+use crate::config::{self, ConfigStore};
 use crate::local_clock::MachineClock;
 use crate::volume_state::{VolumeRegistry, VolumeSet, VolumeState};
 
@@ -420,6 +423,18 @@ async fn handle_connection(
                     wait = WRITE_TIMEOUT;
                     continue;
                 }
+                // Only an elevated administrator changes the options: the
+                // client's token decides, read through the pipe.
+                Ok(Request::SetConfig(change)) => {
+                    use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+                    // SAFETY: `server` is a live pipe instance for the call.
+                    let pipe = unsafe { BorrowedHandle::borrow_raw(server.as_raw_handle()) };
+                    let admin = goz_winfs::pipe_client_is_elevated_admin(pipe).unwrap_or(false);
+                    let mut out = Vec::new();
+                    let reply = set_config(config::init(), &change, admin, &volumes.current());
+                    encode_response_frame(&reply, &mut out);
+                    out
+                }
                 // Hello / Status are trivial; encode inline as a tagged JSON frame.
                 Ok(req) => {
                     let mut out = Vec::new();
@@ -611,29 +626,72 @@ fn stream_query_binary(
         timing.lock_wait += waiting.elapsed();
         let matching = Instant::now();
         let budget = Budget::until(matching + search_budget, cancel);
-        let scope_entry = match scope {
-            VolScope::All => None,
-            VolScope::Rel(rel) => match resolve_scope_cached(vol, &index, rel, parsed.match_case) {
-                Some(e) => Some(e),
-                None => continue, // scope folder absent on this volume: no hits
-            },
+        let Some(scope_entry) = scope_in(vol, &index, scope, parsed.match_case) else {
+            continue; // scope folder absent on this volume: no hits
         };
+        let need = disk_columns(&index, &parsed, q.sort);
+        let mut disk = None;
         // Ordered under the lock: the comparators read folded names straight
         // from the index and allocate nothing, so a 3M-row set orders in
         // ~160 ms across cores, against ~1 s the lock used to be held while
         // every row's path was built here.
-        let outcome = run_query_refs(
-            &index,
-            vol.mount_prefix(),
-            &parsed,
-            scope_entry,
-            q.sort,
-            0,
-            per_vol_limit,
-            q.want_total_size,
-            &budget,
-        );
-        drop(index);
+        let outcome = if need.is_empty() {
+            let outcome = run_query_refs(
+                &index,
+                vol.mount_prefix(),
+                &parsed,
+                scope_entry,
+                q.sort,
+                0,
+                per_vol_limit,
+                q.want_total_size,
+                &budget,
+            );
+            drop(index);
+            outcome
+        } else {
+            // A term or the sort reads a column the index does not hold:
+            // the first search, with those terms as weak as they can be,
+            // finds the entries to read; the disk is read with the lock
+            // released; the second search gives the page.
+            let first = run_query_refs_disk(
+                &index,
+                vol.mount_prefix(),
+                &parsed,
+                scope_entry,
+                SortSpec::default(),
+                0,
+                None,
+                false,
+                &budget,
+                None,
+            );
+            drop(index);
+            match first.and_then(|first| read_disk(vol, &first.refs, &budget)) {
+                Err(stopped) => Err(stopped),
+                Ok(props) => {
+                    timing.disk_reads += props.len() as u64;
+                    let props = Arc::new(props);
+                    let index = vol.index.read();
+                    let Some(scope_entry) = scope_in(vol, &index, scope, parsed.match_case) else {
+                        continue;
+                    };
+                    disk = Some(Arc::clone(&props));
+                    run_query_refs_disk(
+                        &index,
+                        vol.mount_prefix(),
+                        &parsed,
+                        scope_entry,
+                        q.sort,
+                        0,
+                        per_vol_limit,
+                        q.want_total_size,
+                        &budget,
+                        Some(props),
+                    )
+                }
+            }
+        };
         timing.matching += matching.elapsed();
         timing.volumes += 1;
         let Ok(outcome) = outcome else {
@@ -660,10 +718,12 @@ fn stream_query_binary(
             *sum = sum.saturating_add(size);
         }
         if !outcome.refs.is_empty() {
-            runs.push(Run::new(outcome.refs));
+            runs.push(Run::new(outcome.refs, disk));
             vols.push(vol.clone());
         }
     }
+    let want_cols = q.want_ctime || q.want_atime || q.want_attrib || q.want_rtime;
+    let mut hints: Vec<Option<Option<VolumeHint>>> = Vec::new();
 
     let prefixes: Vec<&str> = vols.iter().map(|v| v.mount_prefix()).collect();
     let turn = match q.sort.key {
@@ -706,7 +766,13 @@ fn stream_query_binary(
         );
         let mut count = 0u32;
         let mut taken = 0usize;
-        while taken < page && consumed < end && out.len() < PAGE_BYTE_BUDGET {
+        // With columns asked for, the rows wait for the lock to go before
+        // they are encoded: those whose column the index does not hold are
+        // read from disk first.
+        let mut pending: Vec<PendingRow> = Vec::new();
+        let mut paths: Vec<u8> = Vec::new();
+        let mut pending_bytes = 0usize;
+        while taken < page && consumed < end && out.len() + pending_bytes < PAGE_BYTE_BUDGET {
             let Some(ri) = next_head(
                 &mut runs,
                 &guards,
@@ -738,10 +804,47 @@ fn stream_query_binary(
             }
             let size = q.want_size.then(|| entry.size()).flatten();
             let mtime = q.want_mtime.then(|| entry.mtime()).flatten();
-            push_item(&mut out, &path, entry.is_dir(), size, mtime);
+            if want_cols {
+                let (cols, need) = row_columns(index, href.idx, &q, runs[ri].disk.as_deref());
+                let start_at = paths.len();
+                paths.extend_from_slice(&path);
+                pending_bytes += path.len() + 48;
+                pending.push(PendingRow {
+                    path: start_at..paths.len(),
+                    is_dir: entry.is_dir(),
+                    size,
+                    mtime,
+                    cols,
+                    need,
+                    frn: href.frn,
+                    run: ri,
+                });
+            } else {
+                push_item(&mut out, &path, entry.is_dir(), size, mtime);
+            }
             count += 1;
         }
         drop(guards);
+        if want_cols {
+            if hints.len() < vols.len() {
+                hints.resize_with(vols.len(), || None);
+            }
+            for row in &mut pending {
+                if !row.need.is_empty() {
+                    let hint = hints[row.run]
+                        .get_or_insert_with(|| VolumeHint::open(&vols[row.run].guid).ok());
+                    fill_from_disk(row, hint.as_ref());
+                }
+                push_item_with(
+                    &mut out,
+                    &paths[row.path.clone()],
+                    row.is_dir,
+                    row.size,
+                    row.mtime,
+                    &row.cols,
+                );
+            }
+        }
         let more = consumed < end;
         patch_results_header(&mut out[header_at..], more, count);
         let payload_len = (out.len() - 4) as u32;
@@ -785,6 +888,203 @@ struct QueryTiming {
     /// Whether a volume's search ran out of its budget, or the client left
     /// while it ran.
     stopped: bool,
+    /// Files whose optional columns the searches read from disk.
+    disk_reads: u64,
+}
+
+/// A row of a page that asked for optional columns, held until the index
+/// lock is released (see [`fill_from_disk`]).
+struct PendingRow {
+    path: std::ops::Range<usize>,
+    is_dir: bool,
+    size: Option<u64>,
+    mtime: Option<i64>,
+    cols: ItemColumns,
+    /// The columns asked for that the index does not hold.
+    need: Columns,
+    frn: Frn,
+    run: usize,
+}
+
+/// The columns `q` asks of entry `idx`: those the index holds settled, or
+/// the search read from disk, and the rest still to read.
+fn row_columns(
+    index: &VolumeIndex,
+    idx: EntryIdx,
+    q: &QueryRequest,
+    disk: Option<&DiskProps>,
+) -> (ItemColumns, Columns) {
+    let entry = index.entry(idx);
+    let settled = index.settled_columns();
+    let mut cols = ItemColumns::default();
+    let mut need = Columns::NONE;
+    let mut date = |c: Column, on: bool, slot: &mut Option<i64>, from_index: Option<i64>| {
+        if !on {
+            return;
+        }
+        if settled.contains(c) {
+            *slot = from_index;
+        } else if let Some(d) = disk.and_then(|d| d.date(index, idx, c)) {
+            *slot = Some(d);
+        } else if c.on_disk() {
+            need = need.with(c, true);
+        }
+    };
+    date(
+        Column::DateCreated,
+        q.want_ctime,
+        &mut cols.ctime,
+        entry.ctime(),
+    );
+    date(
+        Column::DateAccessed,
+        q.want_atime,
+        &mut cols.atime,
+        entry.atime(),
+    );
+    date(
+        Column::RecentChange,
+        q.want_rtime,
+        &mut cols.rtime,
+        entry.rtime(),
+    );
+    if q.want_attrib {
+        if settled.contains(Column::Attributes) {
+            cols.attrib = entry.attrib();
+        } else if let Some(a) = disk.and_then(|d| d.attrib(index, idx)) {
+            cols.attrib = Some(a);
+        } else {
+            need = need.with(Column::Attributes, true);
+        }
+    }
+    (cols, need)
+}
+
+/// Reads the columns `row` still needs from disk, by its FRN; a file that
+/// cannot be read keeps `None`.
+fn fill_from_disk(row: &mut PendingRow, hint: Option<&VolumeHint>) {
+    let Some(info) = hint.and_then(|h| basic_info(h, row.frn.0)) else {
+        return;
+    };
+    let date = |ft: i64| (ft > 0).then_some(ft);
+    if row.need.contains(Column::DateCreated) {
+        row.cols.ctime = date(info.ctime_ft);
+    }
+    if row.need.contains(Column::DateAccessed) {
+        row.cols.atime = date(info.atime_ft);
+    }
+    if row.need.contains(Column::Attributes) {
+        row.cols.attrib = Some(as_kept(info.attributes, row.is_dir));
+    }
+}
+
+/// The scope entry of `scope` on `vol`: `Some(None)` for the whole volume,
+/// `None` when its folder is not on the volume.
+fn scope_in(
+    vol: &Arc<VolumeState>,
+    index: &VolumeIndex,
+    scope: &VolScope,
+    match_case: bool,
+) -> Option<Option<EntryIdx>> {
+    match scope {
+        VolScope::All => Some(None),
+        VolScope::Rel(rel) => resolve_scope_cached(vol, index, rel, match_case).map(Some),
+    }
+}
+
+/// Reads from disk, by FRN and with the index lock released, the basic
+/// information of the entries `refs` holds, for the second search of a
+/// query that needs a column the index does not hold. Stops with the
+/// budget; a file that cannot be read is left out, and reads as unknown.
+fn read_disk(vol: &VolumeState, refs: &[HitRef], budget: &Budget) -> Result<DiskProps, Stopped> {
+    let mut props = DiskProps::new();
+    let Ok(hint) = VolumeHint::open(&vol.guid) else {
+        tracing::debug!(volume = %vol.mount_prefix(), "no volume hint; columns read as unknown");
+        return Ok(props);
+    };
+    for (i, r) in refs.iter().enumerate() {
+        if i % 64 == 0 && budget.check() {
+            return Err(Stopped);
+        }
+        if let Some(b) = basic_info(&hint, r.frn.0) {
+            props.insert(
+                r.idx,
+                r.frn,
+                BasicInfo {
+                    ctime: b.ctime_ft,
+                    atime: b.atime_ft,
+                    mtime: b.mtime_ft,
+                    attributes: b.attributes,
+                },
+            );
+        }
+    }
+    Ok(props)
+}
+
+/// What this daemon supports right now, for `Hello.features`: the one place
+/// the list is built (see [`feature`]). What it understands always; then
+/// `"folder_sizes"` while folder sizes are on and every volume's totals are
+/// summed, and an `"indexed:*"` while every volume holds that column
+/// settled.
+fn features(volumes: &VolumeSet) -> Vec<String> {
+    let mut list: Vec<String> = [
+        feature::COLUMNS,
+        feature::CONFIG,
+        feature::SORT_DATE_CREATED,
+        feature::SORT_DATE_ACCESSED,
+        feature::SORT_ATTRIBUTES,
+        feature::SORT_DATE_RECENTLY_CHANGED,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    if crate::folder_sizes::settled(volumes) {
+        list.push(feature::FOLDER_SIZES.to_string());
+    }
+    // A column is indexed while every volume holds it settled.
+    for c in Column::ALL {
+        if !volumes.is_empty()
+            && volumes
+                .iter()
+                .all(|v| v.index.read().settled_columns().contains(c))
+        {
+            list.push(c.feature().to_string());
+        }
+    }
+    list
+}
+
+/// Answers `SetConfig`: refused unless the client is an elevated
+/// administrator; otherwise the options changed, written, and returned.
+fn set_config(
+    store: &ConfigStore,
+    change: &ConfigChange,
+    admin: bool,
+    volumes: &VolumeSet,
+) -> Response {
+    if !admin {
+        return Response::Error {
+            code: ProtoError::Unsupported,
+            message: "needs administrator: changing gozd's index options needs an elevated \
+                      administrator's token (run goz --config set from an elevated prompt)"
+                .into(),
+        };
+    }
+    let before = store.get();
+    match store.set(change) {
+        Ok(now) => {
+            tracing::info!(config = ?now, "index options changed");
+            if before.index_folder_size != now.index_folder_size {
+                crate::folder_sizes::set(volumes, now.index_folder_size);
+            }
+            Response::Config(now)
+        }
+        Err(e) => Response::Error {
+            code: ProtoError::Internal,
+            message: format!("the options were not changed: {e}"),
+        },
+    }
 }
 
 /// What a query asked for, as far as its log line says: not the query text,
@@ -854,6 +1154,12 @@ fn handle_request(volumes: &VolumeSet, req: Request) -> Response {
             ..
         } => hello(volumes, proto_min, proto_max),
         Request::Status => Response::Status(build_status(volumes)),
+        Request::GetConfig => Response::Config(config::current()),
+        // Needs the pipe, to read the client's token: see `handle_connection`.
+        Request::SetConfig(_) => Response::Error {
+            code: ProtoError::Unsupported,
+            message: "needs administrator".into(),
+        },
         // Queries are streamed directly to binary frames by stream_query_binary
         // and never routed through here.
         Request::Query(_) => unreachable!("Query is handled by stream_query_binary"),
@@ -883,17 +1189,6 @@ fn hello(volumes: &VolumeSet, proto_min: u16, proto_max: u16) -> Response {
     }
 }
 
-/// What this daemon supports right now, for `Hello.features`: the one place
-/// the list is built. `"folder_sizes"` while folder sizes are on and every
-/// volume's totals are summed.
-fn features(volumes: &VolumeSet) -> Vec<String> {
-    let mut features = Vec::new();
-    if crate::folder_sizes::settled(volumes) {
-        features.push("folder_sizes".to_string());
-    }
-    features
-}
-
 /// Whether every volume's index is as complete as goz can make it, via
 /// [`goz_core::types::VolumePhase::is_complete`]. The same bar
 /// [`DaemonStatus::volumes_incomplete`] applies, so `Hello.ready` and a `Status`
@@ -914,6 +1209,22 @@ fn build_status(volumes: &VolumeSet) -> DaemonStatus {
             let index = v.index.read();
             let stats = index.stats();
             let mem = index.memory();
+            let build = *v.column_build.lock();
+            let columns = index
+                .columns()
+                .iter()
+                .map(|c| ColumnStatus {
+                    column: c.option().to_string(),
+                    settled: index.settled_columns().contains(c),
+                    built: if build.building.contains(c) {
+                        build.built
+                    } else {
+                        0
+                    },
+                    of: index.len() as u64,
+                    bytes: index.column_memory(c).allocated,
+                })
+                .collect();
             let pair = |c: goz_core::index::ComponentBytes| MemPair {
                 used: c.used,
                 alloc: c.allocated,
@@ -942,6 +1253,7 @@ fn build_status(volumes: &VolumeSet) -> DaemonStatus {
                     dir_children: pair(mem.dir_children),
                     frn_map_kind: mem.frn_map_kind.to_string(),
                 }),
+                columns,
             }
         })
         .collect();
@@ -1084,10 +1396,13 @@ struct Run {
     memo: FxHashMap<EntryIdx, Option<Vec<u8>>>,
     memo_generation: u64,
     memo_bytes: usize,
+    /// What the volume's search read from disk, for a sort by a column the
+    /// index does not hold and for the page's columns.
+    disk: Option<Arc<DiskProps>>,
 }
 
 impl Run {
-    fn new(refs: Vec<HitRef>) -> Self {
+    fn new(refs: Vec<HitRef>, disk: Option<Arc<DiskProps>>) -> Self {
         Self {
             refs,
             pos: 0,
@@ -1095,6 +1410,7 @@ impl Run {
             memo: FxHashMap::default(),
             memo_generation: u64::MAX,
             memo_bytes: 0,
+            disk,
         }
     }
 
@@ -1238,6 +1554,12 @@ fn cmp_heads(
                 .as_deref()
                 .cmp(&runs[b].head_key.as_deref())
         }
+        SortKey::DateCreated
+        | SortKey::DateAccessed
+        | SortKey::Attributes
+        | SortKey::DateRecentlyChanged => column_key(ia, ha.idx, sort, runs[a].disk.as_deref())
+            .cmp(&column_key(ib, hb.idx, sort, runs[b].disk.as_deref()))
+            .then_with(by_name),
     };
     if sort.dir == SortDir::Desc {
         base.reverse()
@@ -1333,6 +1655,7 @@ mod tests {
             journal_max_bytes: RwLock::new(None),
             indexed: AtomicBool::new(true),
             scope_cache: Mutex::new(None),
+            column_build: Mutex::new(Default::default()),
         })
     }
 
@@ -1586,6 +1909,7 @@ mod tests {
             want_mtime: true,
             match_case: false,
             want_total_size: false,
+            ..Default::default()
         }
     }
 
@@ -2376,7 +2700,7 @@ mod tests {
                     false,
                     &goz_core::query::Budget::unlimited(),
                 );
-                Run::new(out.unwrap().refs)
+                Run::new(out.unwrap().refs, None)
             })
             .collect();
         let guards: Vec<IndexGuard<'_>> = vols.iter().map(|v| v.index.read()).collect();
@@ -2572,6 +2896,138 @@ mod tests {
         rec
     }
 
+    /// The features the protocol names, listed by one function: what this
+    /// daemon understands always, and `indexed:*` while every volume holds
+    /// the column settled.
+    #[test]
+    fn hello_lists_the_columns_config_sorts_and_indexed_ones() {
+        use goz_core::index::Column;
+        let mut index = windows_index();
+        index.set_column(Column::Attributes, true);
+        index.settle_column(Column::Attributes);
+        index.set_column(Column::DateCreated, true);
+        let vols: VolumeSet = Arc::new(vec![volume(r"C:\", index, VolumePhase::Live)]);
+        let Response::Hello { features, .. } = handle_request(&vols, hello_request(1, 1)) else {
+            panic!("expected Hello");
+        };
+        for want in [
+            "columns",
+            "config",
+            "sort:date_created",
+            "sort:date_accessed",
+            "sort:attributes",
+            "sort:date_recently_changed",
+            "indexed:attributes",
+        ] {
+            assert!(features.iter().any(|f| f == want), "{want}: {features:?}");
+        }
+        assert!(
+            !features.iter().any(|f| f == "indexed:date_created"),
+            "a column still building is not indexed: {features:?}"
+        );
+        // A second volume without the column takes the feature away.
+        let vols: VolumeSet = Arc::new(vec![
+            vols[0].clone(),
+            volume(r"D:\", windows_index(), VolumePhase::Live),
+        ]);
+        let Response::Hello { features, .. } = handle_request(&vols, hello_request(1, 1)) else {
+            panic!("expected Hello");
+        };
+        assert!(!features.iter().any(|f| f.starts_with("indexed:")));
+        // Status reports the columns that are on.
+        let Response::Status(status) = handle_request(&vols, Request::Status) else {
+            panic!("expected Status");
+        };
+        let cols: Vec<(&str, bool)> = status.volumes[0]
+            .columns
+            .iter()
+            .map(|c| (c.column.as_str(), c.settled))
+            .collect();
+        assert_eq!(
+            cols,
+            [("index_date_created", false), ("index_attributes", true)]
+        );
+        assert!(status.volumes[1].columns.is_empty());
+    }
+
+    /// Only an elevated administrator changes the options; GetConfig reads
+    /// them, Everything's defaults in a daemon that never loaded a file.
+    #[test]
+    fn set_config_needs_an_administrator() {
+        use crate::config::ConfigStore;
+        use crate::server::set_config;
+        use goz_core::proto::{ConfigChange, IndexConfig};
+        let store = ConfigStore::load(None);
+        let change = ConfigChange {
+            index_date_created: Some(true),
+            ..ConfigChange::default()
+        };
+        let vols: VolumeSet = Arc::new(vec![live_volume(r"C:\")]);
+        match set_config(&store, &change, false, &vols) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ProtoError::Unsupported);
+                assert!(message.starts_with("needs administrator"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(store.get(), IndexConfig::default(), "nothing changed");
+        match set_config(&store, &change, true, &vols) {
+            Response::Config(now) => assert!(now.index_date_created),
+            other => panic!("expected Config, got {other:?}"),
+        }
+        assert_eq!(
+            handle_request(&vols, Request::GetConfig),
+            Response::Config(IndexConfig::default())
+        );
+        assert!(matches!(
+            handle_request(&vols, Request::SetConfig(change)),
+            Response::Error { .. }
+        ));
+    }
+
+    /// A page carries the columns asked for, each only when asked: an
+    /// indexed one from the index, under the lock; one the index does not
+    /// hold from disk, after it, which on a volume that cannot be opened
+    /// (this test's) reads as unknown. A query on such a column finds every
+    /// value unknown.
+    #[test]
+    fn a_page_carries_the_columns_asked_for() {
+        use goz_core::index::{Column, StatInfo};
+        let mut index = windows_index();
+        index.insert_enum(&file_record(200, 101, "a.log"));
+        index.set_column(Column::Attributes, true);
+        index.settle_column(Column::Attributes);
+        index.set_stat_info(
+            Frn(200),
+            &StatInfo {
+                size: 5,
+                mtime: 7,
+                ctime: 3,
+                atime: 4,
+                attributes: 0x23,
+            },
+        );
+        let vols: VolumeSet = Arc::new(vec![volume(r"C:\", index, VolumePhase::Live)]);
+        let mut q = query("a.log");
+        q.want_attrib = true;
+        q.want_ctime = true;
+        q.want_rtime = true;
+        let pages = results(&encode_query_binary(&vols, q));
+        let item = &pages[0].items[0];
+        assert_eq!(item.attrib, Some(0x23));
+        assert_eq!(item.ctime_ft, None, "not indexed, and no disk to read");
+        assert_eq!(item.rtime_ft, None);
+        let plain = results(&encode_query_binary(&vols, query("a.log")));
+        assert_eq!(plain[0].items[0].attrib, None, "not asked for");
+        let total = |q: &str| results(&encode_query_binary(&vols, query(q)))[0].total;
+        assert_eq!(total("a.log dc:2020"), 0);
+        assert_eq!(total("a.log !dc:2020"), 1);
+        // 0x23: read-only, hidden, archive; not system.
+        assert_eq!(total("a.log attrib:rha"), 1);
+        assert_eq!(total("a.log attrib:rs"), 0);
+        assert_eq!(total("a.log !attrib:s"), 1);
+    }
+
     fn delete_record(frn: u64) -> ParsedUsnRecord {
         let mut rec = file_record(frn, NTFS_ROOT_FRN.0, "");
         rec.reason = goz_core::usn::record::USN_REASON_FILE_DELETE;
@@ -2641,7 +3097,11 @@ mod tests {
             other => panic!("must negotiate, got {other:?}"),
         };
         let vols = set(&[volume(r"C:\", summed(), VolumePhase::Live)]);
-        assert_eq!(features(&vols), ["folder_sizes"]);
+        assert!(
+            features(&vols)
+                .iter()
+                .any(|f| f == goz_core::proto::feature::FOLDER_SIZES)
+        );
         let rows = |q: &str| -> Vec<(String, Option<u64>)> {
             results(&encode_query_binary(&vols, query(q)))
                 .into_iter()
@@ -2672,7 +3132,9 @@ mod tests {
             volume(r"D:\", sized_index(), VolumePhase::Live),
         ]);
         assert!(
-            features(&unsummed).is_empty(),
+            !features(&unsummed)
+                .iter()
+                .any(|f| f == goz_core::proto::feature::FOLDER_SIZES),
             "not while a volume lacks them"
         );
     }

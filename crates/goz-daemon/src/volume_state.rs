@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use goz_core::index::{FrnMap, NTFS_ROOT_FRN, VolumeIndex};
+use goz_core::index::{Columns, FrnMap, NTFS_ROOT_FRN, VolumeIndex};
 use goz_core::types::{EntryIdx, VolumePhase};
 use parking_lot::{Mutex, RwLock};
 
@@ -46,6 +46,18 @@ pub(crate) struct VolumeState {
     pub indexed: AtomicBool,
     /// Memoized `-path` scope resolution (case-insensitive queries only).
     pub scope_cache: Mutex<Option<ScopeCache>>,
+    /// How the background build of optional columns switched on while the
+    /// volume is live stands, for `--status`.
+    pub column_build: Mutex<ColumnBuild>,
+}
+
+/// A background build of optional columns (see `tail::ColumnBuilder`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ColumnBuild {
+    /// The columns the pass running fills; none while none runs.
+    pub building: Columns,
+    /// Files the pass has filled in so far.
+    pub built: u64,
 }
 
 impl VolumeState {
@@ -62,6 +74,7 @@ impl VolumeState {
             journal_max_bytes: RwLock::new(None),
             indexed: AtomicBool::new(false),
             scope_cache: Mutex::new(None),
+            column_build: Mutex::new(ColumnBuild::default()),
         }
     }
 

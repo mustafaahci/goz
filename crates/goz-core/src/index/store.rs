@@ -13,6 +13,7 @@
 //! lazily repaired: a stale singly-linked chain can cycle through reused slots,
 //! and an exact chain needs no per-candidate staleness guard at query time.
 
+use super::columns::{ATTRIB_UNKNOWN, Column, Columns, DATE_UNKNOWN};
 use crate::types::{EntryIdx, Frn, NIL};
 use rustc_hash::FxHashMap;
 
@@ -1098,6 +1099,14 @@ pub(crate) struct EntryTable {
     /// cycle through reused slots).
     next_child: Vec<EntryIdx>,
     prev_child: Vec<EntryIdx>,
+    /// The optional columns (see [`super::columns`]): empty, holding no
+    /// memory, while off; one value per slot while on.
+    ctime: Vec<i64>,
+    atime: Vec<i64>,
+    rtime: Vec<i64>,
+    attrib: Vec<u16>,
+    /// Which of them are on.
+    columns: Columns,
     free: Vec<EntryIdx>,
     live: usize,
     /// Set once the columns are trimmed for a live index (see
@@ -1108,43 +1117,59 @@ pub(crate) struct EntryTable {
 
 /// Generates, over the entry columns: [`EntryRoom`] and the
 /// `EntryTable` methods that reserve, grow off the lock, install and
-/// measure every column alike.
+/// measure every column alike. The optional columns after the `;` take
+/// part only while they are on: off, they hold no memory and get none.
 macro_rules! entry_columns {
-    ($($col:ident: $ty:ty),* $(,)?) => {
+    ($($col:ident: $ty:ty),* ; $($opt:ident: $oty:ty = $c:expr),* $(,)?) => {
         /// Grown copies of the entry columns (see [`EntryTable::plan_room`]);
         /// `None` where a column has the room. After an install it holds
         /// the old columns.
         pub(crate) struct EntryRoom {
             $($col: Option<Vec<$ty>>,)*
+            $($opt: Option<Vec<$oty>>,)*
         }
 
         impl EntryRoom {
             fn grows(&self) -> bool {
-                false $(|| self.$col.is_some())*
+                false $(|| self.$col.is_some())* $(|| self.$opt.is_some())*
             }
         }
 
         impl EntryTable {
             fn reserve_columns(&mut self, slots: usize) {
                 $(self.$col.reserve_exact(slots.saturating_sub(self.$col.len()));)*
+                $(if self.columns.contains($c) {
+                    self.$opt.reserve_exact(slots.saturating_sub(self.$opt.len()));
+                })*
             }
 
             fn plan_columns(&self, more: usize) -> EntryRoom {
                 EntryRoom {
                     $($col: grown(&self.$col, more),)*
+                    $($opt: if self.columns.contains($c) {
+                        grown(&self.$opt, more)
+                    } else {
+                        None
+                    },)*
                 }
             }
 
             fn install_columns(&mut self, room: &mut EntryRoom) {
                 $(swap_grown(&mut self.$col, &mut room.$col);)*
+                $(swap_grown(&mut self.$opt, &mut room.$opt);)*
             }
 
-            /// Every column's bytes, by name, for a detailed breakdown.
+            /// Every column's bytes, by name, for a detailed breakdown;
+            /// an optional column only while it is on.
             pub(crate) fn columns_mem(&self) -> Vec<(&'static str, ComponentBytes)> {
-                vec![
+                let mut parts = vec![
                     $((stringify!($col), ComponentBytes::of_vec(&self.$col)),)*
-                    ("free", ComponentBytes::of_vec(&self.free)),
-                ]
+                ];
+                $(if self.columns.contains($c) {
+                    parts.push((stringify!($opt), ComponentBytes::of_vec(&self.$opt)));
+                })*
+                parts.push(("free", ComponentBytes::of_vec(&self.free)));
+                parts
             }
         }
     };
@@ -1162,7 +1187,11 @@ entry_columns! {
     prev_same: EntryIdx,
     first_child: EntryIdx,
     next_child: EntryIdx,
-    prev_child: EntryIdx,
+    prev_child: EntryIdx;
+    ctime: i64 = Column::DateCreated,
+    atime: i64 = Column::DateAccessed,
+    rtime: i64 = Column::RecentChange,
+    attrib: u16 = Column::Attributes,
 }
 
 impl EntryTable {
@@ -1239,6 +1268,7 @@ impl EntryTable {
             self.first_child[i] = NIL;
             self.next_child[i] = NIL;
             self.prev_child[i] = NIL;
+            self.reset_columns(i);
             idx
         } else {
             if self.settled {
@@ -1257,7 +1287,117 @@ impl EntryTable {
             self.first_child.push(NIL);
             self.next_child.push(NIL);
             self.prev_child.push(NIL);
+            self.push_columns();
             idx
+        }
+    }
+
+    /// Unknown in each column that is on, for a reused slot.
+    fn reset_columns(&mut self, i: usize) {
+        if self.columns.is_empty() {
+            return;
+        }
+        if let Some(v) = self.ctime.get_mut(i) {
+            *v = DATE_UNKNOWN;
+        }
+        if let Some(v) = self.atime.get_mut(i) {
+            *v = DATE_UNKNOWN;
+        }
+        if let Some(v) = self.rtime.get_mut(i) {
+            *v = DATE_UNKNOWN;
+        }
+        if let Some(v) = self.attrib.get_mut(i) {
+            *v = ATTRIB_UNKNOWN;
+        }
+    }
+
+    /// Unknown in each column that is on, for a new slot.
+    fn push_columns(&mut self) {
+        if self.columns.is_empty() {
+            return;
+        }
+        let settled = self.settled;
+        for c in self.columns.iter() {
+            match c {
+                Column::DateCreated => push_settled(&mut self.ctime, DATE_UNKNOWN, settled),
+                Column::DateAccessed => push_settled(&mut self.atime, DATE_UNKNOWN, settled),
+                Column::RecentChange => push_settled(&mut self.rtime, DATE_UNKNOWN, settled),
+                Column::Attributes => push_settled(&mut self.attrib, ATTRIB_UNKNOWN, settled),
+            }
+        }
+    }
+
+    /// The optional columns that are on.
+    pub(crate) fn columns(&self) -> Columns {
+        self.columns
+    }
+
+    /// Switches column `c` on, every slot unknown, or off, freeing it.
+    pub(crate) fn set_column(&mut self, c: Column, on: bool) {
+        if self.columns.contains(c) == on {
+            return;
+        }
+        self.columns = self.columns.with(c, on);
+        let n = if on { self.frn.len() } else { 0 };
+        match c {
+            Column::DateCreated => self.ctime = sized(n, DATE_UNKNOWN),
+            Column::DateAccessed => self.atime = sized(n, DATE_UNKNOWN),
+            Column::RecentChange => self.rtime = sized(n, DATE_UNKNOWN),
+            Column::Attributes => self.attrib = sized(n, ATTRIB_UNKNOWN),
+        }
+    }
+
+    /// A date column's value at `idx` (a FILETIME, or unknown); unknown
+    /// while the column is off.
+    #[inline]
+    pub(crate) fn date(&self, c: Column, idx: EntryIdx) -> i64 {
+        let col = match c {
+            Column::DateCreated => &self.ctime,
+            Column::DateAccessed => &self.atime,
+            Column::RecentChange => &self.rtime,
+            Column::Attributes => return DATE_UNKNOWN,
+        };
+        col.get(idx as usize).copied().unwrap_or(DATE_UNKNOWN)
+    }
+
+    /// The attributes column's value at `idx`; unknown while it is off.
+    #[inline]
+    pub(crate) fn packed_attrib(&self, idx: EntryIdx) -> u16 {
+        self.attrib
+            .get(idx as usize)
+            .copied()
+            .unwrap_or(ATTRIB_UNKNOWN)
+    }
+
+    /// Sets a date column at `idx`, when it is on.
+    #[inline]
+    pub(crate) fn set_date(&mut self, c: Column, idx: EntryIdx, date: i64) {
+        let col = match c {
+            Column::DateCreated => &mut self.ctime,
+            Column::DateAccessed => &mut self.atime,
+            Column::RecentChange => &mut self.rtime,
+            Column::Attributes => return,
+        };
+        if let Some(v) = col.get_mut(idx as usize) {
+            *v = date;
+        }
+    }
+
+    /// Sets the attributes column at `idx`, when it is on.
+    #[inline]
+    pub(crate) fn set_packed_attrib(&mut self, idx: EntryIdx, packed: u16) {
+        if let Some(v) = self.attrib.get_mut(idx as usize) {
+            *v = packed;
+        }
+    }
+
+    /// The heap bytes of column `c`.
+    pub(crate) fn column_memory(&self, c: Column) -> ComponentBytes {
+        match c {
+            Column::DateCreated => ComponentBytes::of_vec(&self.ctime),
+            Column::DateAccessed => ComponentBytes::of_vec(&self.atime),
+            Column::RecentChange => ComponentBytes::of_vec(&self.rtime),
+            Column::Attributes => ComponentBytes::of_vec(&self.attrib),
         }
     }
 
@@ -1413,6 +1553,10 @@ impl EntryTable {
             + ComponentBytes::of_vec(&self.first_child)
             + ComponentBytes::of_vec(&self.next_child)
             + ComponentBytes::of_vec(&self.prev_child)
+            + ComponentBytes::of_vec(&self.ctime)
+            + ComponentBytes::of_vec(&self.atime)
+            + ComponentBytes::of_vec(&self.rtime)
+            + ComponentBytes::of_vec(&self.attrib)
             + ComponentBytes::of_vec(&self.free)
     }
 
@@ -1451,6 +1595,10 @@ impl EntryTable {
         shrink_vec(&mut self.first_child);
         shrink_vec(&mut self.next_child);
         shrink_vec(&mut self.prev_child);
+        shrink_vec(&mut self.ctime);
+        shrink_vec(&mut self.atime);
+        shrink_vec(&mut self.rtime);
+        shrink_vec(&mut self.attrib);
         shrink_vec(&mut self.free);
     }
 }
@@ -1460,6 +1608,20 @@ pub(crate) enum FrnRoom {
     Dense(Vec<EntryIdx>),
     /// The map's length when planned, and the grown map.
     Sparse(usize, FxHashMap<u64, EntryIdx>),
+}
+
+/// A column of `n` copies of `fill`, or an empty one holding no memory.
+fn sized<T: Clone>(n: usize, fill: T) -> Vec<T> {
+    if n == 0 { Vec::new() } else { vec![fill; n] }
+}
+
+/// Appends `v` to an optional column, which grows by a sixteenth once the
+/// index has settled, as the other columns do (see [`room_for`]).
+fn push_settled<T>(col: &mut Vec<T>, v: T, settled: bool) {
+    if settled {
+        room_for(col, 1);
+    }
+    col.push(v);
 }
 
 /// How many records past twice its length a dense [`FrnMap`] still grows to
