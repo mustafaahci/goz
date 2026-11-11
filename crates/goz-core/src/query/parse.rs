@@ -34,14 +34,20 @@
 //! `extension:`, `size:`, `dm:`, the lengths (`len:`, ...), `parent:`,
 //! `ancestor:`, and the parts of a full path (`name:`, `stem:`,
 //! `full-path:`, `location:`, `parent-name:`), the counts (`parent-count:`,
-//! `child-count:` ...), and the sub-searches of other entries' names
-//! (`child:`, `descendant:`, `sibling:`, `ancestor-name:`, whose value is a
-//! term on those names, modifiers and all); a function's value may be a
+//! `child-count:`, `descendant-count:`, `sibling-count:` ...), the
+//! sub-searches of other entries' names (`child:`, `descendant:`,
+//! `sibling:`, `ancestor-name:`, `parent-child:`, `parent-sibling:`,
+//! `ancestor-child:`, `ancestor-sibling:`, whose value is a term on those
+//! names, modifiers and all), and the tests of a folder's entries' sizes
+//! and dates (`child-file-size:`, `child-date-modified:`,
+//! `total-child-size:`); a function's value may be a
 //! `;` list (any one matches) or a group (`ext:<pdf|txt>`). The macros
 //! `audio:`, `zip:`, `doc:`, `exe:`, `image:` (`pic:`) and `video:` keep
 //! the files of Everything's own filters. `case:` and `matchpath:` with no
 //! text switch the whole query. An unknown `func:` is refused: as text it
-//! could match nothing, since no name contains `:`.
+//! could match nothing, since no name contains `:`; so are Everything's
+//! functions that need what goz does not index (`child-size:`, which
+//! compares folder sizes), and its `$name:` substitutions.
 //!
 //! The parser builds an [`Expr`]; the lowering in the `expr` module then
 //! moves the top-level terms the buckets of [`ParsedQuery`] hold into them,
@@ -80,6 +86,11 @@ pub struct SizeRange {
 impl SizeRange {
     pub fn contains(self, n: u64) -> bool {
         self.min <= n && n <= self.max
+    }
+
+    /// Whether every number is in range.
+    pub fn is_any(self) -> bool {
+        self.min == 0 && self.max == u64::MAX
     }
 }
 
@@ -145,13 +156,22 @@ pub enum QueryError {
         "unknown search function or modifier '{0}'; goz supports ext:, extension:, size:, dm:, \
          len:, parent:, ancestor:, name:, stem:, full-path:, location:, parent-name:, \
          parent-count:, child-count:, child-file-count:, child-folder-count:, empty:, child:, \
-         descendant:, sibling: (each with -file: and -folder: forms), ancestor-name:, the macros \
-         audio:, zip:, doc:, exe:, image: and video:, and the modifiers case:, diacritics:, \
-         regex:, path:, file:, folder:, ww:, prefix:, suffix:, whole:, startwith:, endwith:, \
-         nopunc:, nows:, starall:, nowildcards: and metric: (each with Everything's aliases and \
-         no- forms), and matchpath:"
+         descendant:, sibling:, parent-child:, parent-sibling:, ancestor-child:, \
+         ancestor-sibling: (each with -file: and -folder: forms), ancestor-name:, \
+         descendant-count:, sibling-count: (each with -file- and -folder- forms), \
+         child-file-size:, child-date-modified: (with -file- and -folder- forms), \
+         total-child-size:, the macros audio:, zip:, doc:, exe:, image: and video:, and the \
+         modifiers case:, diacritics:, regex:, path:, file:, folder:, ww:, prefix:, suffix:, \
+         whole:, startwith:, endwith:, nopunc:, nows:, starall:, nowildcards: and metric: (each \
+         with Everything's aliases and no- forms), and matchpath:"
     )]
     UnknownFunction(String),
+    /// A function Everything defines that needs what goz's index does not
+    /// hold (`child-size:`, which compares folder sizes), or a `$name:`
+    /// substitution: what was written, and why goz cannot answer it
+    /// exactly.
+    #[error("{what} is not supported: {why}")]
+    Unsupported { what: String, why: &'static str },
     /// A `dm:` term in a query parsed without a [`LocalClock`] to resolve it.
     #[error("dm: needs a clock to resolve dates against, and this query was parsed without one")]
     NoClock,
@@ -197,10 +217,12 @@ const MAX_QUERY_TERMS: usize = 256;
 /// the `pattern` module): 8 keep a hostile query's memory to tens of MiB.
 const MAX_REGEX_TERMS: usize = 8;
 
-/// The most sub-searches (`child:`, `descendant:`, `sibling:`,
-/// `ancestor-name:`, a `;` list being one) one query may hold. Each is a
-/// pass over the names and a set of the volume's entries, a bit each, made
-/// before the search: 8 keep a hostile query's to a few MB.
+/// The most functions of related entries worked out before the search one
+/// query may hold: the sub-searches (`child:`, `descendant:`, `sibling:`,
+/// `parent-sibling:`, `ancestor-child:` ..., a `;` list being one), the
+/// child size and date tests, and the descendant and sibling counts. Each
+/// is a pass over the names or the entries, and one or two sets of the
+/// volume's entries, a bit each: 8 keep a hostile query's to a few MB.
 const MAX_RELATED_TERMS: usize = 8;
 
 /// How deep groups and prefixes may nest. Each level is a frame of the
@@ -300,8 +322,10 @@ fn parse(
         return Err(QueryError::Malformed {
             what: "sub-search",
             detail: format!(
-                "the query has {related} child:, descendant:, sibling: and ancestor-name: terms; \
-                 a query may have at most {MAX_RELATED_TERMS}"
+                "the query has {related} terms on related entries (child:, descendant:, \
+                 sibling:, ancestor-name:, parent-child:, parent-sibling:, ancestor-child:, \
+                 ancestor-sibling:, child-file-size:, child-date-modified:, descendant-count:, \
+                 sibling-count: and their forms); a query may have at most {MAX_RELATED_TERMS}"
             ),
         });
     }
@@ -639,6 +663,15 @@ impl<'t> Parser<'t, '_> {
         literal_wild: bool,
         set: ModSet,
     ) -> Result<Expr, QueryError> {
+        if let Some(name) = substitution(bytes) {
+            return Err(QueryError::Unsupported {
+                what: format!("the substitution {name}"),
+                why: "Everything replaces it with a value of each entry it tests (its own \
+                      $stem:, $name: ..., or a regex: capture, $1:), so the term differs \
+                      from entry to entry, which is no rewrite of the query; goz runs one \
+                      term over every entry",
+            });
+        }
         let case = set.case.unwrap_or(self.match_case);
         if set.regex == Some(true) {
             let target = target.unwrap_or_else(|| {
@@ -744,6 +777,9 @@ impl<'t> Parser<'t, '_> {
         } else if related_of(func).is_some() {
             // A list is one sub-search, of any of its values.
             self.related(func, text.items(), text.literal_wild, set)?
+        } else if child_prop_kind(func).is_some() {
+            // A list is one test of the children, of any of its values.
+            self.child_props(func, text.items(), set)?
         } else {
             let mut items = Vec::new();
             for item in text.items() {
@@ -797,8 +833,24 @@ impl<'t> Parser<'t, '_> {
             | Func::Sibling
             | Func::SiblingFile
             | Func::SiblingFolder
-            | Func::AncestorName => {
+            | Func::AncestorName
+            | Func::ParentChild
+            | Func::ParentChildFile
+            | Func::ParentChildFolder
+            | Func::ParentSibling
+            | Func::ParentSiblingFile
+            | Func::ParentSiblingFolder
+            | Func::AncestorChild
+            | Func::AncestorChildFile
+            | Func::AncestorChildFolder
+            | Func::AncestorSibling
+            | Func::AncestorSiblingFile
+            | Func::AncestorSiblingFolder => {
                 return self.related(func, std::iter::once(item), literal_wild, set);
+            }
+            // `value` reads these lists whole too.
+            Func::ChildFileSize | Func::ChildDate | Func::ChildFileDate | Func::ChildFolderDate => {
+                return self.child_props(func, std::iter::once(item), set);
             }
             Func::Date => {
                 // A value's own `!` negates it, here as before the list.
@@ -822,13 +874,27 @@ impl<'t> Parser<'t, '_> {
             | Func::ParentCount
             | Func::ChildCount
             | Func::ChildFileCount
-            | Func::ChildFolderCount => {
+            | Func::ChildFolderCount
+            | Func::DescendantCount
+            | Func::DescendantFileCount
+            | Func::DescendantFolderCount
+            | Func::SiblingCount
+            | Func::SiblingFileCount
+            | Func::SiblingFolderCount
+            | Func::TotalChildSize => {
                 let (nots, item) = bangs(item);
                 let s = String::from_utf8_lossy(item);
                 let leaf = if func == Func::Size {
                     match value::number(&s, what, true, set.metric == Some(true))? {
                         Number::Range(range) => Expr::Leaf(Leaf::Size(range)),
                         Number::Unknown => Expr::Leaf(Leaf::SizeUnknown),
+                    }
+                } else if func == Func::TotalChildSize {
+                    match value::number(&s, what, true, set.metric == Some(true))? {
+                        Number::Range(range) => Expr::Leaf(Leaf::TotalChildSize(range)),
+                        // A file of unknown size leaves its folder's total
+                        // unknown, which no value names.
+                        Number::Unknown => Expr::False,
                     }
                 } else if let Some(of) = count_of(func) {
                     match value::number(&s, what, false, false)? {
@@ -892,8 +958,61 @@ impl Parser<'_, '_> {
         Ok(Expr::Leaf(Leaf::Related {
             relation,
             kind,
-            name: Box::new(expr::simplify(name)),
+            term: Box::new(expr::simplify(name)),
         }))
+    }
+
+    /// `child-file-size:` and `child-date-modified:` (and its `-file-` and
+    /// `-folder-` forms): a folder holding an entry, of the function's kind,
+    /// whose size or date modified one of `values` names (a size or a date,
+    /// as `size:` and `dm:` read them). A value's own `!` keeps the folders
+    /// that hold no such entry, as a live Everything 1.5 answers
+    /// `child-file-size:!0` (W8): only a folder holds entries, so the NOT
+    /// stays among the folders, as `child-count:!2`'s does.
+    fn child_props<'v>(
+        &self,
+        func: Func,
+        values: impl Iterator<Item = &'v [u8]>,
+        set: ModSet,
+    ) -> Result<Expr, QueryError> {
+        let kind = child_prop_kind(func).unwrap_or(None);
+        let what = func.spelling();
+        let held = |term: Expr| {
+            Expr::Leaf(Leaf::Related {
+                relation: Relation::Child,
+                kind,
+                term: Box::new(term),
+            })
+        };
+        let mut any = Expr::False;
+        let mut negated = Vec::new();
+        for item in values {
+            let (nots, item) = bangs(item);
+            let s = String::from_utf8_lossy(item);
+            let leaf = if func == Func::ChildFileSize {
+                match value::number(&s, what, true, set.metric == Some(true))? {
+                    Number::Range(range) => Leaf::Size(range),
+                    Number::Unknown => Leaf::SizeUnknown,
+                }
+            } else {
+                Leaf::Date(date_filter(&s, self.clock.ok_or(QueryError::NoClock)?)?)
+            };
+            if nots % 2 == 1 {
+                negated.push(not_value(func, held(Expr::Leaf(leaf))));
+            } else {
+                any = Expr::or(any, Expr::Leaf(leaf));
+            }
+        }
+        let any = expr::simplify(any);
+        let mut e = if any == Expr::False {
+            Expr::False
+        } else {
+            held(any)
+        };
+        for n in negated {
+            e = Expr::or(e, n);
+        }
+        Ok(expr::simplify(e))
     }
 }
 
@@ -910,6 +1029,29 @@ fn related_of(func: Func) -> Option<(Relation, Option<Kind>)> {
         Func::SiblingFile => (Relation::Sibling, Some(Kind::File)),
         Func::SiblingFolder => (Relation::Sibling, Some(Kind::Folder)),
         Func::AncestorName => (Relation::Ancestor, Some(Kind::Folder)),
+        Func::ParentChild => (Relation::ParentChild, None),
+        Func::ParentChildFile => (Relation::ParentChild, Some(Kind::File)),
+        Func::ParentChildFolder => (Relation::ParentChild, Some(Kind::Folder)),
+        Func::ParentSibling => (Relation::ParentSibling, None),
+        Func::ParentSiblingFile => (Relation::ParentSibling, Some(Kind::File)),
+        Func::ParentSiblingFolder => (Relation::ParentSibling, Some(Kind::Folder)),
+        Func::AncestorChild => (Relation::AncestorChild, None),
+        Func::AncestorChildFile => (Relation::AncestorChild, Some(Kind::File)),
+        Func::AncestorChildFolder => (Relation::AncestorChild, Some(Kind::Folder)),
+        Func::AncestorSibling => (Relation::AncestorSibling, None),
+        Func::AncestorSiblingFile => (Relation::AncestorSibling, Some(Kind::File)),
+        Func::AncestorSiblingFolder => (Relation::AncestorSibling, Some(Kind::Folder)),
+        _ => return None,
+    })
+}
+
+/// The kind of the entries a child size or date function tests (`None`:
+/// files and folders); `None` for any other function.
+fn child_prop_kind(func: Func) -> Option<Option<Kind>> {
+    Some(match func {
+        Func::ChildFileSize | Func::ChildFileDate => Some(Kind::File),
+        Func::ChildDate => None,
+        Func::ChildFolderDate => Some(Kind::Folder),
         _ => return None,
     })
 }
@@ -938,13 +1080,24 @@ fn not_value(func: Func, e: Expr) -> Expr {
             range: any,
         }),
         // Only a folder has children to count (`child-count:!2` keeps no
-        // file, while `!child-count:2` keeps them all, as in Everything).
-        Func::ChildCount | Func::ChildFileCount | Func::ChildFolderCount => {
-            Expr::Leaf(Leaf::Count {
-                of: count_of(func).unwrap_or(CountOf::Children),
-                range: any,
-            })
+        // file, while `!child-count:2` keeps them all, as in Everything),
+        // and descendants (`descendant-count:!1`, W8).
+        Func::ChildCount
+        | Func::ChildFileCount
+        | Func::ChildFolderCount
+        | Func::DescendantCount
+        | Func::DescendantFileCount
+        | Func::DescendantFolderCount => Expr::Leaf(Leaf::Count {
+            of: count_of(func).unwrap_or(CountOf::Children),
+            range: any,
+        }),
+        // Only a folder holds entries whose size or date to test
+        // (`child-file-size:!0` keeps the folders holding no empty file,
+        // the empty ones too, W8), or a total of its files' sizes.
+        Func::ChildFileSize | Func::ChildDate | Func::ChildFileDate | Func::ChildFolderDate => {
+            Expr::Leaf(Leaf::Kind(Kind::Folder))
         }
+        Func::TotalChildSize => Expr::Leaf(Leaf::TotalChildSize(any)),
         _ => Expr::True,
     };
     Expr::and(known, e.not())
@@ -957,8 +1110,36 @@ fn count_of(func: Func) -> Option<CountOf> {
         Func::ChildCount => CountOf::Children,
         Func::ChildFileCount => CountOf::ChildFiles,
         Func::ChildFolderCount => CountOf::ChildFolders,
+        Func::DescendantCount => CountOf::Descendants,
+        Func::DescendantFileCount => CountOf::DescendantFiles,
+        Func::DescendantFolderCount => CountOf::DescendantFolders,
+        Func::SiblingCount => CountOf::Siblings,
+        Func::SiblingFileCount => CountOf::SiblingFiles,
+        Func::SiblingFolderCount => CountOf::SiblingFolders,
         _ => return None,
     })
+}
+
+/// The first `$name:` in `text`, Everything's substitution of a property
+/// of the entry tested (`$stem:`, `$size:`) or of a `regex:` capture
+/// (`$1:`): a `$`, letters, digits or hyphens, and a colon. As text it
+/// could match nothing, since no name holds a colon and a full path holds
+/// one only after its drive letter.
+fn substitution(text: &[u8]) -> Option<String> {
+    let mut at = 0;
+    while let Some(dollar) = text[at..].iter().position(|&b| b == b'$') {
+        let start = at + dollar;
+        let body = text[start + 1..]
+            .iter()
+            .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'-')
+            .count();
+        let colon = start + 1 + body;
+        if body > 0 && text.get(colon) == Some(&b':') {
+            return Some(String::from_utf8_lossy(&text[start..=colon]).into_owned());
+        }
+        at = start + 1;
+    }
+    None
 }
 
 /// `item` without its leading `!`s, and how many there were.
@@ -2233,7 +2414,7 @@ mod tests {
             Expr::Leaf(Leaf::Related {
                 relation,
                 kind,
-                name: Box::new(name),
+                term: Box::new(name),
             })
         };
         assert_eq!(ex("child:CMD"), rel(Relation::Child, None, name("cmd")));
@@ -2277,13 +2458,13 @@ mod tests {
                 rel(Relation::Child, None, name("b"))
             ])
         );
-        let Expr::Leaf(Leaf::Related { name: whole, .. }) = ex("whole:child:a") else {
+        let Expr::Leaf(Leaf::Related { term: whole, .. }) = ex("whole:child:a") else {
             panic!()
         };
         assert!(
             matches!(*whole, Expr::Leaf(Leaf::Text { anchors, .. }) if anchors.start && anchors.end)
         );
-        let Expr::Leaf(Leaf::Related { name: re, .. }) = ex("regex:child:^c") else {
+        let Expr::Leaf(Leaf::Related { term: re, .. }) = ex("regex:child:^c") else {
             panic!()
         };
         assert!(matches!(
@@ -2375,6 +2556,287 @@ mod tests {
             parse_query("root:"),
             Err(QueryError::UnknownFunction("root:".to_string()))
         );
+    }
+
+    /// The functions of related entries of W8, checked against a live
+    /// Everything 1.5: the four new sub-searches read their value as
+    /// `child:` does; the descendant and sibling counts are counts, a
+    /// value's own `!` keeping folders alone for the descendant ones only;
+    /// the child size and date tests are a `child:` of a size or date, a
+    /// list one test, and a value's own `!` keeps the folders holding no
+    /// such entry; `total-child-size:` is a size; the aliases Everything
+    /// lists read as their functions; what goz's index cannot answer, and
+    /// a `$name:` substitution, is refused with why; and each counts toward
+    /// the cap of 8.
+    #[test]
+    fn related_entry_functions_of_w8() {
+        use crate::query::dates::tests::{FixedClock, ft};
+        let rel = |relation, kind, term: Expr| {
+            Expr::Leaf(Leaf::Related {
+                relation,
+                kind,
+                term: Box::new(term),
+            })
+        };
+        let count = |of, min, max| {
+            Expr::Leaf(Leaf::Count {
+                of,
+                range: SizeRange { min, max },
+            })
+        };
+        let size = |min, max| Expr::Leaf(Leaf::Size(SizeRange { min, max }));
+        for (query, relation, kind) in [
+            ("parent-child:x", Relation::ParentChild, None),
+            ("parentchildfile:x", Relation::ParentChild, Some(Kind::File)),
+            (
+                "parent-child-folder:x",
+                Relation::ParentChild,
+                Some(Kind::Folder),
+            ),
+            ("parent-sibling:x", Relation::ParentSibling, None),
+            (
+                "parent-sibling-file:x",
+                Relation::ParentSibling,
+                Some(Kind::File),
+            ),
+            (
+                "parentsiblingfolder:x",
+                Relation::ParentSibling,
+                Some(Kind::Folder),
+            ),
+            ("ancestor-child:x", Relation::AncestorChild, None),
+            (
+                "ancestor-child-file:x",
+                Relation::AncestorChild,
+                Some(Kind::File),
+            ),
+            (
+                "ancestorchildfolder:x",
+                Relation::AncestorChild,
+                Some(Kind::Folder),
+            ),
+            ("ancestor-sibling:x", Relation::AncestorSibling, None),
+            (
+                "ancestorsiblingfile:x",
+                Relation::AncestorSibling,
+                Some(Kind::File),
+            ),
+            (
+                "ancestor-sibling-folder:x",
+                Relation::AncestorSibling,
+                Some(Kind::Folder),
+            ),
+            ("child-name:x", Relation::Child, None),
+            ("child-file-name:x", Relation::Child, Some(Kind::File)),
+            ("childfoldername:x", Relation::Child, Some(Kind::Folder)),
+            ("siblingname:x", Relation::Sibling, None),
+            ("sibling-file-name:x", Relation::Sibling, Some(Kind::File)),
+            (
+                "sibling-folder-name:x",
+                Relation::Sibling,
+                Some(Kind::Folder),
+            ),
+        ] {
+            assert_eq!(ex(query), rel(relation, kind, name("x")), "{query}");
+        }
+        assert_eq!(
+            ex("parent-sibling:!docs"),
+            rel(Relation::ParentSibling, None, name("!docs"))
+        );
+        assert_eq!(
+            ex("ancestor-child:a;b"),
+            rel(Relation::AncestorChild, None, or([name("a"), name("b")]))
+        );
+
+        assert_eq!(ex("descendant-count:3"), count(CountOf::Descendants, 3, 3));
+        assert_eq!(
+            ex("descendantfilecount:>2"),
+            count(CountOf::DescendantFiles, 3, u64::MAX)
+        );
+        assert_eq!(
+            ex("descendant-folder-count:0"),
+            count(CountOf::DescendantFolders, 0, 0)
+        );
+        // An empty value is any count but 0, as in Everything.
+        assert_eq!(ex("sibling-count:"), count(CountOf::Siblings, 1, u64::MAX));
+        assert_eq!(ex("siblingfilecount:1"), count(CountOf::SiblingFiles, 1, 1));
+        assert_eq!(
+            ex("sibling-folder-count:<2"),
+            count(CountOf::SiblingFolders, 0, 1)
+        );
+        assert_eq!(
+            ex("descendant-count:!1"),
+            and([
+                count(CountOf::Descendants, 0, u64::MAX),
+                count(CountOf::Descendants, 1, 1).not()
+            ])
+        );
+        // Every entry has siblings to count, so the value's `!` is a NOT.
+        assert_eq!(ex("sibling-count:!1"), count(CountOf::Siblings, 1, 1).not());
+
+        let folder_without = |e: Expr| and([kind(Kind::Folder), e.not()]);
+        assert_eq!(
+            ex("child-file-size:1025"),
+            rel(Relation::Child, Some(Kind::File), size(1025, 1025))
+        );
+        assert_eq!(
+            ex("childfilesize:1kb;5000"),
+            rel(
+                Relation::Child,
+                Some(Kind::File),
+                or([size(KB, 2 * KB - 1), size(5000, 5000)])
+            )
+        );
+        // At the top level the folders' kind goes to the kind filter.
+        let p = q("child-file-size:!0");
+        assert_eq!(p.filters.kind, Some(Kind::Folder));
+        assert_eq!(
+            p.expr,
+            Some(rel(Relation::Child, Some(Kind::File), size(0, 0)).not())
+        );
+        assert_eq!(
+            ex("x|child-file-size:!0"),
+            or([
+                name("x"),
+                folder_without(rel(Relation::Child, Some(Kind::File), size(0, 0)))
+            ])
+        );
+        assert_eq!(
+            ex("child-file-size:1;!0"),
+            or([
+                rel(Relation::Child, Some(Kind::File), size(1, 1)),
+                folder_without(rel(Relation::Child, Some(Kind::File), size(0, 0)))
+            ])
+        );
+        assert_eq!(
+            ex("child-file-size:unknown"),
+            rel(
+                Relation::Child,
+                Some(Kind::File),
+                Expr::Leaf(Leaf::SizeUnknown)
+            )
+        );
+        assert_eq!(
+            ex("total-child-size:>2kb"),
+            Expr::Leaf(Leaf::TotalChildSize(SizeRange {
+                min: 2 * KB + 1,
+                max: u64::MAX
+            }))
+        );
+        assert_eq!(
+            ex("total-child-size:!0"),
+            and([
+                Expr::Leaf(Leaf::TotalChildSize(SizeRange {
+                    min: 0,
+                    max: u64::MAX
+                })),
+                Expr::Leaf(Leaf::TotalChildSize(SizeRange { min: 0, max: 0 })).not()
+            ])
+        );
+
+        let clock = FixedClock::utc(ft("2026-11-04T10:00:00"));
+        let at = |text| {
+            parse_query_at(text, false, &clock)
+                .unwrap()
+                .expr
+                .unwrap_or_else(|| panic!("{text} has no expression"))
+        };
+        let year = |y: &str, next: &str| {
+            Expr::Leaf(Leaf::Date(DateFilter::Within {
+                min: ft(&format!("{y}-01-01T00:00:00")),
+                max: ft(&format!("{next}-01-01T00:00:00")) - 1,
+            }))
+        };
+        for (query, kind) in [
+            ("child-date-modified:2025", None),
+            ("childdm:2025", None),
+            ("child-dm:2025", None),
+            ("child-file-date-modified:2025", Some(Kind::File)),
+            ("childfiledm:2025", Some(Kind::File)),
+            ("child-folder-date-modified:2025", Some(Kind::Folder)),
+            ("childfolderdm:2025", Some(Kind::Folder)),
+        ] {
+            assert_eq!(
+                at(query),
+                rel(Relation::Child, kind, year("2025", "2026")),
+                "{query}"
+            );
+        }
+        assert_eq!(
+            at("x|childdm:!2025"),
+            or([
+                name("x"),
+                folder_without(rel(Relation::Child, None, year("2025", "2026")))
+            ])
+        );
+        assert_eq!(parse_query("childdm:2025"), Err(QueryError::NoClock));
+
+        for (query, why) in [
+            ("child-size:>1kb", "folder sizes"),
+            ("childfoldersize:1", "folder sizes"),
+            ("parent-size:1", "folder sizes"),
+            ("child-date-created:today", "dates created"),
+            ("childdc:2020", "dates created"),
+            ("child-file-attrib:h", "attributes"),
+            ("ancestor-attr:h", "attributes"),
+            ("childrc:today", "recently changed"),
+            ("child-occurrence-count:2", "hits"),
+            ("descendant-occurrence-count:2", "hits"),
+            ("child-count-from-disk:2", "disk"),
+            ("file: child-size:1", "folder sizes"),
+        ] {
+            match parse_query(query) {
+                Err(QueryError::Unsupported { what, why: text }) => {
+                    assert!(
+                        query.contains(what.trim_end_matches(':')),
+                        "{query}: {what}"
+                    );
+                    assert!(text.contains(why), "{query}: {text}");
+                }
+                other => panic!("{query}: {other:?}"),
+            }
+        }
+        for (query, sub) in [
+            ("*.txt !sibling:$stem:.doc", "$stem:"),
+            ("stem:.$extension:", "$extension:"),
+            ("regex:^(.*)$ sibling-file:$1:", "$1:"),
+            ("regex:siblingfile:^$1:.*mp4$", "$1:"),
+            ("a$full-path:", "$full-path:"),
+        ] {
+            match parse_query(query) {
+                Err(QueryError::Unsupported { what, .. }) => {
+                    assert_eq!(what, format!("the substitution {sub}"), "{query}")
+                }
+                other => panic!("{query}: {other:?}"),
+            }
+        }
+        // A `$` that names no substitution is text.
+        for text in ["$Recycle.Bin", "a$b", "$:x", "price$", "c$ d:"] {
+            assert!(parse_query(text).is_ok(), "{text}");
+        }
+
+        assert!(parse_query(&"sibling-count:1 ".repeat(8)).is_ok());
+        for query in [
+            "descendant-count:1 ".repeat(9),
+            "ancestor-sibling:a ".repeat(9),
+            "child-file-size:1 ".repeat(9),
+            "child:a descendant-count:1 parent-child:a parent-sibling:a ancestor-child:a \
+             ancestor-sibling:a sibling-count:1 child-file-size:1 descendant:a x"
+                .to_string(),
+        ] {
+            assert!(
+                matches!(
+                    parse_query(&query),
+                    Err(QueryError::Malformed {
+                        what: "sub-search",
+                        ..
+                    })
+                ),
+                "{query}"
+            );
+        }
+        // A value's own `!` asks for no second set.
+        assert!(parse_query(&"descendant-count:!1 ".repeat(8)).is_ok());
     }
 
     /// `parent:` and `ancestor:` take absolute folders, case-insensitively,

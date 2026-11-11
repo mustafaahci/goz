@@ -2156,6 +2156,14 @@ mod tests {
         assert!(msg.contains("unclosed group"), "{msg}");
         let msg = refused(&["size:huge2"]);
         assert!(msg.contains("size:"), "{msg}");
+        // What the index cannot answer exactly, and a substitution (W8).
+        let msg = refused(&["child-size:>1gb"]);
+        assert!(
+            msg.contains("child-size: is not supported") && msg.contains("folder sizes"),
+            "{msg}"
+        );
+        let msg = refused(&["*.txt", "!sibling:$stem:.doc"]);
+        assert!(msg.contains("the substitution $stem:"), "{msg}");
         assert_eq!(
             parse_command_line("goz -argv \"<a b\"")
                 .unwrap_err()

@@ -112,12 +112,43 @@ pub enum CountOf {
     ChildFiles,
     /// `child-folder-count:`: a folder's folders.
     ChildFolders,
+    /// `descendant-count:`: the files and folders below a folder, at any
+    /// depth.
+    Descendants,
+    /// `descendant-file-count:`.
+    DescendantFiles,
+    /// `descendant-folder-count:`.
+    DescendantFolders,
+    /// `sibling-count:`: the other files and folders of the entry's folder.
+    Siblings,
+    /// `sibling-file-count:`.
+    SiblingFiles,
+    /// `sibling-folder-count:`.
+    SiblingFolders,
 }
 
-/// How the entries a sub-search names relate to the entry tested: the four
+impl CountOf {
+    /// Whether the count is worked out for the whole volume before the
+    /// search (see the `related` module), rather than entry by entry.
+    pub fn is_volume_wide(self) -> bool {
+        matches!(
+            self,
+            CountOf::Descendants
+                | CountOf::DescendantFiles
+                | CountOf::DescendantFolders
+                | CountOf::Siblings
+                | CountOf::SiblingFiles
+                | CountOf::SiblingFolders
+        )
+    }
+}
+
+/// How the entries a sub-search names relate to the entry tested: the
 /// functions that search other entries' names (`child:`, `descendant:`,
-/// `sibling:`, `ancestor-name:`), each answered from the parent and child
-/// links the index keeps.
+/// `sibling:`, `ancestor-name:`, `parent-child:`, `parent-sibling:`,
+/// `ancestor-child:`, `ancestor-sibling:`), each answered from the parent
+/// and child links the index keeps, and `child:` also for a child's size or
+/// date (`child-file-size:`, `child-date-modified:`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Relation {
     /// The entry is a folder that holds one directly.
@@ -129,6 +160,18 @@ pub enum Relation {
     /// A folder above the entry, the volume's root included, whose name is
     /// then the mount prefix (`C:`), as Everything names a root by its path.
     Ancestor,
+    /// An entry of the entry's folder, the entry itself included.
+    ParentChild,
+    /// An entry of the folder above the entry's folder, that folder itself
+    /// included: a live Everything 1.5 answers `parent-sibling:src` with the
+    /// entries of every folder named `src` too (W8), though its help says
+    /// the parent is left out.
+    ParentSibling,
+    /// An entry of a folder above the entry, the volume's root included.
+    AncestorChild,
+    /// An entry of a folder above the entry's folder, the folders on the
+    /// entry's path included (W8, as `ParentSibling`).
+    AncestorSibling,
 }
 
 /// One term. Text is folded unless the term matches case: with
@@ -180,8 +223,12 @@ pub enum Leaf {
     /// A length, in UTF-16 units, is in range.
     Len { of: LenOf, range: SizeRange },
     /// A count is in range. Only a folder has children, so a file matches
-    /// no child count, as in Everything.
+    /// no child count, as in Everything, nor any descendant count.
     Count { of: CountOf, range: SizeRange },
+    /// A folder whose files' sizes, summed, are in range
+    /// (`total-child-size:`); a file of unknown size leaves the total
+    /// unknown.
+    TotalChildSize(SizeRange),
     /// The entry's folder is one of these.
     Parent(Vec<FolderPath>),
     /// One of the entry's folders, up to the root, is one of these.
@@ -189,14 +236,15 @@ pub enum Leaf {
     /// The entry is on this drive (an ASCII letter, lower-cased): `d:`.
     Drive(u8),
     /// An entry related to this one as `relation` says, and of `kind` when
-    /// set (`child-file:`), has a name that `name` matches: a term on the
-    /// name (text, a wildcard or a regular expression, with its modifiers),
-    /// or an OR of them, or `True` for an empty value, which any name
-    /// matches.
+    /// set (`child-file:`), matches `term`: a term on the name (text, a
+    /// wildcard or a regular expression, with its modifiers), or an OR of
+    /// them, or `True` for an empty value, which any name matches; or, for
+    /// `Child` alone, a size or date test, or an OR of them
+    /// (`child-file-size:`, `child-date-modified:`).
     Related {
         relation: Relation,
         kind: Option<Kind>,
-        name: Box<Expr>,
+        term: Box<Expr>,
     },
 }
 
@@ -276,8 +324,8 @@ impl Expr {
         Expr::Not(Box::new(self))
     }
 
-    /// Visits every leaf, and the leaves of a sub-search's term on the name
-    /// after the sub-search's own.
+    /// Visits every leaf, and the leaves of a sub-search's term after the
+    /// sub-search's own.
     pub fn for_each_leaf<'a>(&'a self, f: &mut impl FnMut(&'a Leaf)) {
         match self {
             Expr::True | Expr::False => {}
@@ -285,8 +333,8 @@ impl Expr {
             Expr::Not(inner) => inner.for_each_leaf(f),
             Expr::Leaf(leaf) => {
                 f(leaf);
-                if let Leaf::Related { name, .. } = leaf {
-                    name.for_each_leaf(f);
+                if let Leaf::Related { term, .. } = leaf {
+                    term.for_each_leaf(f);
                 }
             }
         }
@@ -422,11 +470,19 @@ pub(super) fn regex_terms(e: &Expr) -> usize {
     n
 }
 
-/// How many sub-searches (`child:`, `descendant:`, `sibling:`,
-/// `ancestor-name:`) `e` holds.
+/// How many terms on related entries worked out before the search `e`
+/// holds: the sub-searches (`child:`, `parent-sibling:`, ...,
+/// `child-file-size:`) and the descendant and sibling counts.
 pub(super) fn related_terms(e: &Expr) -> usize {
     let mut n = 0;
-    e.for_each_leaf(&mut |leaf| n += usize::from(matches!(leaf, Leaf::Related { .. })));
+    e.for_each_leaf(&mut |leaf| {
+        n += usize::from(match leaf {
+            Leaf::Related { .. } => true,
+            // Any count at all needs no set (see `cexpr::compile`).
+            Leaf::Count { of, range } => of.is_volume_wide() && !range.is_any(),
+            _ => false,
+        })
+    });
     n
 }
 

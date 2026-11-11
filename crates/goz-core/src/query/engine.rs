@@ -15,7 +15,7 @@ use super::expr::{Expr, Leaf, Target};
 use super::folder_rank::FolderRanks;
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, ParsedQuery, SizeRange, Wildcard};
-use super::related::RelatedSet;
+use super::related::Worked;
 use crate::index::store::NamePair;
 use crate::index::volume::MAX_PATH_HOPS;
 use crate::index::{NameId, VolumeIndex};
@@ -25,7 +25,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// One matched entry. The daemon prepends the volume mount prefix to `path`
 /// and formats `mtime` for display.
@@ -155,10 +155,10 @@ pub struct CompiledQuery<'a> {
     /// Where a top-level `parent:` or `ancestor:` term says the matches
     /// lie, which the scan walks instead of the volume.
     source: Option<Source>,
-    /// A top-level sub-search (`child:`, ...), whose set of folders bounds
-    /// the candidates when nothing narrower does (see
-    /// [`RelatedSet::for_each_candidate`]).
-    related: Option<Arc<RelatedSet>>,
+    /// A top-level term on related entries (`child:`, `descendant-count:`
+    /// ...), whose set of folders bounds the candidates when nothing
+    /// narrower does (see [`Worked::for_each_candidate`]).
+    related: Option<Worked>,
     /// The expression's terms on the entry, projected onto the name (see
     /// [`cexpr::name_projection`]): what the name of every match passes,
     /// beyond [`name_matches`].
@@ -1912,7 +1912,7 @@ fn scan_with(
         // Every match is at or below a name holding the piece, and the walk
         // visited each of those entries once.
     } else if let Some(set) = &compiled.related {
-        // A top-level sub-search: only the entries its folders give can
+        // A top-level term on related entries: only the entries its folders give can
         // match, each once. (A path walk that grew past its share may have
         // left some.)
         candidates.clear();
@@ -7362,6 +7362,1064 @@ mod tests {
                 r"desktop\First Level First\inner\g.txt",
             ],
         );
+    }
+
+    /// The live fixture's tree `r8` (W8): record, parent record (0 for the
+    /// root), name, folder or not, size, and the day of its date modified,
+    /// 12:00 UTC here as it was 12:00 local time there.
+    const R8: &[(u64, u64, &str, bool, u64, &str)] = &[
+        (300, 0, "r8", true, 0, "2026-11-11"),
+        (301, 300, "proj", true, 0, "2023-03-10"),
+        (302, 301, ".gitignore", false, 10, "2024-01-15"),
+        (303, 301, "src", true, 0, "2019-05-05"),
+        (304, 303, "main.rs", false, 2000, "2025-06-01"),
+        (305, 303, "util", true, 0, "2022-02-02"),
+        (306, 305, "lib.rs", false, 5000, "2025-06-02"),
+        (307, 305, "deep", true, 0, "2020-07-07"),
+        (308, 307, "x.txt", false, 0, "2021-08-08"),
+        (309, 301, "docs", true, 0, "2023-04-04"),
+        (310, 309, "readme.md", false, 1500, "2024-09-09"),
+        (311, 300, "other", true, 0, "2018-01-01"),
+        (312, 311, "src", true, 0, "2019-06-06"),
+        (313, 312, "app.rs", false, 100, "2016-01-01"),
+        (314, 311, "notes.txt", false, 2048, "2025-06-03"),
+        (315, 300, "solo", true, 0, "2017-01-01"),
+        (316, 315, "only.txt", false, 1, "2015-05-05"),
+        (317, 300, "empty", true, 0, "2014-04-04"),
+        (318, 300, "mixed", true, 0, "2013-03-03"),
+        (319, 318, "f1.bin", false, 1024, "2012-02-02"),
+        (320, 318, "f2.bin", false, 1025, "2012-02-03"),
+        (321, 318, "sub1", true, 0, "2011-01-01"),
+        (322, 318, "sub2", true, 0, "2010-10-10"),
+        (323, 322, "g.bin", false, 4096, "2025-06-04"),
+    ];
+
+    /// [`related_index`] and the tree `r8` of the live fixture, with its
+    /// sizes and dates.
+    fn w8_index() -> VolumeIndex {
+        use crate::query::dates::tests::ft;
+        let mut idx = related_index();
+        for &(rec, parent, name, is_dir, _, _) in R8 {
+            let parent = if parent == 0 {
+                NTFS_ROOT_FRN
+            } else {
+                frn(parent)
+            };
+            idx.insert_enum(&enum_rec(frn(rec), parent, name, is_dir));
+        }
+        for &(rec, _, _, _, size, day) in R8 {
+            idx.set_stat(frn(rec), size, ft(&format!("{day}T12:00:00")));
+        }
+        idx.optimize_storage();
+        idx
+    }
+
+    /// `parent-child:`, `parent-sibling:`, `ancestor-child:`,
+    /// `ancestor-sibling:` (and their `-file:` and `-folder:` forms),
+    /// `descendant-count:`, `sibling-count:` (and their `-file-` and
+    /// `-folder-` forms), `child-file-size:`, `child-date-modified:` (and
+    /// its forms and aliases), `total-child-size:` and the `-name:` aliases
+    /// of `child:` and `sibling:` answer as a live Everything 1.5.0.1424b
+    /// did over the same tree (W8, 102 queries): a parent's or an
+    /// ancestor's own name counts among its siblings, the root counts as an
+    /// ancestor, a value's own `!` keeps folders alone for the descendant
+    /// counts and the child size and date tests, and the empty value of a
+    /// count is any count but 0. What Everything answered from folder
+    /// sizes, and a `$stem:` substitution, goz refuses.
+    #[test]
+    fn related_entry_functions_answer_as_everything_does() {
+        use crate::query::dates::tests::{FixedClock, ft};
+        use crate::query::parse::{QueryError, parse_query_at};
+        let idx = w8_index();
+        let clock = FixedClock::utc(ft("2026-11-11T12:00:00"));
+        let check = |query: &str, want: &[&str]| {
+            let parsed =
+                parse_query_at(query, false, &clock).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let out = run_query(
+                &idx,
+                FIXTURE_ROOT,
+                &parsed,
+                None,
+                SortSpec::default(),
+                0,
+                None,
+            );
+            let mut got: Vec<String> = out
+                .hits
+                .iter()
+                .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                .collect();
+            got.sort();
+            let mut want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{query}");
+        };
+        let all = [
+            r"r8\proj\src\util\deep",
+            r"r8\proj\docs",
+            r"r8\empty",
+            r"r8\mixed",
+            r"r8\other",
+            r"r8\proj",
+            r"r8\solo",
+            r"r8\other\src",
+            r"r8\proj\src",
+            r"r8\mixed\sub1",
+            r"r8\mixed\sub2",
+            r"r8\proj\src\util",
+            r"r8\proj\.gitignore",
+            r"r8\other\src\app.rs",
+            r"r8\mixed\f1.bin",
+            r"r8\mixed\f2.bin",
+            r"r8\mixed\sub2\g.bin",
+            r"r8\proj\src\util\lib.rs",
+            r"r8\proj\src\main.rs",
+            r"r8\other\notes.txt",
+            r"r8\solo\only.txt",
+            r"r8\proj\docs\readme.md",
+            r"r8\proj\src\util\deep\x.txt",
+        ];
+        check(r"\r8\", &all);
+        check(
+            r"parent-sibling:src \r8\",
+            &[
+                r"r8\proj\src\util",
+                r"r8\other\src\app.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+            ],
+        );
+        check(
+            r"parent-sibling:.gitignore \r8\",
+            &[
+                r"r8\proj\src\util",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+            ],
+        );
+        check(
+            r#"whole:parent-sibling:".gitignore" \r8\"#,
+            &[
+                r"r8\proj\src\util",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+            ],
+        );
+        check(r"parent-sibling-file:src \r8\", &[]);
+        check(
+            r"parent-sibling-folder:docs \r8\",
+            &[
+                r"r8\proj\src\util",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+            ],
+        );
+        check(
+            r"parent-sibling-file:gitignore \r8\",
+            &[
+                r"r8\proj\src\util",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+            ],
+        );
+        check(
+            r"parentsibling:docs \r8\",
+            &[
+                r"r8\proj\src\util",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+            ],
+        );
+        check(r"parent-sibling: \r8\", &all);
+        check(
+            r"!parent-sibling:src \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\proj\.gitignore",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\other\notes.txt",
+                r"r8\solo\only.txt",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"parent-sibling:words \r8\",
+            &[
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+            ],
+        );
+        check(r"parent-sibling:words whole:r8", &[]);
+        check(
+            r"regex:parent-sibling:^do \r8\",
+            &[
+                r"r8\proj\src\util",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+            ],
+        );
+        check(r"parent-sibling:!docs \r8\", &[]);
+        check(
+            r"file: parent-sibling:docs \r8\",
+            &[r"r8\proj\src\main.rs", r"r8\proj\docs\readme.md"],
+        );
+        check(
+            r"whole:parent-sibling:src \r8\",
+            &[
+                r"r8\proj\src\util",
+                r"r8\other\src\app.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+            ],
+        );
+        check(
+            r"ancestor-sibling:docs \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\src\util",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"ancestor-sibling:.gitignore \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\src\util",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"ancestor-sibling-file:notes \r8\",
+            &[r"r8\other\src\app.rs"],
+        );
+        check(
+            r"ancestor-sibling-folder:other \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\proj\src\util",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\other\notes.txt",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(r"ancestor-sibling-folder:notes \r8\", &[]);
+        check(r"ancestor-sibling:words \r8\", &all);
+        check(r"ancestor-sibling: \r8\", &all);
+        check(
+            r"!ancestor-sibling:docs \r8\",
+            &[
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\other\notes.txt",
+                r"r8\solo\only.txt",
+            ],
+        );
+        check(
+            r"whole:ancestor-sibling:src \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\src\util",
+                r"r8\other\src\app.rs",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"ancestorsibling:solo \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\proj\src\util",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\other\notes.txt",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(r"ancestor-sibling:words whole:r8", &[]);
+        check(
+            r"ancestor-child:.gitignore \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\proj\src",
+                r"r8\proj\src\util",
+                r"r8\proj\.gitignore",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"!whole:ancestor-child-file:.gitignore \r8\",
+            &[
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\other\notes.txt",
+                r"r8\solo\only.txt",
+            ],
+        );
+        check(
+            r"ancestor-child-folder:src \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\proj\src\util",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\other\notes.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(r"ancestor-child-file:src \r8\", &[]);
+        check(r"ancestor-child:only \r8\", &[r"r8\solo\only.txt"]);
+        check(r"ancestor-child:r8 \r8\", &all);
+        check(r"ancestor-child:words \r8\", &all);
+        check(r"ancestor-child:words whole:r8", &[r"r8"]);
+        check(r"ancestor-child: \r8\", &all);
+        check(
+            r"ancestorchild:lib \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"ancestor-child:x.txt \r8\",
+            &[r"r8\proj\src\util\deep\x.txt"],
+        );
+        check(r"parent-child:only \r8\", &[r"r8\solo\only.txt"]);
+        check(
+            r"parent-child:.gitignore \r8\",
+            &[r"r8\proj\docs", r"r8\proj\src", r"r8\proj\.gitignore"],
+        );
+        check(r"parent-child-file:src \r8\", &[]);
+        check(
+            r"parent-child-folder:src \r8\",
+            &[
+                r"r8\proj\docs",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\proj\.gitignore",
+                r"r8\other\notes.txt",
+            ],
+        );
+        check(r"parent-child:words whole:r8", &[r"r8"]);
+        check(r"parent-child: \r8\", &all);
+        check(
+            r"sibling-count:0 \r8\",
+            &[
+                r"r8\other\src\app.rs",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"sibling-count:1 \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\other\src",
+                r"r8\proj\src\util",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\other\notes.txt",
+            ],
+        );
+        check(
+            r"sibling-count:2 \r8\",
+            &[r"r8\proj\docs", r"r8\proj\src", r"r8\proj\.gitignore"],
+        );
+        check(
+            r"sibling-count:>2 \r8\",
+            &[
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+            ],
+        );
+        check(
+            r"sibling-count: \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\proj\src\util",
+                r"r8\proj\.gitignore",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\other\notes.txt",
+            ],
+        );
+        check(
+            r"sibling-file-count:1 \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\proj\src\util",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+            ],
+        );
+        check(
+            r"sibling-folder-count:0 \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\other\src",
+                r"r8\proj\src\util",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"sibling-folder-count:2 \r8\",
+            &[
+                r"r8\proj\.gitignore",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+            ],
+        );
+        check(
+            r"sibling-count:!1 \r8\",
+            &[
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"!sibling-count:1 \r8\",
+            &[
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"siblingcount:4 \r8\",
+            &[
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+            ],
+        );
+        check(
+            r"file: sibling-count:0 \r8\",
+            &[
+                r"r8\other\src\app.rs",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(r"sibling-count:4 whole:r8", &[]);
+        check(r"descendant-count:0 \r8\", &[r"r8\empty", r"r8\mixed\sub1"]);
+        check(
+            r"descendant-count:1 \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\mixed\sub2",
+            ],
+        );
+        check(
+            r"descendant-count:3 \r8\",
+            &[r"r8\other", r"r8\proj\src\util"],
+        );
+        check(
+            r"descendant-count:>4 \r8\",
+            &[r"r8\mixed", r"r8\proj", r"r8\proj\src"],
+        );
+        check(r"descendant-count:9 \r8\", &[r"r8\proj"]);
+        check(
+            r"descendant-file-count:2 \r8\",
+            &[r"r8\other", r"r8\proj\src\util"],
+        );
+        check(
+            r"descendant-folder-count:0 \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+            ],
+        );
+        check(r"descendant-folder-count:4 \r8\", &[r"r8\proj"]);
+        check(
+            r"descendant-count:!1 \r8\",
+            &[
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\proj\src\util",
+            ],
+        );
+        check(
+            r"!descendant-count:1 \r8\",
+            &[
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\proj\src\util",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\other\notes.txt",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(r"descendantcount:5 \r8\", &[r"r8\mixed", r"r8\proj\src"]);
+        check(
+            r"descendant-count: \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\mixed\sub2",
+                r"r8\proj\src\util",
+            ],
+        );
+        check(r"descendant-count:23 whole:r8", &[r"r8"]);
+        check(r"descendant-file-count:12 whole:r8", &[]);
+        check(
+            r"child-file-size:>1kb \r8\",
+            &[
+                r"r8\proj\docs",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj\src",
+                r"r8\mixed\sub2",
+                r"r8\proj\src\util",
+            ],
+        );
+        check(r"child-file-size:1025 \r8\", &[r"r8\mixed"]);
+        check(
+            r"child-file-size:<10 \r8\",
+            &[r"r8\proj\src\util\deep", r"r8\solo"],
+        );
+        check(r"childfilesize:0 \r8\", &[r"r8\proj\src\util\deep"]);
+        check(
+            r"child-file-size:!0 \r8\",
+            &[
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\other",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\proj\src",
+                r"r8\mixed\sub1",
+                r"r8\mixed\sub2",
+                r"r8\proj\src\util",
+            ],
+        );
+        check(
+            r"!child-file-size:>1kb \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\empty",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\mixed\sub1",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\other\notes.txt",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(
+            r"child-file-size:1kb;5000 \r8\",
+            &[
+                r"r8\proj\docs",
+                r"r8\mixed",
+                r"r8\proj\src",
+                r"r8\proj\src\util",
+            ],
+        );
+        check(
+            r"total-child-size:>2kb \r8\",
+            &[r"r8\mixed", r"r8\mixed\sub2", r"r8\proj\src\util"],
+        );
+        check(
+            r"total-child-size:0 \r8\",
+            &[r"r8\proj\src\util\deep", r"r8\empty", r"r8\mixed\sub1"],
+        );
+        check(
+            r"child-date-modified:2025 \r8\",
+            &[
+                r"r8\other",
+                r"r8\proj\src",
+                r"r8\mixed\sub2",
+                r"r8\proj\src\util",
+            ],
+        );
+        check(r"childdm:2024 \r8\", &[r"r8\proj\docs", r"r8\proj"]);
+        check(
+            r"child-file-date-modified:2025-06-01 \r8\",
+            &[r"r8\proj\src"],
+        );
+        check(
+            r"child-folder-date-modified:2019 \r8\",
+            &[r"r8\other", r"r8\proj"],
+        );
+        check(r"childfiledm:<2015 \r8\", &[r"r8\mixed"]);
+        check(
+            r"childdm:!2025 \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\mixed\sub1",
+            ],
+        );
+        check(
+            r"!childdm:2025 \r8\",
+            &[
+                r"r8\proj\src\util\deep",
+                r"r8\proj\docs",
+                r"r8\empty",
+                r"r8\mixed",
+                r"r8\proj",
+                r"r8\solo",
+                r"r8\other\src",
+                r"r8\mixed\sub1",
+                r"r8\proj\.gitignore",
+                r"r8\other\src\app.rs",
+                r"r8\mixed\f1.bin",
+                r"r8\mixed\f2.bin",
+                r"r8\mixed\sub2\g.bin",
+                r"r8\proj\src\util\lib.rs",
+                r"r8\proj\src\main.rs",
+                r"r8\other\notes.txt",
+                r"r8\solo\only.txt",
+                r"r8\proj\docs\readme.md",
+                r"r8\proj\src\util\deep\x.txt",
+            ],
+        );
+        check(r"childfolderdm:2023 \r8\", &[r"r8\proj"]);
+        check(r"child-dm:2012 \r8\", &[r"r8\mixed"]);
+        check(r"child-date-modified:2010..2012 \r8\", &[r"r8\mixed"]);
+        check(
+            r"child-file-dm:2025 \r8\",
+            &[
+                r"r8\other",
+                r"r8\proj\src",
+                r"r8\mixed\sub2",
+                r"r8\proj\src\util",
+            ],
+        );
+        check(r"child-name:main \r8\", &[r"r8\proj\src"]);
+        check(r"child-file-name:main \r8\", &[r"r8\proj\src"]);
+        check(r"child-folder-name:util \r8\", &[r"r8\proj\src"]);
+        check(r"siblingname:main \r8\", &[r"r8\proj\src\util"]);
+        check(r"sibling-name:main \r8\", &[r"r8\proj\src\util"]);
+        check(r"sibling-file-name:notes \r8\", &[r"r8\other\src"]);
+        check(
+            r"sibling-folder-name:src \r8\",
+            &[
+                r"r8\proj\docs",
+                r"r8\proj\.gitignore",
+                r"r8\other\notes.txt",
+            ],
+        );
+        for query in [
+            r"child-size:>1kb \r8\",
+            r"child-folder-size:>1kb \r8\",
+            r"child-size:<10 \r8\",
+            r"*.rs !sibling:$stem:.md \r8\",
+        ] {
+            assert!(
+                matches!(
+                    parse_query_at(query, false, &clock),
+                    Err(QueryError::Unsupported { .. })
+                ),
+                "{query}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The functions of related entries of W8 against a plain reference
+        /// over random trees whose names repeat and fold alike and whose
+        /// entries carry sizes and dates: each answer is worked out entry by
+        /// entry from the parent links (the entry's folder's entries, those
+        /// of the folder above it, the folders above it and theirs, the
+        /// entries below a folder, a folder's own entries), and the engine
+        /// must give the same entries, alone, negated, ANDed with a name
+        /// term, ORed with one, and with the value's own `!` where the value
+        /// is a number or a date (with a path term for the sub-searches,
+        /// whose `!` is text).
+        #[test]
+        fn related_entry_functions_agree_with_a_reference(
+            nodes in prop::collection::vec(
+                (any::<prop::sample::Index>(), 0usize..5, 0u8..3, 0usize..5, 0usize..4),
+                1..60,
+            ),
+            func in 0usize..23,
+            value in 0usize..4,
+            shape in 0u8..5,
+        ) {
+            use crate::query::dates::tests::{FixedClock, ft};
+            use crate::query::parse::parse_query_at;
+            const NAMES: [&str; 5] = ["a", "A", "ab", "b.txt", "é"];
+            const SIZES: [u64; 5] = [0, 1, 1024, 1025, 5000];
+            const YEARS: [&str; 4] = ["2019", "2020", "2021", "2022"];
+            let mut idx = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+            let mut dirs = vec![NTFS_ROOT_FRN];
+            for (i, (parent, name, kind, size, year)) in nodes.iter().enumerate() {
+                let f = frn(1000 + i as u64);
+                let is_dir = *kind == 0;
+                idx.insert_enum(&enum_rec(f, dirs[parent.index(dirs.len())], NAMES[*name], is_dir));
+                idx.set_stat(f, SIZES[*size], ft(&format!("{}-06-15T12:00:00", YEARS[*year])));
+                if is_dir {
+                    dirs.push(f);
+                }
+            }
+            idx.optimize_storage();
+            let funcs = [
+                "parent-child:", "parent-child-file:", "parent-child-folder:",
+                "parent-sibling:", "parent-sibling-file:", "parent-sibling-folder:",
+                "ancestor-child:", "ancestor-child-file:", "ancestor-child-folder:",
+                "ancestor-sibling:", "ancestor-sibling-file:", "ancestor-sibling-folder:",
+                "descendant-count:", "descendant-file-count:", "descendant-folder-count:",
+                "sibling-count:", "sibling-file-count:", "sibling-folder-count:",
+                "child-file-size:",
+                "child-date-modified:", "child-file-date-modified:", "child-folder-date-modified:",
+                "total-child-size:",
+            ];
+            let text = match func {
+                0..=11 => ["a", "b", "ab", ""][value],
+                12..=17 => ["0", "1", ">1", "<3"][value],
+                18 | 22 => ["0", "1kb", ">1kb", "<10"][value],
+                _ => ["2019", "2020", "2021..2022", "2019;2022"][value],
+            };
+            let term = format!("{}{text}", funcs[func]);
+            let query = match shape {
+                0 => term.clone(),
+                1 => format!("!{term}"),
+                2 => format!("{term} a"),
+                3 => format!("{term}|b"),
+                _ if func < 12 => format!("{term} a\\"),
+                _ => format!("{}!{text}", funcs[func]),
+            };
+
+            // The reference.
+            let live: Vec<EntryIdx> =
+                idx.live_entries().filter(|&e| !idx.is_synthetic(e)).collect();
+            let parent = |e: EntryIdx| idx.entry(e).parent();
+            let is_dir = |e: EntryIdx| idx.entry(e).is_dir();
+            // The kind each function counts or tests, by its place in a
+            // group of three: any, files, folders.
+            let kind_ok = |e: EntryIdx| {
+                let place = match func {
+                    18 | 22 => 1,
+                    19..=21 => func - 19,
+                    _ => func % 3,
+                };
+                match place {
+                    1 => !is_dir(e),
+                    2 => is_dir(e),
+                    _ => true,
+                }
+            };
+            let named = |e: EntryIdx| {
+                let n = crate::fold::fold(idx.entry(e).name());
+                text.is_empty() || memmem::find(&n, text.as_bytes()).is_some()
+            };
+            let hit = |e: EntryIdx| named(e) && kind_ok(e);
+            let holds_hit = |folder: EntryIdx| {
+                folder != NIL && live.iter().any(|&c| parent(c) == folder && hit(c))
+            };
+            // The folders above an entry, its folder first, the root last.
+            let above = |e: EntryIdx| {
+                let mut out = Vec::new();
+                let mut cur = parent(e);
+                while cur != NIL {
+                    out.push(cur);
+                    cur = parent(cur);
+                }
+                out
+            };
+            let count_ok = |n: u64| match value {
+                0 => n == 0,
+                1 => n == 1,
+                2 => n > 1,
+                _ => n < 3,
+            };
+            let size_ok = |s: u64| match value {
+                0 => s == 0,
+                1 => (1024..2048).contains(&s),
+                2 => s > 1024,
+                _ => s < 10,
+            };
+            let year_ok = |e: EntryIdx| {
+                let year = YEARS
+                    .iter()
+                    .position(|y| idx.entry(e).mtime() == Some(ft(&format!("{y}-06-15T12:00:00"))));
+                match value {
+                    0 => year == Some(0),
+                    1 => year == Some(1),
+                    2 => matches!(year, Some(2 | 3)),
+                    _ => matches!(year, Some(0 | 3)),
+                }
+            };
+            let children = |e: EntryIdx| live.iter().copied().filter(move |&c| parent(c) == e);
+            // Whether the function's test holds for `e`.
+            let related = |e: EntryIdx| -> bool {
+                match func {
+                    0..=2 => holds_hit(parent(e)),
+                    3..=5 => parent(e) != NIL && holds_hit(parent(parent(e))),
+                    6..=8 => above(e).into_iter().any(holds_hit),
+                    9..=11 => above(e).into_iter().skip(1).any(holds_hit),
+                    12..=14 => {
+                        if !is_dir(e) {
+                            return false;
+                        }
+                        let n = live
+                            .iter()
+                            .filter(|&&c| kind_ok(c) && above(c).contains(&e))
+                            .count();
+                        count_ok(n as u64)
+                    }
+                    15..=17 => {
+                        let n = live
+                            .iter()
+                            .filter(|&&c| c != e && parent(c) == parent(e) && kind_ok(c))
+                            .count();
+                        count_ok(n as u64)
+                    }
+                    18 => {
+                        if !is_dir(e) {
+                            return false;
+                        }
+                        children(e).any(|c| {
+                            kind_ok(c) && idx.entry(c).size().is_some_and(size_ok)
+                        })
+                    }
+                    19..=21 => {
+                        if !is_dir(e) {
+                            return false;
+                        }
+                        children(e).any(|c| kind_ok(c) && year_ok(c))
+                    }
+                    _ => {
+                        if !is_dir(e) {
+                            return false;
+                        }
+                        let total: u64 = children(e)
+                            .filter(|&c| !is_dir(c))
+                            .map(|c| idx.entry(c).size().unwrap_or(0))
+                            .sum();
+                        size_ok(total)
+                    }
+                }
+            };
+            let name_of = |e: EntryIdx| crate::fold::fold(idx.entry(e).name());
+            let path_of = |e: EntryIdx| {
+                let mut p = Vec::new();
+                idx.path_of(e, &mut p);
+                p
+            };
+            let mut want: Vec<String> = live
+                .iter()
+                .copied()
+                .filter(|&e| match shape {
+                    0 => related(e),
+                    1 => !related(e),
+                    2 => related(e) && memmem::find(&name_of(e), b"a").is_some(),
+                    3 => related(e) || memmem::find(&name_of(e), b"b").is_some(),
+                    _ if func < 12 => {
+                        related(e)
+                            && memmem::find(&crate::fold::fold(&path_of(e)), b"a\\").is_some()
+                    }
+                    // The value's own `!`: among the folders for the
+                    // descendant counts and the child tests, among every
+                    // entry for the sibling counts.
+                    _ if (15..=17).contains(&func) => !related(e),
+                    _ => is_dir(e) && !related(e),
+                })
+                .map(|e| String::from_utf8(path_of(e)).unwrap())
+                .collect();
+            want.sort();
+            let clock = FixedClock::utc(ft("2026-11-11T12:00:00"));
+            let parsed = parse_query_at(&query, false, &clock).unwrap();
+            let out = run_query(&idx, r"C:\", &parsed, None, SortSpec::default(), 0, None);
+            let mut got: Vec<String> = out
+                .hits
+                .iter()
+                .map(|h| crate::wtf8::to_string_lossy(&h.path))
+                .collect();
+            got.sort();
+            prop_assert_eq!(got, want, "{}", query);
+        }
     }
 
     proptest! {

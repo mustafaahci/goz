@@ -215,7 +215,20 @@ const SEARCH_TEXT: &[(&str, &str)] = &[
         "child:*.mp3",
         "Folders holding an entry so named (child-file:, child-folder:); \
          descendant: at any depth; sibling: another entry of the folder; \
-         ancestor-name: a folder above",
+         ancestor-name: a folder above; parent-child:, parent-sibling:, \
+         ancestor-child:, ancestor-sibling: an entry of the folder, of the \
+         folder above it, of a folder above, of a folder above that",
+    ),
+    (
+        "descendant-count:>99, sibling-count:0",
+        "Folders with that many entries below them; entries with that many \
+         others in their folder; also descendant-file-count:, \
+         sibling-folder-count: ...",
+    ),
+    (
+        "child-file-size:>1gb, childdm:today",
+        "Folders holding a file of that size, or an entry modified then \
+         (childfiledm:, childfolderdm:); total-child-size: sums the files",
     ),
     (
         "path:TEXT",

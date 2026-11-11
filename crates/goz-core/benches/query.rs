@@ -462,6 +462,45 @@ fn bench_query(c: &mut Criterion) {
             true,
         ),
         ("related(child:*.txt)", "child:*.txt".into(), true),
+        // W8: the other relations of other entries' names, mapped through
+        // the same links.
+        (
+            "related(parent-child:kernel32)",
+            "parent-child:kernel32".into(),
+            true,
+        ),
+        (
+            "related(parent-sibling:module_group_007)",
+            "parent-sibling:module_group_007".into(),
+            true,
+        ),
+        (
+            "related(ancestor-child:kernel32)",
+            "ancestor-child:kernel32".into(),
+            true,
+        ),
+        (
+            "related(ancestor-sibling:module_group_007 kernel32)",
+            "ancestor-sibling:module_group_007 kernel32".into(),
+            true,
+        ),
+        // Descendant and sibling counts: a walk of the volume, or a count
+        // of each folder's entries, before the search.
+        (
+            "count(descendant-count:>1000)",
+            "descendant-count:>1000".into(),
+            true,
+        ),
+        (
+            "count(descendant-file-count:52)",
+            "descendant-file-count:52".into(),
+            true,
+        ),
+        (
+            "count(sibling-count:51 kernel32)",
+            "sibling-count:51 kernel32".into(),
+            true,
+        ),
     ];
     bench_group(c, "query_2M_mods", &idx, &mods);
     drop(idx);
@@ -511,6 +550,24 @@ fn bench_query(c: &mut Criterion) {
         ("granule(size:1kb)", "size:1kb".into(), true),
         ("constant(size:tiny)", "size:tiny".into(), true),
         ("or(dm:2024|size:>2mb)", "dm:2024|size:>2mb".into(), true),
+        // W8: a folder's entries' sizes and dates, from a pass over the
+        // entries before the search, or summed folder by folder.
+        (
+            "child(child-file-size:>2.5mb)",
+            "child-file-size:>2.5mb".into(),
+            true,
+        ),
+        ("child(childdm:2024)", "childdm:2024".into(), true),
+        (
+            "child(childfolderdm:2024)",
+            "childfolderdm:2024".into(),
+            true,
+        ),
+        (
+            "total(total-child-size:>80mb)",
+            "total-child-size:>80mb".into(),
+            true,
+        ),
     ];
     bench_group(c, "query_dates", &idx, &dates);
 }

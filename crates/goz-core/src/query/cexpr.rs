@@ -13,9 +13,11 @@
 //! those that need the entry, so the first can run in the pass over the
 //! distinct names, the fast path of a name-level query.
 //!
-//! A sub-search (`child:`, `descendant:`, `sibling:`, `ancestor-name:`) is
-//! worked out here too, once per volume, into the set of entries it holds
-//! for (see the `related` module), so that testing an entry is a lookup.
+//! A term on related entries (a sub-search such as `child:` or
+//! `ancestor-sibling:`, a child size or date test, a descendant or sibling
+//! count) is worked out here too, once per volume, into the set of entries
+//! it holds for (see the `related` module), so that testing an entry is a
+//! lookup.
 //!
 //! The children of each AND and OR are ordered cheapest first (a kind, a
 //! size or date compare, a name search, a wildcard, an extension, a full-path
@@ -29,7 +31,7 @@ use super::expr::{CountOf, Expr, FolderPath, Leaf, LenOf, Relation, Target};
 use super::glob::{CodePointBuf, Glob, decode_into};
 use super::parse::{Kind, SizeRange, Wildcard};
 use super::pattern::RegexTerm;
-use super::related::{RelatedSet, name_term_matches};
+use super::related::{CountSet, RelatedSet, Worked, name_term_matches, total_child_size};
 use super::text::{TextMatcher, utf16_len};
 use crate::fold::{fold_exact_into, fold_into};
 use crate::index::volume::MAX_PATH_HOPS;
@@ -126,6 +128,10 @@ pub(super) enum CNode<'a> {
         of: CountOf,
         range: SizeRange,
     },
+    /// A descendant or sibling count, worked out for the volume.
+    Counted(Arc<CountSet>),
+    /// A folder whose files' sizes, summed, are in range.
+    TotalChildSize(SizeRange),
     /// The entry's folder is one of these.
     Parent(Vec<EntryIdx>),
     /// One of the entry's folders is one of these.
@@ -168,10 +174,10 @@ pub(super) struct Volume<'i> {
     pub(super) parts_are_names: bool,
     /// The query's budget, which a sub-search's work counts against.
     pub(super) budget: &'i Budget<'i>,
-    /// The sub-searches worked out so far, by their leaf: an expression is
-    /// compiled twice for a volume (see `CompiledQuery::new`), and each
-    /// sub-search is worked out once.
-    pub(super) related: RefCell<Vec<(*const Leaf, Arc<RelatedSet>)>>,
+    /// The terms on related entries worked out so far, by their leaf: an
+    /// expression is compiled twice for a volume (see
+    /// `CompiledQuery::new`), and each is worked out once.
+    pub(super) related: RefCell<Vec<(*const Leaf, Worked)>>,
 }
 
 impl Volume<'_> {
@@ -184,28 +190,16 @@ impl Volume<'_> {
         }
     }
 
-    /// Sub-search `leaf` on this volume, worked out now unless it was
-    /// already.
-    fn related(
-        &self,
-        leaf: &Leaf,
-        relation: Relation,
-        kind: Option<Kind>,
-        name: &CNode<'_>,
-    ) -> Arc<RelatedSet> {
+    /// Term `leaf` on related entries on this volume, worked out now by
+    /// `work` unless it was already.
+    fn worked(&self, leaf: &Leaf, work: impl FnOnce() -> Worked) -> Worked {
         let key: *const Leaf = leaf;
-        if let Some((_, set)) = self.related.borrow().iter().find(|(k, _)| *k == key) {
-            return Arc::clone(set);
+        if let Some((_, worked)) = self.related.borrow().iter().find(|(k, _)| *k == key) {
+            return worked.clone();
         }
-        let set = Arc::new(RelatedSet::new(
-            self.index,
-            relation,
-            kind,
-            name,
-            self.budget,
-        ));
-        self.related.borrow_mut().push((key, Arc::clone(&set)));
-        set
+        let worked = work();
+        self.related.borrow_mut().push((key, worked.clone()));
+        worked
     }
 
     /// The name Everything gives the volume's root: its path, the mount
@@ -402,10 +396,37 @@ fn compile_leaf<'a>(leaf: &'a Leaf, volume: &Volume) -> CNode<'a> {
             of: *of,
             range: *range,
         },
+        Leaf::Count { of, range } if of.is_volume_wide() => {
+            if range.is_any() {
+                // Every folder has its descendants counted, and every entry
+                // its siblings: a value's own `!` asks for one (see
+                // `parse::not_value`), and needs no set.
+                match of {
+                    CountOf::Siblings | CountOf::SiblingFiles | CountOf::SiblingFolders => {
+                        CNode::True
+                    }
+                    _ => CNode::Kind(Kind::Folder),
+                }
+            } else {
+                match volume.worked(leaf, || {
+                    Worked::Counted(Arc::new(CountSet::new(
+                        volume.index,
+                        *of,
+                        *range,
+                        volume.budget,
+                    )))
+                }) {
+                    Worked::Counted(set) => CNode::Counted(set),
+                    // A leaf is worked out as one kind of term only.
+                    Worked::Related(_) => CNode::False,
+                }
+            }
+        }
         Leaf::Count { of, range } => CNode::Count {
             of: *of,
             range: *range,
         },
+        Leaf::TotalChildSize(range) => CNode::TotalChildSize(*range),
         Leaf::Parent(paths) => match volume.folders(paths, false) {
             Ok(dirs) if !dirs.is_empty() => CNode::Parent(dirs),
             _ => CNode::False,
@@ -427,20 +448,35 @@ fn compile_leaf<'a>(leaf: &'a Leaf, volume: &Volume) -> CNode<'a> {
         Leaf::Related {
             relation,
             kind,
-            name,
+            term,
         } => {
             // Above every entry is the root, named by the prefix.
             if *relation == Relation::Ancestor
-                && name_term_matches(name, volume.root_name(), volume.budget)
+                && name_term_matches(term, volume.root_name(), volume.budget)
             {
                 return CNode::True;
             }
-            let name = compile(name, volume);
-            if matches!(name, CNode::False) {
-                // No name matches: no entry is related to a match.
+            let term = compile(term, volume);
+            if matches!(term, CNode::False) {
+                // Nothing matches: no entry is related to a match.
                 return CNode::False;
             }
-            CNode::Related(volume.related(leaf, *relation, *kind, &name))
+            // A term on the name, or a child's size or date test.
+            let by_name = term.decided_by_name();
+            match volume.worked(leaf, || {
+                Worked::Related(Arc::new(RelatedSet::new(
+                    volume.index,
+                    *relation,
+                    *kind,
+                    &term,
+                    by_name,
+                    volume.budget,
+                )))
+            }) {
+                Worked::Related(set) => CNode::Related(set),
+                // A leaf is worked out as one kind of term only.
+                Worked::Counted(_) => CNode::False,
+            }
         }
     }
 }
@@ -508,15 +544,18 @@ pub(super) fn source(node: &CNode<'_>) -> Option<Source> {
     })
 }
 
-/// The first top-level sub-search of `node`, the expression's terms on the
-/// entry: every match is among the entries its set gives.
-pub(super) fn related_source(node: &CNode<'_>) -> Option<Arc<RelatedSet>> {
+/// The first top-level term on related entries of `node`, the expression's
+/// terms on the entry, that bounds its candidates (see
+/// [`Worked::for_each_candidate`]): every match is among the entries its set
+/// gives.
+pub(super) fn related_source(node: &CNode<'_>) -> Option<Worked> {
     let items = match node {
         CNode::And(items) => items.as_slice(),
         other => std::slice::from_ref(other),
     };
     items.iter().find_map(|i| match i {
-        CNode::Related(set) => Some(Arc::clone(set)),
+        CNode::Related(set) if set.bounds() => Some(Worked::Related(Arc::clone(set))),
+        CNode::Counted(set) => Some(Worked::Counted(Arc::clone(set))),
         _ => None,
     })
 }
@@ -638,9 +677,11 @@ impl<'a> CNode<'a> {
             {
                 4
             }
-            CNode::Ext(_) | CNode::Ancestor(_) | CNode::Count { .. } => 5,
+            CNode::Ext(_) | CNode::Ancestor(_) | CNode::Count { .. } | CNode::TotalChildSize(_) => {
+                5
+            }
             // Worked out before the search: a lookup or two.
-            CNode::Related(_) => 2,
+            CNode::Related(_) | CNode::Counted(_) => 2,
             CNode::Regex { target, .. } if target.by_name() => 6,
             CNode::Path { .. }
             | CNode::Text { .. }
@@ -669,7 +710,7 @@ impl<'a> CNode<'a> {
     }
 
     /// Whether every leaf is decided by the name alone.
-    fn decided_by_name(&self) -> bool {
+    pub(super) fn decided_by_name(&self) -> bool {
         match self {
             CNode::True
             | CNode::False
@@ -876,6 +917,10 @@ impl<'a> CNode<'a> {
                 .entry
                 .is_some_and(|e| dirs.binary_search(&s.index.entry(e).parent()).is_ok()),
             CNode::Related(set) => s.entry.is_some_and(|e| set.holds(s.index, e)),
+            CNode::Counted(set) => s.entry.is_some_and(|e| set.holds(s.index, e)),
+            CNode::TotalChildSize(range) => s
+                .entry
+                .is_some_and(|e| total_child_size(s.index, e).is_some_and(|t| range.contains(t))),
             CNode::Ancestor(dirs) => s.entry.is_some_and(|e| {
                 let mut cur = s.index.entry(e).parent();
                 for _ in 0..MAX_PATH_HOPS {
@@ -944,6 +989,13 @@ fn count(
         CountOf::Children => None,
         CountOf::ChildFiles => Some(Kind::File),
         CountOf::ChildFolders => Some(Kind::Folder),
+        // Worked out for the volume (`CNode::Counted`), never here.
+        CountOf::Descendants
+        | CountOf::DescendantFiles
+        | CountOf::DescendantFolders
+        | CountOf::Siblings
+        | CountOf::SiblingFiles
+        | CountOf::SiblingFolders => return None,
     };
     let cap = usize::try_from(range.max.saturating_add(1)).unwrap_or(usize::MAX);
     let n = index

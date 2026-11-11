@@ -261,6 +261,58 @@ pub(super) enum Func {
     SiblingFolder,
     /// `ancestor-name:`: a folder above the entry has a name that matches.
     AncestorName,
+    /// `parent-child:`: the entry's folder holds an entry whose name
+    /// matches, the entry itself included.
+    ParentChild,
+    /// `parent-child-file:`.
+    ParentChildFile,
+    /// `parent-child-folder:`.
+    ParentChildFolder,
+    /// `parent-sibling:`: the folder above the entry's folder holds an
+    /// entry whose name matches, the entry's folder itself included.
+    ParentSibling,
+    /// `parent-sibling-file:`.
+    ParentSiblingFile,
+    /// `parent-sibling-folder:`.
+    ParentSiblingFolder,
+    /// `ancestor-child:`: a folder above the entry holds an entry whose
+    /// name matches.
+    AncestorChild,
+    /// `ancestor-child-file:`.
+    AncestorChildFile,
+    /// `ancestor-child-folder:`.
+    AncestorChildFolder,
+    /// `ancestor-sibling:`: a folder above the entry's folder holds an
+    /// entry whose name matches.
+    AncestorSibling,
+    /// `ancestor-sibling-file:`.
+    AncestorSiblingFile,
+    /// `ancestor-sibling-folder:`.
+    AncestorSiblingFolder,
+    /// `descendant-count:`: how many files and folders are below a folder.
+    DescendantCount,
+    /// `descendant-file-count:`.
+    DescendantFileCount,
+    /// `descendant-folder-count:`.
+    DescendantFolderCount,
+    /// `sibling-count:`: how many other files and folders the entry's
+    /// folder holds.
+    SiblingCount,
+    /// `sibling-file-count:`.
+    SiblingFileCount,
+    /// `sibling-folder-count:`.
+    SiblingFolderCount,
+    /// `child-file-size:`: a folder holds a file of that size.
+    ChildFileSize,
+    /// `child-date-modified:` (`childdm:`): a folder holds a file or folder
+    /// modified then.
+    ChildDate,
+    /// `child-file-date-modified:` (`childfiledm:`).
+    ChildFileDate,
+    /// `child-folder-date-modified:` (`childfolderdm:`).
+    ChildFolderDate,
+    /// `total-child-size:`: the sizes of a folder's files, summed.
+    TotalChildSize,
 }
 
 impl Func {
@@ -280,6 +332,17 @@ impl Func {
                 | Func::ChildCount
                 | Func::ChildFileCount
                 | Func::ChildFolderCount
+                | Func::DescendantCount
+                | Func::DescendantFileCount
+                | Func::DescendantFolderCount
+                | Func::SiblingCount
+                | Func::SiblingFileCount
+                | Func::SiblingFolderCount
+                | Func::ChildFileSize
+                | Func::ChildDate
+                | Func::ChildFileDate
+                | Func::ChildFolderDate
+                | Func::TotalChildSize
         )
     }
 
@@ -304,6 +367,18 @@ impl Func {
                 | Func::SiblingFile
                 | Func::SiblingFolder
                 | Func::AncestorName
+                | Func::ParentChild
+                | Func::ParentChildFile
+                | Func::ParentChildFolder
+                | Func::ParentSibling
+                | Func::ParentSiblingFile
+                | Func::ParentSiblingFolder
+                | Func::AncestorChild
+                | Func::AncestorChildFile
+                | Func::AncestorChildFolder
+                | Func::AncestorSibling
+                | Func::AncestorSiblingFile
+                | Func::AncestorSiblingFolder
         )
     }
 
@@ -340,6 +415,29 @@ impl Func {
             Func::SiblingFile => "sibling-file:",
             Func::SiblingFolder => "sibling-folder:",
             Func::AncestorName => "ancestor-name:",
+            Func::ParentChild => "parent-child:",
+            Func::ParentChildFile => "parent-child-file:",
+            Func::ParentChildFolder => "parent-child-folder:",
+            Func::ParentSibling => "parent-sibling:",
+            Func::ParentSiblingFile => "parent-sibling-file:",
+            Func::ParentSiblingFolder => "parent-sibling-folder:",
+            Func::AncestorChild => "ancestor-child:",
+            Func::AncestorChildFile => "ancestor-child-file:",
+            Func::AncestorChildFolder => "ancestor-child-folder:",
+            Func::AncestorSibling => "ancestor-sibling:",
+            Func::AncestorSiblingFile => "ancestor-sibling-file:",
+            Func::AncestorSiblingFolder => "ancestor-sibling-folder:",
+            Func::DescendantCount => "descendant-count:",
+            Func::DescendantFileCount => "descendant-file-count:",
+            Func::DescendantFolderCount => "descendant-folder-count:",
+            Func::SiblingCount => "sibling-count:",
+            Func::SiblingFileCount => "sibling-file-count:",
+            Func::SiblingFolderCount => "sibling-folder-count:",
+            Func::ChildFileSize => "child-file-size:",
+            Func::ChildDate => "child-date-modified:",
+            Func::ChildFileDate => "child-file-date-modified:",
+            Func::ChildFolderDate => "child-folder-date-modified:",
+            Func::TotalChildSize => "total-child-size:",
         }
     }
 }
@@ -421,7 +519,29 @@ enum Named {
     Prefix(Prefix),
     /// A name Everything knows that goz refuses, with why.
     Refused(&'static str),
+    /// One of Everything's functions of related entries that needs what
+    /// goz's index does not hold, with why.
+    Unsupported(&'static str),
 }
+
+/// Why `child-size:` and `child-folder-size:` are refused.
+const NO_CHILD_FOLDER_SIZES: &str = "goz's index holds no folder sizes, which Everything \
+                                     compares for a child folder (M7); child-file-size: \
+                                     tests the files alone";
+/// Why `parent-size:` is refused.
+const NO_FOLDER_SIZES: &str = "goz's index holds no folder sizes (M7)";
+/// Why the date created, accessed, changed and run, run count and
+/// attribute functions of related entries are refused.
+const NO_SUCH_DATA: &str = "goz's index holds no dates created, accessed, recently changed \
+                            or run, no run counts and no attributes (M7); of a file it \
+                            holds the size and the date modified";
+/// Why the occurrence counts are refused.
+const NO_OCCURRENCES: &str = "it counts the hits of the query's child: or descendant: term \
+                              in each folder, which goz does not keep; child-count:, \
+                              descendant-count: and child: answer the other questions";
+/// Why the counts read from disk are refused.
+const NO_DISK: &str = "goz answers from its index and never reads a folder from disk; \
+                       child-count: counts what the index holds";
 
 impl Prefix {
     /// The prefix `name` stands for, lower-cased with its hyphens dropped,
@@ -458,6 +578,7 @@ impl Prefix {
         let off = |m: Mod| Named::Prefix(Prefix::Mod(m, false));
         let func = |f: Func| Named::Prefix(Prefix::Func(f));
         let macro_ = |m: Macro| Named::Prefix(Prefix::Macro(m));
+        let unsupported = Named::Unsupported;
         Some(match name {
             "case" => on(M::Case),
             "path" | "\\" => on(M::Path),
@@ -503,16 +624,89 @@ impl Prefix {
             "childcount" => func(F::ChildCount),
             "childfilecount" => func(F::ChildFileCount),
             "childfoldercount" => func(F::ChildFolderCount),
-            "child" => func(F::Child),
-            "childfile" => func(F::ChildFile),
-            "childfolder" => func(F::ChildFolder),
+            "child" | "childname" => func(F::Child),
+            "childfile" | "childfilename" => func(F::ChildFile),
+            "childfolder" | "childfoldername" => func(F::ChildFolder),
             "descendant" => func(F::Descendant),
             "descendantfile" => func(F::DescendantFile),
             "descendantfolder" => func(F::DescendantFolder),
-            "sibling" => func(F::Sibling),
-            "siblingfile" => func(F::SiblingFile),
-            "siblingfolder" => func(F::SiblingFolder),
+            "sibling" | "siblingname" => func(F::Sibling),
+            "siblingfile" | "siblingfilename" => func(F::SiblingFile),
+            "siblingfolder" | "siblingfoldername" => func(F::SiblingFolder),
             "ancestorname" => func(F::AncestorName),
+            "parentchild" => func(F::ParentChild),
+            "parentchildfile" => func(F::ParentChildFile),
+            "parentchildfolder" => func(F::ParentChildFolder),
+            "parentsibling" => func(F::ParentSibling),
+            "parentsiblingfile" => func(F::ParentSiblingFile),
+            "parentsiblingfolder" => func(F::ParentSiblingFolder),
+            "ancestorchild" => func(F::AncestorChild),
+            "ancestorchildfile" => func(F::AncestorChildFile),
+            "ancestorchildfolder" => func(F::AncestorChildFolder),
+            "ancestorsibling" => func(F::AncestorSibling),
+            "ancestorsiblingfile" => func(F::AncestorSiblingFile),
+            "ancestorsiblingfolder" => func(F::AncestorSiblingFolder),
+            "descendantcount" => func(F::DescendantCount),
+            "descendantfilecount" => func(F::DescendantFileCount),
+            "descendantfoldercount" => func(F::DescendantFolderCount),
+            "siblingcount" => func(F::SiblingCount),
+            "siblingfilecount" => func(F::SiblingFileCount),
+            "siblingfoldercount" => func(F::SiblingFolderCount),
+            "childfilesize" => func(F::ChildFileSize),
+            "childdatemodified" | "childdm" => func(F::ChildDate),
+            "childfiledatemodified" | "childfiledm" => func(F::ChildFileDate),
+            "childfolderdatemodified" | "childfolderdm" => func(F::ChildFolderDate),
+            "totalchildsize" => func(F::TotalChildSize),
+            "childsize" => unsupported(NO_CHILD_FOLDER_SIZES),
+            "childfoldersize" => unsupported(NO_CHILD_FOLDER_SIZES),
+            "parentsize" => unsupported(NO_FOLDER_SIZES),
+            "childdatecreated"
+            | "childdc"
+            | "childfiledatecreated"
+            | "childfiledc"
+            | "childfolderdatecreated"
+            | "childfolderdc"
+            | "childdateaccessed"
+            | "childda"
+            | "childfiledateaccessed"
+            | "childfileda"
+            | "childfolderdateaccessed"
+            | "childfolderda"
+            | "childdaterecentlychanged"
+            | "childrc"
+            | "childfiledaterecentlychanged"
+            | "childfilerc"
+            | "childfolderdaterecentlychanged"
+            | "childfolderrc"
+            | "childdaterun"
+            | "childfiledaterun"
+            | "childfolderdaterun"
+            | "childruncount"
+            | "childfileruncount"
+            | "childfolderruncount"
+            | "childattr"
+            | "childattrib"
+            | "childattribute"
+            | "childattributes"
+            | "childfileattr"
+            | "childfileattrib"
+            | "childfileattribute"
+            | "childfileattributes"
+            | "childfolderattr"
+            | "childfolderattrib"
+            | "childfolderattribute"
+            | "childfolderattributes"
+            | "ancestorattr"
+            | "ancestorattrib"
+            | "ancestorattribute"
+            | "ancestorattributes"
+            | "parentdatecreated"
+            | "parentdc" => unsupported(NO_SUCH_DATA),
+            "childoccurrencecount" => unsupported(NO_OCCURRENCES),
+            "descendantoccurrencecount" => unsupported(NO_OCCURRENCES),
+            "childcountfromdisk" | "childfilecountfromdisk" | "childfoldercountfromdisk" => {
+                unsupported(NO_DISK)
+            }
             "empty" => Named::Prefix(Prefix::Empty),
             "audio" => macro_(Macro::Audio),
             "zip" => macro_(Macro::Zip),
@@ -980,6 +1174,12 @@ impl Lexer {
                     return Err(QueryError::Malformed {
                         what: "wildcards:",
                         detail: why.to_string(),
+                    });
+                }
+                Some(Named::Unsupported(why)) => {
+                    return Err(QueryError::Unsupported {
+                        what: format!("{}:", raw.trim_end_matches('*')),
+                        why,
                     });
                 }
                 None if global => return Ok(None),
