@@ -384,6 +384,18 @@ pub(super) fn simplify(e: Expr) -> Expr {
             Expr::Not(twice) => *twice,
             other => other.not(),
         },
+        // Every name has a length, so a name length that any length passes
+        // is every entry, and one that none does is none: the constants the
+        // goz client puts where a `content:` term stood (see the `content`
+        // module), which cost the search nothing this way.
+        Expr::Leaf(Leaf::Len {
+            of: LenOf::Name,
+            range,
+        }) if range.is_any() => Expr::True,
+        Expr::Leaf(Leaf::Len {
+            of: LenOf::Name,
+            range,
+        }) if range.min > range.max => Expr::False,
         leaf => leaf,
     }
 }

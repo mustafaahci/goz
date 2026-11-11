@@ -279,8 +279,10 @@ fn tail_loop(state: &VolumeState, handle: VolumeHandle, stop: &AtomicBool, pulse
                 // the one thing here that used to run long (~184 ms on a large
                 // index), is no longer inline: `apply_batch` reports it and
                 // `compact_index` does the copying off the exclusive lock.
+                // The batch moves the generation, which the guard publishes
+                // to watchers as it drops.
                 let outcome = {
-                    let mut index = state.index.write();
+                    let mut index = state.write_index();
                     index.apply_batch(&walk.records)
                 };
                 for anomaly in &outcome.anomalies {
@@ -520,8 +522,11 @@ fn reconcile_links(
     if walked.is_empty() && dropped == 0 {
         return;
     }
-    let mut index = state.index.write();
+    let mut index = state.write_index();
     dropped += apply_link_walks(&mut index, &walked);
+    if !walked.is_empty() {
+        index.note_changed();
+    }
     if dropped > 0 {
         // Not silent: a reconcile we could not perform means names on this
         // volume may be stale until the next rescan, and `--status` says so.
@@ -641,10 +646,13 @@ fn enrich_stats(
     if stats.is_empty() {
         return;
     }
-    let mut index = state.index.write();
+    let mut index = state.write_index();
     for (frn, size, mtime) in stats {
         index.set_stat(frn, size, mtime);
     }
+    // Sizes and dates change what a query matches and how it sorts, so
+    // watchers are told, as for a journal batch.
+    index.note_changed();
 }
 
 /// Rescan with a storm guard: rebuilds the index, capping consecutive attempts
@@ -873,9 +881,11 @@ fn install(
     built: bootstrap::BuiltIndex,
     journal: JournalSetup,
 ) -> Option<JournalInfo> {
-    {
+    let generation = {
         let mut index = state.index.write();
+        let before = index.generation();
         *index = built.index;
+        index.continue_generation(before);
         *state.metadata_pending.write() = built.metadata_pending;
         *state.journal_max_bytes.write() = journal.cursor().map(|c| c.maximum_size);
         state.indexed.store(true, Ordering::Release);
@@ -886,8 +896,12 @@ fn install(
         // would index out of bounds in VolumeIndex::path_of during scope
         // validation.
         *state.scope_cache.lock() = None;
-    }
+        index.generation()
+    };
     *state.phase.write() = journal.built_phase();
+    // Told after the phase, so a watcher that asks again at once finds the
+    // volume complete.
+    state.publish(generation);
     journal.cursor()
 }
 
@@ -1043,6 +1057,7 @@ mod tests {
                 rel: b"windows".to_vec(),
                 entry: 1,
             })),
+            published_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1281,6 +1296,32 @@ mod tests {
         install(&state, built(true), JournalSetup::Refused);
         assert!(*state.metadata_pending.read());
         assert_eq!(*state.journal_max_bytes.read(), None);
+    }
+
+    /// A rebuilt index keeps the volume's generation rising and tells
+    /// watchers of it; so do the enricher's sizes and dates and folder-size
+    /// deltas, written through the publishing guard, and a write that
+    /// changes nothing tells no one.
+    #[test]
+    fn every_change_moves_the_generation_and_is_published() {
+        let state = volume(VolumePhase::Rescanning);
+        let mut seen = crate::volume_state::subscribe_changes();
+        seen.mark_unchanged();
+        install(&state, built(false), JournalSetup::Active(journal()));
+        assert_eq!(state.published(), 1);
+        assert!(seen.has_changed().unwrap());
+        {
+            let mut index = state.write_index();
+            index.note_changed();
+        }
+        assert_eq!(state.published(), 2);
+        state.write_index().note_folder_sizes_changed();
+        assert_eq!(state.published(), 3);
+        drop(state.write_index());
+        assert_eq!(state.published(), 3);
+        install(&state, built(false), JournalSetup::Active(journal()));
+        assert_eq!(state.published(), 4, "a rebuild never goes back");
+        assert_eq!(state.index.read().generation(), 4);
     }
 
     /// A rescan the volume refuses a new journal for leaves a Snapshot, as

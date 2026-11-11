@@ -25,6 +25,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(windows)]
 mod client;
 #[cfg(windows)]
+mod content;
+#[cfg(windows)]
 mod not_running;
 #[cfg(any(windows, test))]
 mod reply;
@@ -193,6 +195,18 @@ mod win {
         }
 
         let query = build_query(&plan);
+        // Content terms are searched here, under the user's own account:
+        // gozd gets the queries around them (see `content`).
+        let split = match goz_core::query::ContentQuery::new(&query.query, query.match_case) {
+            Ok(split) => split,
+            Err(e) => {
+                eprintln!("goz: {e}");
+                return Err(Exit::BadParam.into());
+            }
+        };
+        if !split.is_plain() {
+            return super::content::run(&plan, &mut connection, query, &split, export_file, timing);
+        }
         if !plan.result_count && !plan.total_size {
             return stream(&plan, &mut connection, query, export_file, timing);
         }
@@ -244,13 +258,13 @@ mod win {
     }
 
     /// Reports `-no-result-error`'s case, in es's words, and its exit code.
-    fn nothing_matched() -> ExitCode {
+    pub(crate) fn nothing_matched() -> ExitCode {
         eprintln!("goz: No results found.");
         Exit::NoResults.into()
     }
 
     /// Why a streamed search stopped before its last page.
-    enum Stop {
+    pub(crate) enum Stop {
         /// The daemon's reply failed.
         Client(ClientError),
         /// A page could not be written out.
@@ -266,12 +280,12 @@ mod win {
     /// The warning that volumes are still indexing, printed once, when the
     /// first page that says so arrives and before its rows.
     #[derive(Default)]
-    struct IncompleteWarning {
+    pub(crate) struct IncompleteWarning {
         printed: bool,
     }
 
     impl IncompleteWarning {
-        fn check(&mut self, page: &QueryResults) {
+        pub(crate) fn check(&mut self, page: &QueryResults) {
             if page.volumes_incomplete && !self.printed {
                 self.printed = true;
                 eprintln!(
@@ -350,6 +364,19 @@ mod win {
         export_file: Option<std::fs::File>,
         timing: &mut Option<Timing>,
     ) -> Result<ExitCode, ExitCode> {
+        emit(plan, export_file, timing, |page| {
+            connection.query(query, page)
+        })
+    }
+
+    /// Writes the pages `fetch` hands its callback, as [`stream`] describes:
+    /// gozd's as they arrive, or a content search's.
+    pub(crate) fn emit(
+        plan: &EsPlan,
+        export_file: Option<std::fs::File>,
+        timing: &mut Option<Timing>,
+        fetch: impl FnOnce(&mut dyn FnMut(QueryResults) -> Result<(), Stop>) -> Result<(), Stop>,
+    ) -> Result<ExitCode, ExitCode> {
         let format = output_format(plan);
         // Local time, ISO 8601 (es's `-date-format 1`), so the JavaScript
         // consumer's `new Date()` parses it regardless of locale. The time
@@ -373,7 +400,7 @@ mod win {
         let mut warning = IncompleteWarning::default();
         let mut buf = Vec::new();
         let mut total = 0;
-        let fetched = connection.query(query, |page| {
+        let fetched = fetch(&mut |page| {
             warning.check(&page);
             total = page.total;
             buf.clear();
@@ -474,7 +501,7 @@ mod win {
 
     /// `-get-result-count` and `-get-total-size`: the number alone, on stdout
     /// or, as es writes it, in the export file after its byte order mark.
-    fn number_only(
+    pub(crate) fn number_only(
         plan: &EsPlan,
         number: impl std::fmt::Display,
         export_file: Option<std::fs::File>,
@@ -547,7 +574,7 @@ mod win {
     }
 
     /// Reports a request that got no usable reply, and its exit code.
-    fn request_failed(error: ClientError) -> ExitCode {
+    pub(crate) fn request_failed(error: ClientError) -> ExitCode {
         match error {
             ClientError::Protocol(m) => {
                 eprintln!("goz: {m}");

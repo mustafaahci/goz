@@ -144,8 +144,6 @@ pub(super) const ES_ONLY_SWITCHES: &[&str] = &[
     "no-white-space",
     "no-ws",
     "nul",
-    "o-e",
-    "oe",
     "path-wide",
     "path-width",
     "pause",

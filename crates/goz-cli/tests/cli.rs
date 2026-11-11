@@ -160,8 +160,12 @@ fn malformed_search_text_exits_4() {
         (&["-argv", "<a|b"][..], "goz: unbalanced '<' at column 1"),
         (&["gr<a|e>y"][..], "group expansion such as gr<a|e>y"),
         (
-            &["!content:x"][..],
-            "unknown search function or modifier 'content:'",
+            &["!attrib:h"][..],
+            "unknown search function or modifier 'attrib:'",
+        ),
+        (
+            &["content:a", "content:b", "content:c", "content:d"][..],
+            "the query has 4 content: terms; goz searches at most 3 in one query",
         ),
         (&["-r", "(?<=a)b"][..], "look-around"),
     ] {

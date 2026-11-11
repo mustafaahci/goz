@@ -22,7 +22,8 @@ use goz_core::proto::{
     patch_results_header, push_item, push_results_header,
 };
 use goz_core::query::{
-    Budget, HitRef, mtime_key, parse_query_at, resolve_scope, run_query_refs, size_key,
+    Budget, HitRef, extension_key, mtime_key, parse_query_at, resolve_scope, run_query_refs,
+    size_key, sort_extension,
 };
 use goz_core::types::{EntryIdx, SortDir, SortKey, SortSpec};
 use goz_winfs::{PipeSecurity, build_pipe_security};
@@ -30,10 +31,11 @@ use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::local_clock::MachineClock;
 use crate::volume_state::{VolumeRegistry, VolumeSet, VolumeState};
+use crate::watch::Watchers;
 
 /// Cap on concurrently-served pipe connections. A silent/hostile local client
 /// cannot pin more than this many tasks + read buffers + pipe instances.
@@ -134,6 +136,7 @@ async fn accept_loop(
         ready();
     }
     let conn_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let watchers = Watchers::new();
     let mut connect_failures = Throttle::new(WARN_EVERY);
     let mut dropped_clients = Throttle::new(WARN_EVERY);
     // A line is due at a burst's first event; this logs the rest of it.
@@ -165,10 +168,15 @@ async fn accept_loop(
                 match Arc::clone(&conn_limit).try_acquire_owned() {
                     Ok(permit) => {
                         let vols = volumes.clone();
+                        let watchers = Arc::clone(&watchers);
                         tokio::spawn(async move {
-                            let _permit = permit; // held for the connection's lifetime
                             let mut connected = connected;
-                            if let Err(e) = handle_connection(&mut connected, vols).await {
+                            // The permit is held for the connection's
+                            // lifetime, but for a watch's (see `watch`).
+                            if let Err(e) =
+                                handle_connection(&mut connected, vols, Some(permit), &watchers)
+                                    .await
+                            {
                                 tracing::debug!(error = %e, "connection ended");
                             }
                             // Dropping the instance cancels only reads and
@@ -341,7 +349,10 @@ fn name_taken(e: &anyhow::Error) -> bool {
 async fn handle_connection(
     server: &mut NamedPipeServer,
     volumes: Arc<VolumeRegistry>,
+    permit: Option<OwnedSemaphorePermit>,
+    watchers: &Arc<Watchers>,
 ) -> Result<()> {
+    let mut permit = permit;
     let mut decoder = goz_core::proto::FrameDecoder::new(MAX_CLIENT_FRAME);
     let mut read_buf = vec![0u8; 16 * 1024];
     // Reap idle/half-open connections: a connected client that never sends a
@@ -419,6 +430,26 @@ async fn handle_connection(
                     }
                     wait = WRITE_TIMEOUT;
                     continue;
+                }
+                // A watch holds the connection until the client closes it.
+                // It gives back its slot among the general connections,
+                // so watchers never starve queries, and takes one of the
+                // watches' own; a request pipelined after it ends it.
+                Ok(Request::Watch {
+                    volumes: names,
+                    min_interval_ms,
+                }) => {
+                    if !decoder.is_empty() {
+                        return Ok(());
+                    }
+                    let process = {
+                        use std::os::windows::io::AsRawHandle;
+                        goz_winfs::pipe_client_process_id(server.as_raw_handle())
+                    };
+                    let slot = watchers.claim(process);
+                    drop(permit.take());
+                    crate::watch::run(server, &volumes, names, min_interval_ms, slot).await?;
+                    return Ok(());
                 }
                 // Hello / Status are trivial; encode inline as a tagged JSON frame.
                 Ok(req) => {
@@ -857,7 +888,21 @@ fn handle_request(volumes: &VolumeSet, req: Request) -> Response {
         // Queries are streamed directly to binary frames by stream_query_binary
         // and never routed through here.
         Request::Query(_) => unreachable!("Query is handled by stream_query_binary"),
+        // A watch holds its connection (see `handle_connection`).
+        Request::Watch { .. } => unreachable!("Watch is handled by watch::run"),
     }
+}
+
+/// What this daemon supports now beyond protocol 1 as v0.6.0 spoke it, for
+/// `Hello.features`: the one place the list is built.
+///
+/// - `watch`: [`Request::Watch`] is understood.
+/// - `sort:extension`: [`SortKey::Extension`] is understood.
+fn features(_volumes: &VolumeSet) -> Vec<String> {
+    ["watch", "sort:extension"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Answers version negotiation.
@@ -879,6 +924,7 @@ fn hello(volumes: &VolumeSet, proto_min: u16, proto_max: u16) -> Response {
         proto: PROTO_VERSION,
         server: concat!("gozd ", env!("CARGO_PKG_VERSION")).to_string(),
         ready: all_volumes_live(volumes),
+        features: features(volumes),
     }
 }
 
@@ -1218,6 +1264,14 @@ fn cmp_heads(
         SortKey::DateModified => mtime_key(ia.entry(ha.idx).mtime(), sort.dir)
             .cmp(&mtime_key(ib.entry(hb.idx).mtime(), sort.dir))
             .then_with(by_name),
+        SortKey::Extension => {
+            let (na, da) = (ia.folded_name(ha.idx), ia.entry(ha.idx).is_dir());
+            let (nb, db) = (ib.folded_name(hb.idx), ib.entry(hb.idx).is_dir());
+            extension_key(na, da)
+                .cmp(&extension_key(nb, db))
+                .then_with(|| sort_extension(na, da).cmp(sort_extension(nb, db)))
+                .then_with(by_name)
+        }
         SortKey::Path => {
             runs[a].ensure_head_key(ia, vols[a].mount_prefix());
             runs[b].ensure_head_key(ib, vols[b].mount_prefix());
@@ -1321,6 +1375,7 @@ mod tests {
             journal_max_bytes: RwLock::new(None),
             indexed: AtomicBool::new(true),
             scope_cache: Mutex::new(None),
+            published_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1727,9 +1782,14 @@ mod tests {
                 client.write_all(&frame).await.unwrap();
             }
             let started = tokio::time::Instant::now();
-            handle_connection(&mut server, Arc::new(VolumeRegistry::default()))
-                .await
-                .unwrap();
+            handle_connection(
+                &mut server,
+                Arc::new(VolumeRegistry::default()),
+                None,
+                &crate::watch::Watchers::new(),
+            )
+            .await
+            .unwrap();
             let waited = started.elapsed();
             if asks {
                 assert!(waited >= WRITE_TIMEOUT, "dropped after {waited:?}");
@@ -1997,7 +2057,8 @@ mod tests {
             drop(client);
         });
         let started = std::time::Instant::now();
-        let _: Result<(), _> = handle_connection(&mut server, registry).await;
+        let _: Result<(), _> =
+            handle_connection(&mut server, registry, None, &crate::watch::Watchers::new()).await;
         let took = started.elapsed();
         assert!(took < SEARCH_BUDGET / 2, "searched on for {took:?}");
     }
@@ -2166,6 +2227,86 @@ mod tests {
             ["a.log", "a.log", "z.log", "z.log"],
             "merged pages must be globally ordered by name, not by path or by volume"
         );
+    }
+
+    /// An extension sort over two volumes is one order, Everything's:
+    /// folders first, then the files without an extension, then by
+    /// extension (past the key's first seven bytes too), and by name within
+    /// one; descending is its exact reverse.
+    #[test]
+    fn extension_sort_merges_volumes_as_everything_orders() {
+        use goz_core::types::SortDir;
+        let build = |names: &[(&str, bool)]| {
+            let mut index = VolumeIndex::new(NTFS_ROOT_FRN, FrnMap::sparse());
+            for (i, (name, dir)) in names.iter().enumerate() {
+                let frn = 100 + i as u64;
+                index.insert_enum(&if *dir {
+                    dir_record(frn, NTFS_ROOT_FRN.0, name)
+                } else {
+                    file_record(frn, NTFS_ROOT_FRN.0, name)
+                });
+            }
+            index
+        };
+        let c = build(&[
+            ("b.TXT", false),
+            ("dir.d", true),
+            ("noext", false),
+            ("z.tar.gz", false),
+            ("x.abcdefgz", false),
+            (".hidden", false),
+        ]);
+        let d = build(&[
+            ("a.txt", false),
+            ("Zdir.aaa", true),
+            ("y.gz", false),
+            ("x.abcdefga", false),
+            ("e", false),
+            ("c.Doc", false),
+        ]);
+        let vols = set(&[
+            volume(r"C:\", c, VolumePhase::Live),
+            volume(r"D:\", d, VolumePhase::Live),
+        ]);
+        let order = |dir| {
+            let mut q = query("");
+            q.sort = SortSpec {
+                key: SortKey::Extension,
+                dir,
+            };
+            paths(&encode_query_binary(&vols, q))
+                .into_iter()
+                .map(|p| p.rsplit('\\').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let want = [
+            "dir.d",
+            "Zdir.aaa",
+            "e",
+            "noext",
+            "x.abcdefga",
+            "x.abcdefgz",
+            "c.Doc",
+            "y.gz",
+            "z.tar.gz",
+            ".hidden",
+            "a.txt",
+            "b.TXT",
+        ];
+        assert_eq!(order(SortDir::Asc), want);
+        let mut reversed = want.to_vec();
+        reversed.reverse();
+        assert_eq!(order(SortDir::Desc), reversed);
+    }
+
+    /// The daemon lists what it understands, in `Hello.features`.
+    #[test]
+    fn hello_lists_the_features() {
+        let vols = set(&[live_volume(r"C:\")]);
+        let Response::Hello { features, .. } = handle_request(&vols, hello_request(1, 1)) else {
+            panic!("a v1 client must negotiate")
+        };
+        assert_eq!(features, ["watch", "sort:extension"]);
     }
 
     /// A boolean query runs on each volume and merges as any other does: one
@@ -2412,6 +2553,7 @@ mod tests {
             SortKey::Path,
             SortKey::Size,
             SortKey::DateModified,
+            SortKey::Extension,
         ] {
             for dir in [SortDir::Asc, SortDir::Desc] {
                 let page = |limit| {

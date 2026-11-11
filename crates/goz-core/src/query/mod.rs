@@ -10,6 +10,7 @@
 
 pub mod budget;
 mod cexpr;
+pub mod content;
 pub mod dates;
 pub mod engine;
 mod expr;
@@ -30,10 +31,14 @@ mod value;
 pub use crate::fold;
 
 pub use budget::{Budget, Stopped};
+pub use content::{
+    ContentEncoding, ContentEnv, ContentQuery, ContentTerm, MAX_CONTENT_TERMS, TextFilter,
+    sort_items,
+};
 pub use dates::{DateFilter, DateOrder, LocalClock};
 pub use engine::{
-    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, mtime_key, resolve_scope, run_query,
-    run_query_refs, size_key,
+    CompiledQuery, HitRef, QueryHit, QueryOutcome, RefOutcome, extension_key, mtime_key,
+    resolve_scope, run_query, run_query_refs, size_key, sort_extension,
 };
 pub use expr::{Anchors, Expr, FolderPath, Leaf, LenOf, Skip, Target};
 pub use parse::{

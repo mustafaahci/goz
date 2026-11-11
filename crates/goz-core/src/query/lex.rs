@@ -41,6 +41,7 @@
 //! for the operators after them. `no-!:` makes the `!` of the term it
 //! prefixes literal, and `?no-!:` of every term after it.
 
+use super::content::ContentEncoding;
 use super::parse::{Kind, QueryError};
 use crate::wtf8::encode_code_point;
 
@@ -50,6 +51,9 @@ pub(super) struct Token {
     pub(super) kind: Tok,
     /// The 1-based character column it starts at, for errors.
     pub(super) column: usize,
+    /// The 0-based character index just past its end: with `column`, the
+    /// span of text it was read from, which the `content` module replaces.
+    pub(super) end: usize,
     /// Whether white space separates it from the token before it.
     pub(super) spaced: bool,
     /// Whether AND binds tighter than OR where it stands: a
@@ -313,6 +317,10 @@ pub(super) enum Func {
     ChildFolderDate,
     /// `total-child-size:`: the sizes of a folder's files, summed.
     TotalChildSize,
+    /// `content:` and its encodings' forms (`utf8content:`, ...): the
+    /// file's content, which gozd never reads; the goz client searches it
+    /// (see the `content` module).
+    Content(ContentEncoding),
 }
 
 impl Func {
@@ -379,6 +387,7 @@ impl Func {
                 | Func::AncestorSibling
                 | Func::AncestorSiblingFile
                 | Func::AncestorSiblingFolder
+                | Func::Content(_)
         )
     }
 
@@ -438,6 +447,7 @@ impl Func {
             Func::ChildFileDate => "child-file-date-modified:",
             Func::ChildFolderDate => "child-folder-date-modified:",
             Func::TotalChildSize => "total-child-size:",
+            Func::Content(encoding) => encoding.spelling(),
         }
     }
 }
@@ -657,6 +667,17 @@ impl Prefix {
             "childfiledatemodified" | "childfiledm" => func(F::ChildFileDate),
             "childfolderdatemodified" | "childfolderdm" => func(F::ChildFolderDate),
             "totalchildsize" => func(F::TotalChildSize),
+            // Everything's content functions with their aliases
+            // (search_functions: content:, ansi-content:/contenta:,
+            // utf8-content:, utf16-content:/unicode-content:/
+            // utf16le-content:/wchar-content:/contentw:/wcontent:,
+            // utf16be-content:).
+            "content" => func(F::Content(ContentEncoding::Auto)),
+            "ansicontent" | "contenta" => func(F::Content(ContentEncoding::Ansi)),
+            "utf8content" => func(F::Content(ContentEncoding::Utf8)),
+            "utf16content" | "unicodecontent" | "utf16lecontent" | "wcharcontent" | "contentw"
+            | "wcontent" => func(F::Content(ContentEncoding::Utf16Le)),
+            "utf16becontent" => func(F::Content(ContentEncoding::Utf16Be)),
             "childsize" => unsupported(NO_CHILD_FOLDER_SIZES),
             "childfoldersize" => unsupported(NO_CHILD_FOLDER_SIZES),
             "parentsize" => unsupported(NO_FOLDER_SIZES),
@@ -885,6 +906,7 @@ impl Lexer {
         self.out.tokens.push(Token {
             kind,
             column,
+            end: self.at,
             spaced: std::mem::take(&mut self.spaced),
             and_first: self.and_first,
             global: self.global,

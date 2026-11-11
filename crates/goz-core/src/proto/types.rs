@@ -57,6 +57,23 @@ pub enum Request {
     Query(QueryRequest),
     /// Ask for per-volume index status.
     Status,
+    /// Watch volumes for changes, on a connection of its own: the daemon
+    /// replies [`Response::Watching`], then sends [`Response::Changed`]
+    /// after the changes it applies to a watched volume, at most one frame
+    /// per `max(min_interval_ms, 100)` ms, until the client closes the pipe.
+    /// The connection carries nothing else: a request sent on it ends the
+    /// watch. Understood when `Hello.features` lists `"watch"`; a daemon
+    /// predating it answers that the request is malformed.
+    Watch {
+        /// The volumes to watch, by mount (`C:\`, `C:`, a folder mount)
+        /// or volume GUID path, case-insensitively; `None` for every
+        /// volume, those found later included. A name that matches no
+        /// volume yet is watched for when one appears.
+        volumes: Option<Vec<String>>,
+        /// The least time between two `Changed` frames, in milliseconds;
+        /// the daemon never sends them closer than 100 ms.
+        min_interval_ms: u32,
+    },
 }
 
 /// Parameters of one search query.
@@ -94,11 +111,30 @@ pub enum Response {
         server: String,
         /// Whether the index is ready to serve queries.
         ready: bool,
+        /// What this daemon supports now beyond protocol 1 as v0.6.0 spoke
+        /// it, so a client asks only for what is understood: `"watch"`
+        /// ([`Request::Watch`]), `"sort:extension"` (and a `sort:` entry for
+        /// every [`crate::types::SortKey`] added since), and the others the
+        /// protocol names. Empty from a daemon predating the field.
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// One page of query results.
     Results(QueryResults),
     /// Reply to [`Request::Status`].
     Status(DaemonStatus),
+    /// Reply to [`Request::Watch`]: the watch is on.
+    Watching,
+    /// Volumes a [`Request::Watch`] watches changed since the last frame:
+    /// a journal batch was applied, sizes or dates were read, a folder's
+    /// size changed, the index was rebuilt, or the volume was found or went
+    /// away. Results drawn from them may be stale; asking again is current.
+    Changed {
+        /// Each changed volume and its generation now (see
+        /// [`VolumeStatus::generation`]); a volume that went away is listed
+        /// with the generation it had.
+        volumes: Vec<VolumeGen>,
+    },
     /// The request failed.
     Error {
         /// Machine-readable failure class.
@@ -106,6 +142,15 @@ pub enum Response {
         /// Human-readable detail for the user/log.
         message: String,
     },
+}
+
+/// A volume and its index generation, in [`Response::Changed`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeGen {
+    /// The volume's first mount (`C:\`), or its GUID path when it has
+    /// none: the prefix its results' paths start with.
+    pub mount: String,
+    pub generation: u64,
 }
 
 /// One page of matches for a [`QueryRequest`].
@@ -358,7 +403,47 @@ mod tests {
             proto: PROTO_VERSION,
             server: "gozd 0.1.0".into(),
             ready: false,
+            features: vec!["watch".into(), "sort:extension".into()],
         });
+    }
+
+    /// A Hello from a daemon predating `features` reads as one with none,
+    /// and a new Hello reads in a client that ignores the field.
+    #[test]
+    fn hello_features_are_optional() {
+        let resp: Response =
+            serde_json::from_str(r#"{"t":"Hello","proto":1,"server":"gozd 0.6.0","ready":true}"#)
+                .expect("an older hello");
+        assert!(matches!(resp, Response::Hello { features, .. } if features.is_empty()));
+        let json = serde_json::to_string(&Response::Hello {
+            proto: 1,
+            server: "gozd".into(),
+            ready: true,
+            features: vec!["watch".into()],
+        })
+        .unwrap();
+        assert!(json.ends_with(r#""features":["watch"]}"#), "{json}");
+    }
+
+    #[test]
+    fn watch_round_trips() {
+        rt_request(&Request::Watch {
+            volumes: Some(vec![r"C:".into(), "d:".into()]),
+            min_interval_ms: 250,
+        });
+        rt_request(&Request::Watch {
+            volumes: None,
+            min_interval_ms: 0,
+        });
+        rt_response(&Response::Watching);
+        rt_response(&Response::Changed {
+            volumes: vec![VolumeGen {
+                mount: r"C:".into(),
+                generation: 7,
+            }],
+        });
+        let json = serde_json::to_string(&Response::Watching).unwrap();
+        assert_eq!(json, r#"{"t":"Watching"}"#);
     }
 
     #[test]
@@ -550,7 +635,8 @@ mod tests {
             Response::Hello {
                 proto: 1,
                 server: "gozd".into(),
-                ready: true
+                ready: true,
+                features: Vec::new(),
             }
         );
 

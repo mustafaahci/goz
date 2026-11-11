@@ -76,7 +76,7 @@
 
 use super::Exit;
 use super::es_only::ES_ONLY_SWITCHES;
-use crate::query::{DateOrder, LocalClock, QueryError, parse_query_at};
+use crate::query::{ContentQuery, QueryError};
 use crate::types::{EsColumn, SortDir, SortKey, SortSpec};
 
 /// What one command line asks goz to do.
@@ -729,6 +729,18 @@ pub(super) const SWITCHES: &[Switch] = &[
         SwitchAction::SortFixed(SortKey::DateModified, Some(SortDir::Desc)),
         "Sort by date modified, newest first",
     ),
+    row(
+        &["oe"],
+        Group::Search,
+        SwitchAction::SortFixed(SortKey::Extension, Some(SortDir::Asc)),
+        "Sort by extension, A to Z",
+    ),
+    row(
+        &["o-e"],
+        Group::Search,
+        SwitchAction::SortFixed(SortKey::Extension, Some(SortDir::Desc)),
+        "Sort by extension, Z to A",
+    ),
     Switch {
         spelling: names(
             &["export-csv"],
@@ -991,6 +1003,12 @@ pub(super) const SORT_KEYS: &[SortKeyRow] = &[
         key: SortKey::DateModified,
         what: "Date modified",
         orders: ["oldest first", "newest first"],
+    },
+    SortKeyRow {
+        names: &["extension", "ext"],
+        key: SortKey::Extension,
+        what: "Extension, folders first, then name",
+        orders: ["A to Z", "Z to A"],
     },
 ];
 
@@ -1297,36 +1315,14 @@ fn parse_tokens(mut tokens: impl Tokens) -> Result<Command, EsFatal> {
 
 /// Refuses search text that gozd would refuse whatever its clock: an
 /// unbalanced `<` or `>`, group expansion, an unknown function, a malformed
-/// size, nesting too deep, too many terms. A `dm:` value is left to gozd,
-/// which reads it against its own clock and regional date order, so the
-/// clock here only lets the parse go on past one.
+/// size, nesting too deep, too many terms; and more `content:` terms than
+/// the client searches in one query. A `dm:` value is left to gozd, which
+/// reads it against its own clock and regional date order. A content term
+/// is the client's to search (see `query::content`), so it passes.
 fn check_search_text(text: &str, match_case: bool) -> Result<(), EsFatal> {
-    match parse_query_at(text, match_case, &CheckClock) {
-        Ok(_) | Err(QueryError::NoClock | QueryError::Malformed { what: "dm:", .. }) => Ok(()),
+    match ContentQuery::new(text, match_case) {
+        Ok(_) => Ok(()),
         Err(error) => Err(EsFatal::bad_search(&error)),
-    }
-}
-
-/// A clock for [`check_search_text`]: any fixed time does, since no answer
-/// that depends on the date is taken from it.
-struct CheckClock;
-
-impl LocalClock for CheckClock {
-    fn now(&self) -> i64 {
-        // 2026-01-01T00:00:00Z as FILETIME ticks.
-        134_115_840_000_000_000
-    }
-    fn to_local(&self, utc: i64) -> Option<i64> {
-        Some(utc)
-    }
-    fn to_utc(&self, local: i64) -> Option<i64> {
-        Some(local)
-    }
-    fn week_start(&self) -> u8 {
-        0
-    }
-    fn date_order(&self) -> DateOrder {
-        DateOrder::YearMonthDay
     }
 }
 
@@ -2145,11 +2141,15 @@ mod tests {
         assert!(msg.contains("unbalanced '>' at column 4"), "{msg}");
         let msg = refused(&["gr<a|e>y"]);
         assert!(msg.contains("group expansion"), "{msg}");
-        let msg = refused(&["content:foo"]);
+        let msg = refused(&["attrib:h"]);
         assert!(
-            msg.contains("unknown search function or modifier 'content:'"),
+            msg.contains("unknown search function or modifier 'attrib:'"),
             "{msg}"
         );
+        // Content terms are the client's to search, three at most.
+        assert_eq!(plan(&["content:foo"]).query, "content:foo");
+        let msg = refused(&["content:a|content:b|content:c|content:d"]);
+        assert!(msg.contains("4 content: terms"), "{msg}");
         let msg = refused(&["regex:(?<=a)b"]);
         assert!(msg.contains("look-around"), "{msg}");
         let msg = refused(&["-r", "a(b"]);
@@ -2188,6 +2188,14 @@ mod tests {
             ("/o-s", spec(SortKey::Size, SortDir::Desc)),
             ("/od", spec(SortKey::DateModified, SortDir::Asc)),
             ("/o-d", spec(SortKey::DateModified, SortDir::Desc)),
+            ("/oe", spec(SortKey::Extension, SortDir::Asc)),
+            ("/o-e", spec(SortKey::Extension, SortDir::Desc)),
+            ("-oe", spec(SortKey::Extension, SortDir::Asc)),
+            ("-sort-extension", spec(SortKey::Extension, SortDir::Asc)),
+            (
+                "-sort-ext-descending",
+                spec(SortKey::Extension, SortDir::Desc),
+            ),
         ] {
             assert_eq!(plan(&[switch]).sort, want, "{switch}");
         }
@@ -2279,16 +2287,7 @@ mod tests {
     /// text: `/w` would search for the text `/w` and find something else.
     #[test]
     fn es_switches_goz_lacks_are_refused_in_either_form() {
-        for name in [
-            "oe",
-            "o-e",
-            "lf",
-            "name",
-            "punc",
-            "ws",
-            "no-punc",
-            "white-space",
-        ] {
+        for name in ["lf", "name", "punc", "ws", "no-punc", "white-space"] {
             for token in [format!("-{name}"), format!("/{name}"), format!("--{name}")] {
                 let err = fatal(&[&token]);
                 assert_eq!(err.exit_code, 6, "{token}");

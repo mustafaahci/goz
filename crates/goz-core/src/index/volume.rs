@@ -307,6 +307,28 @@ impl VolumeIndex {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Marks a change no journal batch made, so the generation moves and
+    /// whoever watches it (the daemon's `Watch`) learns of it: the live
+    /// enricher's sizes and dates, a hard-link reconcile.
+    pub fn note_changed(&mut self) {
+        self.generation += 1;
+    }
+
+    /// The hook for folder-size deltas: call it once after applying a batch
+    /// of them, so the generation moves as it does for any other change and
+    /// a watcher of the volume is told. Folder sizes themselves come with
+    /// wave 9's M7a.
+    pub fn note_folder_sizes_changed(&mut self) {
+        self.note_changed();
+    }
+
+    /// Carries the generation of the index this one replaces past `before`,
+    /// so a rebuilt volume's generation keeps rising and a client that
+    /// compares it sees the change.
+    pub fn continue_generation(&mut self, before: u64) {
+        self.generation = self.generation.max(before) + 1;
+    }
     pub fn stats(&self) -> &IndexStats {
         &self.stats
     }

@@ -61,6 +61,7 @@
 //! resolved here too, to FILETIME bounds, against the [`LocalClock`] the
 //! query is parsed with.
 
+use super::content::ContentEncoding;
 use super::dates::{DateFilter, LocalClock, date_filter};
 use super::expr::{self, Anchors, CountOf, Expr, FolderPath, Leaf, LenOf, Relation, Skip, Target};
 use super::lex::{self, Func, Macro, ModSet, Prefix, Text, Tok, Token};
@@ -194,6 +195,13 @@ pub enum QueryError {
     /// reason.
     #[error("bad regular expression {pattern:?}: {detail}")]
     BadRegex { pattern: String, detail: String },
+    /// More `content:` terms than the goz client splits one query for
+    /// (each doubles the queries it asks gozd), with the query's count.
+    #[error(
+        "the query has {0} content: terms; goz searches at most {max} in one query",
+        max = super::content::MAX_CONTENT_TERMS
+    )]
+    TooManyContentTerms(usize),
 }
 
 fn unbalanced(what: &char, column: &usize) -> String {
@@ -274,6 +282,41 @@ fn parse(
     match_case: bool,
     clock: Option<&dyn LocalClock>,
 ) -> Result<ParsedQuery, QueryError> {
+    parse_as(input, match_case, clock, None).map(|(q, _)| q)
+}
+
+/// A `content:` term (or one of its encodings' forms) of a query parsed
+/// for the goz client by [`parse_content_terms`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ContentFound {
+    pub(super) encoding: ContentEncoding,
+    /// The characters `[start, end)` of the query the term's function and
+    /// value were read from: what the client replaces with a constant.
+    pub(super) span: (usize, usize),
+    /// The value under the term's modifiers: text and `regex:` leaves on
+    /// the "name" (the content, here), an OR of a value group's
+    /// alternatives, and so on. Kinds are left out: they stay in the query
+    /// around the constant.
+    pub(super) value: Expr,
+}
+
+/// Parses `input` as the goz client does before it searches content: every
+/// `content:` term is found and read, under its modifiers, rather than
+/// refused, and `dm:` values are left to gozd. The rest of the query is
+/// checked as gozd checks it.
+pub(super) fn parse_content_terms(
+    input: &str,
+    match_case: bool,
+) -> Result<Vec<ContentFound>, QueryError> {
+    parse_as(input, match_case, None, Some(Vec::new())).map(|(_, found)| found.unwrap_or_default())
+}
+
+fn parse_as(
+    input: &str,
+    match_case: bool,
+    clock: Option<&dyn LocalClock>,
+    content: Option<Vec<ContentFound>>,
+) -> Result<(ParsedQuery, Option<Vec<ContentFound>>), QueryError> {
     let lexed = lex::lex(input)?;
     // The last `case:` directive wins over the caller's default, wherever it
     // stands, so text is folded rightly from the first term on.
@@ -285,6 +328,8 @@ fn parse(
         match_case,
         match_path: lexed.match_path.unwrap_or(false),
         clock,
+        content,
+        in_content: false,
     };
     let e = parser.expr(0, Mods::default())?;
     if let Some(stray) = parser.peek() {
@@ -329,7 +374,7 @@ fn parse(
             ),
         });
     }
-    Ok(q)
+    Ok((q, parser.content))
 }
 
 /// What the prefixes around a term set for it.
@@ -367,6 +412,11 @@ struct Parser<'t, 'c> {
     /// The `matchpath:` directive.
     match_path: bool,
     clock: Option<&'c dyn LocalClock>,
+    /// For the goz client, the `content:` terms found so far; `None` in
+    /// gozd, which refuses them (see [`Parser::content`]).
+    content: Option<Vec<ContentFound>>,
+    /// Inside a `content:` term's value.
+    in_content: bool,
 }
 
 impl<'t> Parser<'t, '_> {
@@ -517,6 +567,7 @@ impl<'t> Parser<'t, '_> {
                 }),
                 self.prefixed_operand(mods)?,
             )),
+            Prefix::Func(Func::Content(encoding)) => self.content(encoding, mods),
             Prefix::Func(func) => self.function(func, mods),
         }?;
         self.depth -= 1;
@@ -584,6 +635,50 @@ impl<'t> Parser<'t, '_> {
         } else {
             e
         })
+    }
+
+    /// A `content:` term, the prefix just read. gozd never reads a file, so
+    /// it refuses one; the goz client reads its value here, and searches
+    /// the files itself (see the `content` module). The term stands for a
+    /// constant in the query: a kind around it stays there, and applies to
+    /// the constant as it would to the term.
+    fn content(&mut self, encoding: ContentEncoding, mods: Mods) -> Result<Expr, QueryError> {
+        let what = Func::Content(encoding).spelling();
+        let start = self.tokens[self.at - 1].column - 1;
+        if self.content.is_none() {
+            return Err(QueryError::Unsupported {
+                what: what.to_string(),
+                why: "gozd answers from its index and never reads a file; the goz CLI \
+                      searches content itself, under your own account",
+            });
+        }
+        if self.in_content || mods.func.is_some() {
+            return Err(QueryError::Malformed {
+                what,
+                detail: "a content: term stands on its own, not in another function's value"
+                    .to_string(),
+            });
+        }
+        self.in_content = true;
+        let value = self.function(
+            Func::Content(encoding),
+            Mods {
+                folder: false,
+                kindless: true,
+                ..mods
+            },
+        );
+        self.in_content = false;
+        let value = expr::simplify(value?);
+        let end = self.tokens[self.at - 1].end;
+        if let Some(found) = self.content.as_mut() {
+            found.push(ContentFound {
+                encoding,
+                span: (start, end),
+                value,
+            });
+        }
+        Ok(Expr::True)
     }
 
     /// An empty term under `mods`: everything (or every folder under
@@ -774,6 +869,9 @@ impl<'t> Parser<'t, '_> {
         let set = mods.set.over(global);
         let e = if func == Func::Ext {
             ext_leaf(text, set)
+        } else if let Func::Content(_) = func {
+            // Everything reads a full-text function's `;` as text.
+            self.item(func, &text.text, text.literal_wild, set)?
         } else if related_of(func).is_some() {
             // A list is one sub-search, of any of its values.
             self.related(func, text.items(), text.literal_wild, set)?
@@ -806,6 +904,23 @@ impl<'t> Parser<'t, '_> {
             Func::Location => Target::Location,
             Func::ParentName => Target::ParentName,
             Func::Extension => Target::Extension,
+            Func::Content(_) => {
+                // Content is matched as written: `*` and `?` are text
+                // (`content:hel*` finds nothing in Everything), and an empty
+                // value matches a file whose content is not empty.
+                if item.is_empty() && set.regex != Some(true) {
+                    let case = set.case.unwrap_or(self.match_case);
+                    return Ok(Expr::Leaf(Leaf::Text {
+                        target: Target::Name,
+                        needle: Vec::new(),
+                        case,
+                        diacritics: !case && set.diacritics == Some(true),
+                        anchors: Anchors::default(),
+                        skip: Skip::default(),
+                    }));
+                }
+                return self.term(Some(Target::Name), item, true, set);
+            }
             Func::Parent | Func::Ancestor => {
                 // Under `diacritics:` the folders' accents count too.
                 let path = FolderPath {
@@ -852,6 +967,8 @@ impl<'t> Parser<'t, '_> {
             Func::ChildFileSize | Func::ChildDate | Func::ChildFileDate | Func::ChildFolderDate => {
                 return self.child_props(func, std::iter::once(item), set);
             }
+            // The client leaves dates to gozd.
+            Func::Date if self.content.is_some() => return Ok(Expr::True),
             Func::Date => {
                 // A value's own `!` negates it, here as before the list.
                 let (nots, item) = bangs(item);
@@ -994,6 +1111,9 @@ impl Parser<'_, '_> {
                     Number::Range(range) => Leaf::Size(range),
                     Number::Unknown => Leaf::SizeUnknown,
                 }
+            } else if self.content.is_some() {
+                // The client leaves dates to gozd.
+                Leaf::Kind(Kind::Folder)
             } else {
                 Leaf::Date(date_filter(&s, self.clock.ok_or(QueryError::NoClock)?)?)
             };
