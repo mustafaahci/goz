@@ -431,7 +431,8 @@ async fn handle_connection(
                     let pipe = unsafe { BorrowedHandle::borrow_raw(server.as_raw_handle()) };
                     let admin = goz_winfs::pipe_client_is_elevated_admin(pipe).unwrap_or(false);
                     let mut out = Vec::new();
-                    encode_response_frame(&set_config(config::init(), &change, admin), &mut out);
+                    let reply = set_config(config::init(), &change, admin, &volumes.current());
+                    encode_response_frame(&reply, &mut out);
                     out
                 }
                 // Hello / Status are trivial; encode inline as a tagged JSON frame.
@@ -1050,7 +1051,12 @@ fn features(volumes: &VolumeSet) -> Vec<String> {
 
 /// Answers `SetConfig`: refused unless the client is an elevated
 /// administrator; otherwise the options changed, written, and returned.
-fn set_config(store: &ConfigStore, change: &ConfigChange, admin: bool) -> Response {
+fn set_config(
+    store: &ConfigStore,
+    change: &ConfigChange,
+    admin: bool,
+    volumes: &VolumeSet,
+) -> Response {
     if !admin {
         return Response::Error {
             code: ProtoError::Unsupported,
@@ -1059,9 +1065,13 @@ fn set_config(store: &ConfigStore, change: &ConfigChange, admin: bool) -> Respon
                 .into(),
         };
     }
+    let before = store.get();
     match store.set(change) {
         Ok(now) => {
             tracing::info!(config = ?now, "index options changed");
+            if before.index_folder_size != now.index_folder_size {
+                config::folder_sizes_switched(volumes, now.index_folder_size);
+            }
             Response::Config(now)
         }
         Err(e) => Response::Error {
@@ -2946,7 +2956,8 @@ mod tests {
             index_date_created: Some(true),
             ..ConfigChange::default()
         };
-        match set_config(&store, &change, false) {
+        let vols: VolumeSet = Arc::new(vec![live_volume(r"C:\")]);
+        match set_config(&store, &change, false, &vols) {
             Response::Error { code, message } => {
                 assert_eq!(code, ProtoError::Unsupported);
                 assert!(message.starts_with("needs administrator"), "{message}");
@@ -2954,11 +2965,10 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(store.get(), IndexConfig::default(), "nothing changed");
-        match set_config(&store, &change, true) {
+        match set_config(&store, &change, true, &vols) {
             Response::Config(now) => assert!(now.index_date_created),
             other => panic!("expected Config, got {other:?}"),
         }
-        let vols: VolumeSet = Arc::new(vec![live_volume(r"C:\")]);
         assert_eq!(
             handle_request(&vols, Request::GetConfig),
             Response::Config(IndexConfig::default())

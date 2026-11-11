@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use goz_core::index::Columns;
+
+use crate::volume_state::VolumeSet;
 use goz_core::proto::{CONFIG_KEYS, ConfigChange, IndexConfig};
 use parking_lot::RwLock;
 
@@ -52,18 +54,14 @@ impl ConfigStore {
             goz_winfs::write_admin_only(path, render(&next).as_bytes())
                 .map_err(|e| format!("writing {}: {e}", path.display()))?;
         }
-        let before = *current;
         *current = next;
-        drop(current);
-        if before.index_folder_size != next.index_folder_size {
-            folder_sizes_switched(next.index_folder_size);
-        }
         Ok(next)
     }
 }
 
-/// Where folder sizes (stream M7a) learn of `index_folder_size` changing.
-pub(crate) fn folder_sizes_switched(_on: bool) {}
+/// Where folder sizes learn of `index_folder_size`: at start, and on each
+/// change (stream M7a's `folder_sizes::set(volumes, on)` goes here).
+pub(crate) fn folder_sizes_switched(_volumes: &VolumeSet, _on: bool) {}
 
 /// `%SystemRoot%\Logs\goz\gozd.ini`, beside the service's log.
 pub(crate) fn default_path() -> Option<PathBuf> {

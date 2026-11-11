@@ -35,6 +35,7 @@ pub(crate) fn start_engine() -> Result<Engine> {
         bail!("no fixed NTFS volumes found");
     }
     let volumes = Arc::new(VolumeRegistry::default());
+    crate::config::folder_sizes_switched(&volumes.current(), options.index_folder_size);
     let supervisor =
         Supervisor::spawn(volumes.clone(), &listed).context("starting the volume supervisor")?;
     Ok(Engine {
