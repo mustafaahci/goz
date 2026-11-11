@@ -9,6 +9,8 @@
 
 goz indexes every filename on your fixed NTFS volumes and answers substring queries in single-digit milliseconds, from the command line or from your own tools over a named pipe.
 
+Prefer a window? **[goz-gui](https://github.com/mustafaahci/goz-gui)** is the desktop app for goz, in the style of Everything 1.5 (see [Desktop app](#desktop-app)).
+
 ## Highlights
 
 - **Fast.** 1.8x to 6.1x quicker than Everything across every query in our [benchmarks](docs/BENCHMARKS.md), on the same machine with the same result sets. Names are kept in sort order, so the first page of a name-sorted query over three million matches arrives in about 50 ms without sorting anything.
@@ -52,6 +54,18 @@ Or install it as an auto-start Windows service (elevated):
 ```
 
 When the daemon is not running, `goz` says what state the `goz` service is in (not installed, stopped, disabled or still starting) and prints the commands that fix it, each on its own line.
+
+## Desktop app
+
+**[goz-gui](https://github.com/mustafaahci/goz-gui)** is a native Windows app on top of gozd, with Everything 1.5's window, menus, keys and options: results as you type, tabs, Folders, Filters and Bookmarks sidebars, a Preview pane, thumbnails, file lists and live updates. Once gozd is running, install it from the [latest goz-gui release](https://github.com/mustafaahci/goz-gui/releases/latest) (MSI installer or portable zip).
+
+<a href="https://github.com/mustafaahci/goz-gui">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-light.png">
+    <img src="https://raw.githubusercontent.com/mustafaahci/goz-gui/main/docs/images/hero-light.png" alt="goz-gui showing search results as you type, with the Preview pane open" width="800">
+  </picture>
+</a>
 
 ## Usage
 
