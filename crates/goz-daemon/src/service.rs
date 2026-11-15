@@ -1,8 +1,12 @@
 //! Windows service integration (M8).
 //!
-//! `install` registers `gozd` as a LocalSystem auto-start service so the index
-//! is warm from boot for every user (admin or standard) with no per-session
-//! elevation. `uninstall` stops and removes it. `run` is the SCM entry point:
+//! `install` copies `gozd.exe` to `Program Files\goz` and registers that copy
+//! as a LocalSystem auto-start service, so the index is warm from boot for
+//! every user (admin or standard) with no per-session elevation. The copy is
+//! what keeps the service safe: wherever `gozd.exe` was downloaded or built,
+//! the user can write to it, and a program they run could replace it with
+//! its own, which would then start as SYSTEM. `uninstall` stops and removes
+//! the service and the copy. `run` is the SCM entry point:
 //! Windows launches `gozd.exe run --service`, which hands the process to the
 //! service dispatcher and reports `StartPending` (with a heartbeat checkpoint)
 //! → `Running` → `StopPending` (with one too) → `Stopped`. `Running` comes
@@ -11,6 +15,7 @@
 //! published.
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
@@ -44,32 +49,64 @@ const PENDING_HEARTBEAT: Duration = Duration::from_secs(2);
 const PENDING_WAIT_HINT: Duration = Duration::from_secs(4);
 
 // Win32 error codes we treat as non-fatal for idempotent install/uninstall.
-const ERROR_SERVICE_EXISTS: i32 = 1073;
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
 
-/// `ServiceInfo` describing how the SCM should launch us. `current_exe()`
-/// resolves to the installed `gozd.exe`, and `run --service` is the argv the
-/// SCM starts it with.
-fn service_info() -> Result<ServiceInfo> {
-    let exe = std::env::current_exe().context("resolving the gozd.exe path")?;
-    Ok(ServiceInfo {
+/// `ServiceInfo` describing how the SCM should launch us: `exe` is the
+/// installed copy, and `run --service` is the argv the SCM starts it with.
+fn service_info(exe: &Path) -> ServiceInfo {
+    ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(DISPLAY_NAME),
         service_type: SERVICE_TYPE,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: exe,
+        executable_path: exe.to_path_buf(),
         launch_arguments: vec![OsString::from("run"), OsString::from("--service")],
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
-    })
+    }
 }
 
-/// Registers the auto-start service and starts it now, so search works
-/// immediately after install without a reboot. Idempotent: re-running refreshes
-/// the config (e.g. after an app upgrade moved the binary) and ensures it runs.
+/// Where `install` puts the copy the service runs: `Program Files\goz`, a
+/// folder only administrators can write, as everything under Program Files.
+fn installed_exe() -> Result<PathBuf> {
+    let program_files =
+        goz_winfs::program_files_dir().context("finding the Program Files folder")?;
+    Ok(install_path(&program_files))
+}
+
+fn install_path(program_files: &Path) -> PathBuf {
+    program_files.join("goz").join("gozd.exe")
+}
+
+/// The name a copy is written under before it replaces the installed one.
+fn staged_path(installed: &Path) -> PathBuf {
+    installed.with_extension("exe.new")
+}
+
+/// The name a running installed copy is moved to so it can be removed.
+fn retired_path(installed: &Path) -> PathBuf {
+    installed.with_extension("exe.old")
+}
+
+/// Whether `a` and `b` name the same existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Copies the running gozd.exe to `Program Files\goz`, registers that copy as
+/// the auto-start service and starts it now, so search works immediately
+/// after install without a reboot.
+///
+/// Idempotent: re-running it from a new gozd.exe is how goz is upgraded. The
+/// service is stopped while its copy is replaced, then started on the new
+/// one. Run from the installed copy, it only refreshes the service's
+/// configuration and makes sure it runs.
 pub(crate) fn install() -> Result<()> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -77,24 +114,49 @@ pub(crate) fn install() -> Result<()> {
     )
     .context("opening the service control manager (are you elevated?)")?;
 
-    let info = service_info()?;
-    let access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS;
+    let installed = installed_exe()?;
+    let current = std::env::current_exe().context("resolving the gozd.exe path")?;
+    let access = ServiceAccess::CHANGE_CONFIG
+        | ServiceAccess::START
+        | ServiceAccess::STOP
+        | ServiceAccess::QUERY_STATUS;
 
-    let service = match manager.create_service(&info, access) {
-        Ok(service) => service,
+    let existing = match manager.open_service(SERVICE_NAME, access) {
+        Ok(service) => Some(service),
         Err(windows_service::Error::Winapi(e))
-            if e.raw_os_error() == Some(ERROR_SERVICE_EXISTS) =>
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
         {
-            // Already installed → open and refresh config (upgrade-safe).
-            let service = manager
-                .open_service(SERVICE_NAME, access)
-                .context("opening the existing goz service")?;
+            None
+        }
+        Err(e) => return Err(e).context("opening the existing goz service"),
+    };
+
+    if !same_file(&current, &installed) {
+        // A running gozd.exe cannot be overwritten, and the service must
+        // restart to run the new one anyway.
+        if let Some(service) = &existing {
+            stop_and_wait(service);
+        }
+        if let Err(e) = copy_binary(&current, &installed) {
+            // Leave the old copy serving rather than no service at all.
+            if let Some(service) = &existing {
+                let _ = start_if_stopped(service);
+            }
+            return Err(e);
+        }
+    }
+
+    let info = service_info(&installed);
+    let service = match existing {
+        Some(service) => {
             service
                 .change_config(&info)
                 .context("updating the goz service configuration")?;
             service
         }
-        Err(e) => return Err(e).context("creating the goz service"),
+        None => manager
+            .create_service(&info, access)
+            .context("creating the goz service")?,
     };
 
     // Best-effort description; not worth failing the install over.
@@ -103,42 +165,103 @@ pub(crate) fn install() -> Result<()> {
     // so a dead daemon self-heals without app involvement or a UAC prompt.
     let _ = set_failure_actions(&service);
     start_if_stopped(&service).context("starting the goz service")?;
-    println!("goz service installed and started.");
+    println!(
+        "goz service installed at {} and started.",
+        installed.display()
+    );
     Ok(())
 }
 
-/// Stops (if running) and deletes the service. Succeeds even if it was never
-/// installed, so an installer's uninstall step is safe to run unconditionally.
+/// Copies `from` to `to`, creating its folder: written under a new name
+/// beside `to`, then moved over it, so a failed copy leaves the old binary in
+/// place. Both files take the folder's permissions, not `from`'s.
+fn copy_binary(from: &Path, to: &Path) -> Result<()> {
+    let dir = to.parent().context("the install path has no folder")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let staged = staged_path(to);
+    std::fs::copy(from, &staged)
+        .with_context(|| format!("copying gozd.exe to {}", staged.display()))?;
+    std::fs::rename(&staged, to)
+        .with_context(|| {
+            format!(
+                "replacing {} (is a gozd.exe from there still running?)",
+                to.display()
+            )
+        })
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&staged);
+        })
+}
+
+/// Stops (if running) and deletes the service, then removes the copy
+/// `install` made. Succeeds even if it was never installed, so an installer's
+/// uninstall step is safe to run unconditionally.
 pub(crate) fn uninstall() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("opening the service control manager (are you elevated?)")?;
 
-    let service = match manager.open_service(
+    match manager.open_service(
         SERVICE_NAME,
         ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
     ) {
-        Ok(service) => service,
+        Ok(service) => {
+            // Stop first so the record is deleted immediately rather than
+            // being marked for deletion until the process exits.
+            stop_and_wait(&service);
+            service.delete().context("deleting the goz service")?;
+            println!("goz service stopped and removed.");
+        }
         Err(windows_service::Error::Winapi(e))
             if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
         {
-            println!("goz service is not installed; nothing to remove.");
-            return Ok(());
+            println!("goz service is not installed.");
         }
         Err(e) => return Err(e).context("opening the goz service"),
-    };
+    }
+    remove_installed_copy()
+}
 
-    // Stop first so the record is deleted immediately rather than being marked
-    // for deletion until the process exits.
+/// Removes `Program Files\goz\gozd.exe` and the folder once it is empty.
+///
+/// When uninstall runs from that copy, the copy cannot be deleted while it
+/// runs: it is moved aside and deleted at the next restart. Moving it first
+/// means an install before that restart is not deleted along with it.
+fn remove_installed_copy() -> Result<()> {
+    let installed = installed_exe()?;
+    let dir = installed
+        .parent()
+        .context("the install path has no folder")?;
+    let _ = std::fs::remove_file(staged_path(&installed));
+    if installed.exists() {
+        let current = std::env::current_exe().context("resolving the gozd.exe path")?;
+        if same_file(&current, &installed) {
+            let retired = retired_path(&installed);
+            std::fs::rename(&installed, &retired)
+                .with_context(|| format!("moving {} aside", installed.display()))?;
+            goz_winfs::remove_at_reboot(&retired)
+                .with_context(|| format!("removing {} at restart", retired.display()))?;
+            // Fails harmlessly at restart if the folder is not empty then.
+            let _ = goz_winfs::remove_at_reboot(dir);
+            println!("{} will be removed at the next restart.", dir.display());
+            return Ok(());
+        }
+        std::fs::remove_file(&installed)
+            .with_context(|| format!("removing {}", installed.display()))?;
+        println!("removed {}", installed.display());
+    }
+    // Only once empty: nothing else in the folder is ours to delete.
+    let _ = std::fs::remove_dir(dir);
+    Ok(())
+}
+
+/// Stops the service unless it is already stopped, and waits for it.
+fn stop_and_wait(service: &windows_service::service::Service) {
     if let Ok(status) = service.query_status()
         && status.current_state != ServiceState::Stopped
     {
         let _ = service.stop();
-        wait_for_stopped(&service);
+        wait_for_stopped(service);
     }
-
-    service.delete().context("deleting the goz service")?;
-    println!("goz service stopped and removed.");
-    Ok(())
 }
 
 /// Prints the service's install/run state (for the installer/app to probe).
@@ -515,12 +638,83 @@ impl std::io::Write for FileWriter {
 #[cfg(test)]
 mod tests {
     use super::{
-        PENDING_HEARTBEAT, PENDING_WAIT_HINT, service_exit_code, stop_pending, wait_for_engine,
+        PENDING_HEARTBEAT, PENDING_WAIT_HINT, copy_binary, install_path, retired_path, same_file,
+        service_exit_code, staged_path, stop_pending, wait_for_engine,
     };
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
     use windows_service::service::{ServiceControlAccept, ServiceExitCode, ServiceState};
+
+    /// A fresh folder under the temp folder, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after 1970")
+                .as_nanos();
+            let dir =
+                std::env::temp_dir().join(format!("gozd-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir(&dir).expect("create scratch folder");
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The service runs `Program Files\goz\gozd.exe`, and the copies made on
+    /// the way in and out sit beside it, so they share its permissions.
+    #[test]
+    fn the_service_runs_from_a_goz_folder_in_program_files() {
+        let installed = install_path(Path::new(r"C:\Program Files"));
+        assert_eq!(installed, Path::new(r"C:\Program Files\goz\gozd.exe"));
+        assert_eq!(
+            staged_path(&installed),
+            Path::new(r"C:\Program Files\goz\gozd.exe.new")
+        );
+        assert_eq!(
+            retired_path(&installed),
+            Path::new(r"C:\Program Files\goz\gozd.exe.old")
+        );
+    }
+
+    /// Two spellings of one file are the same file; a missing file is not.
+    #[test]
+    fn same_file_sees_through_spelling() {
+        let scratch = Scratch::new("same-file");
+        let file = scratch.0.join("gozd.exe");
+        std::fs::write(&file, b"x").unwrap();
+        let other_case = scratch.0.join(".").join("GOZD.EXE");
+        assert!(same_file(&file, &other_case));
+        assert!(!same_file(&file, &scratch.0.join("missing.exe")));
+        assert!(!same_file(
+            &scratch.0.join("missing.exe"),
+            &scratch.0.join("missing.exe")
+        ));
+    }
+
+    /// The copy creates the folder, replaces an older binary and leaves no
+    /// staged file behind.
+    #[test]
+    fn copy_binary_creates_the_folder_and_replaces_the_old_copy() {
+        let scratch = Scratch::new("copy-binary");
+        let from = scratch.0.join("built.exe");
+        let to = scratch.0.join("Program Files").join("goz").join("gozd.exe");
+        std::fs::write(&from, b"v1").unwrap();
+        copy_binary(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"v1");
+        std::fs::write(&from, b"v2").unwrap();
+        copy_binary(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"v2");
+        assert!(!staged_path(&to).exists());
+    }
 
     /// Waiting for the engine reports nothing while it serves, then a fresh
     /// checkpoint every heartbeat from the stop until the engine ends, so a

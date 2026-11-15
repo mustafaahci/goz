@@ -34,6 +34,8 @@ mod file_layout;
 #[cfg(windows)]
 mod file_stat;
 #[cfg(windows)]
+mod install;
+#[cfg(windows)]
 mod journal;
 #[cfg(windows)]
 mod links;
@@ -113,3 +115,6 @@ pub use process::{command_line, process_age};
 
 #[cfg(windows)]
 pub use service::{ServiceState, service_state};
+
+#[cfg(windows)]
+pub use install::{program_files_dir, remove_at_reboot};

@@ -63,10 +63,12 @@ Run the daemon in an elevated terminal:
 Or install it as an auto-start Windows service (elevated):
 
 ```
-.\target\release\gozd.exe install     # register and start
+.\target\release\gozd.exe install     # copy to C:\Program Files\goz, register and start
 .\target\release\gozd.exe status      # check state
-.\target\release\gozd.exe uninstall   # stop and remove
+.\target\release\gozd.exe uninstall   # stop and remove the service and the copy
 ```
+
+`install` copies `gozd.exe` to `C:\Program Files\goz` and registers that copy, as Everything's installer does. The service runs as SYSTEM, so the file it starts must sit where only administrators can write; the folder you downloaded or built it in is writable by every program you run. To upgrade, run `install` again from the new `gozd.exe`: it stops the service, replaces the copy and starts it again.
 
 When the daemon is not running, `goz` says what state the `goz` service is in (not installed, stopped, disabled or still starting) and prints the commands that fix it, each on its own line.
 
